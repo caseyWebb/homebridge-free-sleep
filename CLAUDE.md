@@ -26,9 +26,7 @@ vitest, undici/fetch for HTTP.
 All four are CI gates (`.github/workflows/ci.yml`) on every push to `main` and every pull
 request, as a matrix over every Node major version in `engines.node`
 (`^22 || ^24 || ^26` — currently 22, 24, 26), installing from the committed
-`package-lock.json` via `npm ci`. (The workflow file is currently staged pending a
-`workflow`-scope grant on the gh token — see `openspec/changes/tooling-and-ci/tasks.md`
-task 5.3; until it lands, run all four locally before merging.)
+`package-lock.json` via `npm ci`.
 
 ## Hard constraints on the Pod
 
