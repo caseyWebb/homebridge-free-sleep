@@ -23,7 +23,8 @@ The minimum viable plugin: each side of the bed as a HomeKit thermostat.
 - `PodPoller`: single shared poll, cached snapshot, change diffing, `updateCharacteristic` push.
 - `WriteQueue`: per-side debounce, coalescing, optimistic state, confirm reads.
 - Thermostat service per side.
-- Offline handling: backoff and HAP "No Response" across the daily reboot.
+- Offline handling across the daily reboot — note this is *not* HAP "No Response" by default;
+  see docs/HOMEKIT.md for why `updateCharacteristic(c, new Error())` does not work.
 
 **Done when:** paired in the Home app, both sides controllable, state survives a Pod reboot.
 
@@ -42,7 +43,9 @@ The things that make it trustworthy rather than a demo.
 
 - Away Mode switch per side.
 - Skip Alarm switch per side (via `scheduleOverrides.alarm.expiresAt`).
-- Alarm Ringing switch, with scheduled fast-poll windows so short alarms are not missed.
+- Alarm event as a StatelessProgrammableSwitch plus a Dismiss switch, with scheduled
+  fast-poll windows so short alarms are not missed.
+- Hub connection sensor so outages are visible as data rather than as No Response.
 - Occupancy sensor per side, auto-gated on `biometrics.enabled`.
 - Hub accessory: prime switch, water-low sensor, LED lightbulb.
 

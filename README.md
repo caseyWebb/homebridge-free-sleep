@@ -37,6 +37,8 @@ plugin does not change that — do not expose port 3000 to the internet.
 
 - [docs/POD-API.md](docs/POD-API.md) — source-verified notes on free-sleep's API and the
   constraints that shape this plugin.
+- [docs/HOMEKIT.md](docs/HOMEKIT.md) — HAP service/characteristic modeling decisions and the
+  HomeKit-side gotchas they work around.
 - [docs/ROADMAP.md](docs/ROADMAP.md) — milestones and non-goals.
 - `openspec/` — spec-driven change proposals. `openspec list` to see what is in flight.
 

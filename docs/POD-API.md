@@ -52,7 +52,9 @@ Notes, all from `server/src/8sleep/loadDeviceStatus.ts` unless stated:
   the HTTP response**. `Franken.getDeviceStatus(getGestures = false)` defaults gestures off
   (`server/src/8sleep/frankenServer.ts:89`) and the route calls it with no argument. Only the
   in-process `FrankenMonitor` requests them.
-- `wifiStrength` is refreshed by an `nmcli` shell-out on a 10 s interval in `server.ts`.
+- `wifiStrength` is effectively a **boot-time constant** from a client's point of view.
+  `loadDeviceStatus` reads a module-level `WIFI_SIGNAL_STRENGTH` variable that a separate 10 s
+  interval in `server.ts` refreshes; it is never re-read per request. Don't build on it.
 
 ### `POST /api/deviceStatus` → `204`
 
@@ -68,6 +70,28 @@ Deep partial of the read shape. Semantics from
 | `isAlarmVibrating: false` | Sends `ALARM_CLEAR`. `true` is unsupported and logged as such. |
 | `isPriming: true` | Sends `PRIME`. |
 | `settings` | Key-remapped (`ledBrightness`→`lb`, `gainLeft`→`gl`, `gainRight`→`gr`), CBOR-encoded, sent as `SET_SETTINGS`. |
+
+**Two truthiness bugs in `updateSide`.** The handler guards with `if (secondsRemaining)` and
+`if (targetTemperatureF)`, not `!== undefined`:
+
+- **`secondsRemaining: 0` is a silent no-op.** You cannot turn a side off that way — only
+  `isOn: false` works. This is convenient for a keep-alive: it can never accidentally stop the
+  bed.
+- `targetTemperatureF: 0` is likewise ignored, which is harmless since 0 is out of range.
+
+**Command ordering inside one POST is fixed and matters.** `updateSide` applies
+`isOn` → `targetTemperatureF` → `secondsRemaining` → `isAlarmVibrating`, each as a *separate*
+serialised hardware command; the top level applies `isPriming` → `left` → `right` → `settings`.
+So `{isOn: true, targetTemperatureF: 64}` in one POST is correct and safe, but **never put
+`isOn` and `secondsRemaining` in the same patch** — `secondsRemaining` runs last and wins.
+
+**Integer °F is lossless.** Brute-forcing all 55-110 °F through `calculateLevelFromF` →
+`calculateTempInF` produces zero mismatches: every integer °F round-trips exactly through the
+±100 level scale. Integer °F is a faithful internal representation.
+
+**`settings` writes are cheap.** `updateSettings` sends `SET_SETTINGS` over the socket — it is
+a device command, not a LowDB write, so it does **not** trigger the job rebuild. Only
+`/api/settings` and `/api/schedules` do. `memoryDB` (alarm dismiss) is in-RAM and also cheap.
 
 **Away-mode coupling.** `const controlBothSides = settings.left.awayMode || settings.right.awayMode;`
 — if *either* side is in away mode, a write addressed to one side is applied to **both**.
