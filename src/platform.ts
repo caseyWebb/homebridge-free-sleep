@@ -25,9 +25,9 @@ import type {
   PlatformConfig,
 } from 'homebridge';
 
-import { FreeSleepConfigSchema, type FreeSleepConfig } from './config.ts';
+import { FreeSleepConfigSchema, unrecognizedConfigKeys, type FreeSleepConfig } from './config.ts';
 import type { Settings } from './pod/types.ts';
-import { PodClient } from './pod/client.ts';
+import { DEFAULT_TIMEOUT_MS, PodClient, RETRY_BASE_DELAY_MS, RETRY_JITTER_MS } from './pod/client.ts';
 import { PLATFORM_NAME, PLUGIN_NAME } from './settings.ts';
 
 const require = createRequire(import.meta.url);
@@ -47,14 +47,19 @@ export interface MinimalPodClient {
 }
 
 /**
- * Reuses `pod-client`'s own worst-case retry budget (design.md, "Timeout budget") rather than
- * inventing a shorter one: an ~8s per-attempt timeout plus one retry with backoff bounds a
- * `getSettings()` call at roughly 16.5s worst case. Bounding the wait here — rather than
- * trusting every possible `MinimalPodClient` implementation to always settle on its own — is
- * what keeps "startup is not blocked waiting indefinitely" true regardless of what the
- * injected client does.
+ * Derived from `pod-client`'s own exported worst-case retry constants (design.md, "Timeout
+ * budget") rather than a hand-picked number that can silently drift out of sync with them: two
+ * full per-attempt timeouts (the first attempt, plus the one retry `pod-client` makes on a
+ * network error, timeout, or 5xx) plus the worst-case backoff wait between them
+ * (`RETRY_BASE_DELAY_MS + RETRY_JITTER_MS`), plus a small fixed margin so this budget is never
+ * exactly equal to the client's own worst case. Bounding the wait here — rather than trusting
+ * every possible `MinimalPodClient` implementation to always settle on its own — is what keeps
+ * "startup is not blocked waiting indefinitely" true regardless of what the injected client
+ * does.
  */
-export const SETTINGS_READ_TIMEOUT_MS = 16_500;
+const SETTINGS_TIMEOUT_MARGIN_MS = 300;
+export const SETTINGS_READ_TIMEOUT_MS =
+  2 * DEFAULT_TIMEOUT_MS + RETRY_BASE_DELAY_MS + RETRY_JITTER_MS + SETTINGS_TIMEOUT_MARGIN_MS;
 
 const FALLBACK_NAME: Record<'left' | 'right', string> = {
   left: 'Pod Left',
@@ -109,13 +114,26 @@ export class FreeSleepPlatform implements DynamicPlatformPlugin {
   private readonly cachedByUuid = new Map<string, PlatformAccessory>();
   private readonly config: FreeSleepConfig | undefined;
   private readonly podClient: MinimalPodClient | undefined;
+  /**
+   * Explicit fields rather than TS constructor parameter properties (N14 in the
+   * platform-foundation code review): parameter properties are not pure type syntax — they
+   * require the compiler to emit a `this.x = x` assignment — so they are not erasable, and
+   * `scripts/smoke.ts` runs `src/` directly under `node --experimental-strip-types`, which only
+   * strips types and cannot perform that emit.
+   */
+  private readonly log: Logging;
+  private readonly api: API;
 
-  constructor(
-    private readonly log: Logging,
-    rawConfig: PlatformConfig,
-    private readonly api: API,
-    podClient?: MinimalPodClient,
-  ) {
+  constructor(log: Logging, rawConfig: PlatformConfig, api: API, podClient?: MinimalPodClient) {
+    this.log = log;
+    this.api = api;
+
+    for (const key of unrecognizedConfigKeys(rawConfig as unknown as Record<string, unknown>)) {
+      this.log.warn(
+        `FreeSleep: unrecognized config key '${key}' will be ignored. Check config.json for a typo.`,
+      );
+    }
+
     const parsed = FreeSleepConfigSchema.safeParse(rawConfig);
     if (!parsed.success) {
       const issues = parsed.error.issues
@@ -172,15 +190,38 @@ export class FreeSleepPlatform implements DynamicPlatformPlugin {
     for (const w of wanted) {
       const existing = this.cachedByUuid.get(w.uuid);
       if (existing) {
-        this.pruneServices(existing, w.role);
+        // F2: a restored accessory carries Homebridge's own placeholder FirmwareRevision
+        // ('0', stamped by bridgeService.js immediately before configureAccessory is called)
+        // until something overwrites it — re-apply AccessoryInformation on every restart so it
+        // never sticks at that placeholder forever.
+        this.setAccessoryInformation(existing, host, w.role);
+        const pruned = this.pruneServices(existing, w.role);
+        if (pruned) {
+          // F4: persist the prune so it survives an unclean shutdown (one that never reaches
+          // Homebridge's normal cached-accessories flush). Only when something actually
+          // changed — an update call on every restart, even a no-op one, is a gratuitous disk
+          // write.
+          this.api.updatePlatformAccessories([existing]);
+        }
         continue;
       }
 
-      const name = this.nameFor(w.role, settings);
-      const accessory = new this.api.platformAccessory(name, w.uuid, categoryFor(hap, w.role));
-      this.setAccessoryInformation(accessory, host, w.role);
-      this.cachedByUuid.set(w.uuid, accessory);
-      newAccessories.push(accessory);
+      // F1: one bad accessory must not discard the whole batch — the constructor's
+      // `didFinishLaunching` handler only logs-and-swallows at the top level, so without a
+      // per-accessory boundary here, a single throw (e.g. an hap-nodejs assertion on a bad
+      // display name) would abort discovery before any accessory registers.
+      try {
+        const name = this.nameFor(w.role, settings);
+        const accessory = new this.api.platformAccessory(name, w.uuid, categoryFor(hap, w.role));
+        this.setAccessoryInformation(accessory, host, w.role);
+        this.cachedByUuid.set(w.uuid, accessory);
+        newAccessories.push(accessory);
+      } catch (error) {
+        this.log.error(
+          `FreeSleep: failed to create the '${w.role}' accessory (${describeError(error)}); ` +
+            'continuing with the remaining accessories.',
+        );
+      }
     }
 
     if (newAccessories.length > 0) {
@@ -188,9 +229,17 @@ export class FreeSleepPlatform implements DynamicPlatformPlugin {
     }
   }
 
+  /**
+   * F1: `GET /api/settings` can legitimately return an empty (or whitespace-only) `name` —
+   * `SideSettingsSchema` only requires a string, not a non-empty one (`src/pod/types.ts`). Hap-nodejs
+   * asserts a non-empty `displayName` when an accessory is constructed, so handing it `''` or
+   * `'   '` throws and — without this fallback — discarded every accessory in the batch (see
+   * the per-accessory try/catch above, which now also guards against this class of bug for any
+   * future cause of a bad name).
+   */
   private nameFor(role: Role, settings: Settings | undefined): string {
     if (role === 'hub') return 'Pod';
-    return settings?.[role]?.name ?? FALLBACK_NAME[role];
+    return settings?.[role]?.name?.trim() || FALLBACK_NAME[role];
   }
 
   /**
@@ -205,14 +254,19 @@ export class FreeSleepPlatform implements DynamicPlatformPlugin {
     const client = this.podClient;
     if (!client) return undefined;
 
+    // N9: tied to the race timeout below so a timed-out read actually aborts the underlying
+    // HTTP attempt instead of leaving it running in the background after this method has
+    // already given up on it and moved on to fallback names.
+    const controller = new AbortController();
     let timer: ReturnType<typeof setTimeout> | undefined;
     try {
       const timeout = new Promise<never>((_, reject) => {
         timer = setTimeout(() => {
+          controller.abort();
           reject(new Error(`settings read exceeded the ${SETTINGS_READ_TIMEOUT_MS}ms startup budget`));
         }, SETTINGS_READ_TIMEOUT_MS);
       });
-      return await Promise.race([client.getSettings(), timeout]);
+      return await Promise.race([client.getSettings(controller.signal), timeout]);
     } catch (error) {
       this.log.debug(
         `FreeSleep: one-time settings read for name seeding did not complete ` +
@@ -231,17 +285,23 @@ export class FreeSleepPlatform implements DynamicPlatformPlugin {
    * today, so every non-`AccessoryInformation` service is pruned — a no-op in practice,
    * exercised by a unit test with a synthetic extra service, so `thermostat-and-offline` only
    * has to grow `ENABLED_SERVICE_KEYS`, never this method (design.md, "Restore flow").
+   *
+   * Returns whether any service was actually removed, so callers (F4) can persist the mutation
+   * with `updatePlatformAccessories` only when there is something to persist.
    */
-  private pruneServices(accessory: PlatformAccessory, role: Role): void {
+  private pruneServices(accessory: PlatformAccessory, role: Role): boolean {
     const accessoryInformationUuid = this.api.hap.Service.AccessoryInformation.UUID;
     const enabled = ENABLED_SERVICE_KEYS[role];
+    let removedAny = false;
     for (const service of [...accessory.services]) {
       if (service.UUID === accessoryInformationUuid) continue;
       const key = `${service.UUID}:${service.subtype ?? ''}`;
       if (!enabled.has(key)) {
         accessory.removeService(service);
+        removedAny = true;
       }
     }
+    return removedAny;
   }
 
   private setAccessoryInformation(accessory: PlatformAccessory, host: string, role: Role): void {
