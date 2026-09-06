@@ -123,7 +123,9 @@ see Impact for the coordination note.
 - **Coordination**: those two files are also edited by the in-flight `tooling-and-ci` change
   (#1), which is being implemented in a separate worktree. `tooling-and-ci` must land first;
   this change edits its output. No requirement of `build-tooling` changes.
-- **Dependencies**: `zod` becomes a runtime dependency. No new devDependencies — the mock
-  uses `node:http` and the client uses the global `fetch`.
+- **Dependencies**: `zod` becomes a runtime dependency. No devDependency is *added* by this
+  change, but it is the first change to rely on `@types/node` (added by `tooling-and-ci`) for
+  typechecking: `test/mockPod.ts`'s `node:http` server, `node:net`'s `AddressInfo`, and
+  `scripts/smoke.ts` (now in the typecheck `include`, see below) all need its ambient types.
 - **Systems**: no Pod is contacted by the test suite; the whole suite runs offline. The only
   code path that touches real hardware is the smoke script, which is read-only and manual.
