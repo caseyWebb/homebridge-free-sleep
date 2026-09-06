@@ -60,8 +60,12 @@ interface Attempt {
   text: string;
 }
 
-const RETRY_BASE_DELAY_MS = 500;
-const RETRY_JITTER_MS = 200;
+/** Exported so callers outside this module (e.g. `platform.ts`'s startup-budget timeout) can
+ * derive their own worst-case bounds from the client's actual constants rather than guessing
+ * or hardcoding a duplicate magic number. */
+export const DEFAULT_TIMEOUT_MS = 8000;
+export const RETRY_BASE_DELAY_MS = 500;
+export const RETRY_JITTER_MS = 200;
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
@@ -114,7 +118,7 @@ export class PodClient {
   constructor(options: PodClientOptions) {
     this.host = options.host;
     this.port = options.port ?? 3000;
-    this.timeoutMs = options.timeoutMs ?? 8000;
+    this.timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
     this.baseUrl = `http://${this.host}:${this.port}`;
   }
 
