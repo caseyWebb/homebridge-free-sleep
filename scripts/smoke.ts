@@ -19,6 +19,8 @@
  * needs one of those, is `npx tsx scripts/smoke.ts` instead.
  */
 
+import { pathToFileURL } from 'node:url';
+
 // `.ts` extensions (not the usual NodeNext `.js`) so this file resolves under direct
 // `node --experimental-strip-types` execution — see client.ts's header comment.
 import { PodClient } from '../src/pod/client.ts';
@@ -29,8 +31,39 @@ function usage(): string {
   return 'Usage: npm run smoke -- <pod-host>[:<port>]\n  e.g. npm run smoke -- 192.168.1.42';
 }
 
-/** Splits `<host>` or `<host>:<port>` — the last colon wins, so a bare hostname is fine. */
-function parseHostArg(arg: string): { host: string; port?: number } {
+/**
+ * Splits `<host>` or `<host>:<port>` — the last colon wins, so a bare hostname is fine.
+ *
+ * IPv6 needs its own handling (N6 in the pod-client code review), since a bare IPv6 literal
+ * is itself full of colons:
+ *   - Bracketed form, `[<addr>]` or `[<addr>]:<port>` (RFC 3986 §3.2.2) — the bracket is what
+ *     makes a trailing `:<port>` unambiguous, so it's parsed out same as the plain-host case.
+ *   - A bare (unbracketed) address with more than one colon is treated as host-only: with no
+ *     brackets there is no unambiguous place to split off a port, so the whole argument is the
+ *     host and `port` is left undefined (falls back to `PodClientOptions`'s default).
+ */
+export function parseHostArg(arg: string): { host: string; port?: number } {
+  const bracketed = /^\[(.+)\](?::(\d+))?$/.exec(arg);
+  if (bracketed) {
+    const host = bracketed[1]!;
+    const portStr = bracketed[2];
+    if (portStr === undefined) {
+      return { host };
+    }
+    const port = Number(portStr);
+    if (!Number.isInteger(port) || port <= 0) {
+      return { host };
+    }
+    return { host, port };
+  }
+
+  const colonCount = (arg.match(/:/g) ?? []).length;
+  if (colonCount > 1) {
+    // A bare IPv6 literal (or anything else with more than one colon and no brackets) — host
+    // only, no port.
+    return { host: arg };
+  }
+
   const lastColon = arg.lastIndexOf(':');
   if (lastColon === -1) {
     return { host: arg };
@@ -57,8 +90,14 @@ function describeAddress(host: string, port: number | undefined): string {
   return port === undefined ? host : `${host}:${port}`;
 }
 
-async function main(): Promise<number> {
-  const arg = process.argv[2];
+/**
+ * Exported (and parameterised over `argv` instead of reading `process.argv` directly) so
+ * `test/smoke.test.ts` can drive it against a mock Pod and assert on the requests it issues
+ * (N7 in the pod-client code review: a regression test for "performs zero writes") — real CLI
+ * usage is unaffected, since `argv` defaults to `process.argv`.
+ */
+export async function main(argv: string[] = process.argv): Promise<number> {
+  const arg = argv[2];
   if (!arg) {
     process.stderr.write(`${usage()}\n`);
     return 1;
@@ -104,4 +143,10 @@ async function main(): Promise<number> {
   }
 }
 
-process.exitCode = await main();
+// Only auto-run when this file is the actual entry point (`node --experimental-strip-types
+// scripts/smoke.ts …`) — not when `test/smoke.test.ts` imports `main` to drive it directly
+// against a mock Pod, which would otherwise re-run this against whatever `process.argv`
+// vitest itself was started with.
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+  process.exitCode = await main();
+}
