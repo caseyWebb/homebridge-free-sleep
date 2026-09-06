@@ -1,0 +1,325 @@
+/**
+ * `PodClient` — typed, resilient access to a free-sleep Pod's unauthenticated LAN HTTP API.
+ *
+ * Dumb transport with a resilience policy, nothing more (design.md, "Goals"): an ~8s
+ * per-attempt timeout, a concurrency limit of 1 per endpoint with in-flight GET
+ * deduplication, one retry with backoff on network errors and 5xx (never on 4xx), and a
+ * typed error taxonomy. No polling, no caching beyond in-flight dedup, no write queue, no
+ * away-mode guard, no authentication — see proposal.md's "Non-goals".
+ *
+ * Depends on `./types.ts` and `./errors.ts` only (design.md, "Module dependency direction").
+ *
+ * Relative imports here use `.ts` extensions rather than the usual NodeNext `.js`
+ * convention, because `scripts/smoke.ts` imports this module and runs directly under
+ * `node --experimental-strip-types` (no build step) — Node's loader resolves import
+ * specifiers literally and does not fall back from `.js` to a sibling `.ts` file. `tsconfig.json`
+ * sets `rewriteRelativeImportExtensions: true` so `npm run build` still emits the correct
+ * `.js` specifiers in `dist/`.
+ */
+
+import { ZodError } from 'zod';
+
+import {
+  DeviceStatusPatchSchema,
+  DeviceStatusSchema,
+  SchedulesSchema,
+  ServicesSchema,
+  SettingsPatchSchema,
+  SettingsSchema,
+  type DeviceStatus,
+  type DeviceStatusPatch,
+  type Schedules,
+  type Services,
+  type Settings,
+  type SettingsPatch,
+} from './types.ts';
+import {
+  PodAbortError,
+  PodBadRequestError,
+  PodHttpError,
+  PodNetworkError,
+  PodRequestError,
+  PodResponseError,
+  PodTimeoutError,
+} from './errors.ts';
+
+export interface PodClientOptions {
+  host: string;
+  /** Defaults to 3000 — free-sleep's server port. */
+  port?: number;
+  /** Per-attempt abort timeout in milliseconds. Defaults to 8000 (design.md, "Timeout"). */
+  timeoutMs?: number;
+}
+
+interface ReadSchema<T> {
+  parse(input: unknown): T;
+}
+
+interface Attempt {
+  status: number;
+  text: string;
+}
+
+const RETRY_BASE_DELAY_MS = 500;
+const RETRY_JITTER_MS = 200;
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+function safeJsonParse(text: string): unknown {
+  if (text.length === 0) return undefined;
+  try {
+    return JSON.parse(text);
+  } catch {
+    return undefined;
+  }
+}
+
+function formatZodIssues(error: ZodError): string {
+  return error.issues.map((issue) => `${issue.path.join('.') || '(root)'}: ${issue.message}`).join('; ');
+}
+
+/**
+ * Design.md, "Pre-flight rejection of `isOn` + `secondsRemaining` in one patch" (tech-lead
+ * resolution 1, design.md "Resolutions"): `updateSide` applies `isOn` first and
+ * `secondsRemaining` last as separate serialised hardware commands, so the explicit duration
+ * silently wins. Reject locally rather than let a caller's likely-unintended combination
+ * silently pick a winner.
+ */
+function assertNoConflictingDuration(patch: DeviceStatusPatch): void {
+  for (const side of ['left', 'right'] as const) {
+    const sidePatch = patch[side];
+    if (sidePatch && sidePatch.isOn !== undefined && sidePatch.secondsRemaining !== undefined) {
+      throw new PodRequestError(
+        `device-status patch sets both isOn and secondsRemaining for the ${side} side; the ` +
+          'Pod applies isOn first and secondsRemaining last, so the explicit duration silently ' +
+          'wins. Send them as two separate requests, or drop one of the two fields.',
+      );
+    }
+  }
+}
+
+export class PodClient {
+  private readonly host: string;
+  private readonly port: number;
+  private readonly timeoutMs: number;
+  private readonly baseUrl: string;
+
+  /** One promise chain per `${method} ${pathname}` — depth-1 serialisation (design.md). */
+  private readonly chains = new Map<string, Promise<unknown>>();
+  /** In-flight GET promises, keyed the same way — dedup layer, GET only, never writes. */
+  private readonly inFlightGets = new Map<string, Promise<unknown>>();
+
+  constructor(options: PodClientOptions) {
+    this.host = options.host;
+    this.port = options.port ?? 3000;
+    this.timeoutMs = options.timeoutMs ?? 8000;
+    this.baseUrl = `http://${this.host}:${this.port}`;
+  }
+
+  async getDeviceStatus(signal?: AbortSignal): Promise<DeviceStatus> {
+    return this.getJson('/api/deviceStatus', DeviceStatusSchema, signal);
+  }
+
+  async getSettings(signal?: AbortSignal): Promise<Settings> {
+    return this.getJson('/api/settings', SettingsSchema, signal);
+  }
+
+  async getSchedules(signal?: AbortSignal): Promise<Schedules> {
+    return this.getJson('/api/schedules', SchedulesSchema, signal);
+  }
+
+  async getServices(signal?: AbortSignal): Promise<Services> {
+    return this.getJson('/api/services', ServicesSchema, signal);
+  }
+
+  /**
+   * `POST /api/deviceStatus`. Cheap — a device command, not a LowDB write (proposal.md's
+   * endpoint table). Pre-flight-validated against the strict request schema; never sends a
+   * request for a payload the Pod would reject anyway.
+   */
+  async postDeviceStatus(patch: DeviceStatusPatch, signal?: AbortSignal): Promise<void> {
+    const result = DeviceStatusPatchSchema.safeParse(patch);
+    if (!result.success) {
+      throw new PodRequestError(`Invalid device-status patch: ${formatZodIssues(result.error)}`);
+    }
+    assertNoConflictingDuration(result.data);
+    await this.request('POST', '/api/deviceStatus', result.data, signal);
+  }
+
+  /**
+   * `POST /api/settings`. **Expensive** — writes `settingsDB.json`, which rebuilds every
+   * scheduled job on the Pod (proposal.md's endpoint table). Implemented and mock-tested per
+   * design.md's tech-lead resolution 2; no caller in this change.
+   *
+   * Returns `void`, not the merged document: unlike a `GET`, the shape of this response is
+   * not the same read contract (the mock strips `id`, per its own executable spec — see
+   * `test/mockPod.test.ts`'s "id absent from the response"), and nothing in this change reads
+   * the response body.
+   */
+  async postSettings(patch: SettingsPatch, signal?: AbortSignal): Promise<void> {
+    const result = SettingsPatchSchema.safeParse(patch);
+    if (!result.success) {
+      throw new PodRequestError(`Invalid settings patch: ${formatZodIssues(result.error)}`);
+    }
+    await this.request('POST', '/api/settings', result.data, signal);
+  }
+
+  // -----------------------------------------------------------------------------------
+  // GET dedup + per-endpoint serialisation + JSON parsing
+  // -----------------------------------------------------------------------------------
+
+  private async getJson<T>(pathname: string, schema: ReadSchema<T>, signal?: AbortSignal): Promise<T> {
+    const key = `GET ${pathname}`;
+    let promise = this.inFlightGets.get(key) as Promise<T> | undefined;
+    if (!promise) {
+      promise = this.request('GET', pathname, undefined, signal).then((text) =>
+        this.parseJson(text, schema, pathname),
+      );
+      this.inFlightGets.set(key, promise);
+      promise
+        .finally(() => {
+          if (this.inFlightGets.get(key) === promise) {
+            this.inFlightGets.delete(key);
+          }
+        })
+        .catch(() => {
+          // Already surfaced to every awaiter of `promise` itself; this branch exists only
+          // so the cleanup chain above doesn't produce an unhandled rejection.
+        });
+    }
+    const value = await promise;
+    // Never hand out the same object to two callers — one caller's mutation must not be
+    // observable by another (design.md, "Dedupe").
+    return structuredClone(value);
+  }
+
+  private parseJson<T>(text: string, schema: ReadSchema<T>, pathname: string): T {
+    let data: unknown;
+    try {
+      data = text.length > 0 ? JSON.parse(text) : undefined;
+    } catch {
+      throw new PodResponseError(`response body for ${pathname} was not valid JSON`, pathname);
+    }
+    try {
+      return schema.parse(data);
+    } catch (error) {
+      if (error instanceof ZodError) {
+        const firstIssue = error.issues[0];
+        const path = firstIssue ? firstIssue.path.map(String).join('.') : pathname;
+        throw new PodResponseError(
+          `response for ${pathname} did not match the expected shape (${path}): ${formatZodIssues(error)}`,
+          path,
+        );
+      }
+      throw error;
+    }
+  }
+
+  // -----------------------------------------------------------------------------------
+  // Transport: endpoint serialisation, timeout, retry, status interpretation
+  // -----------------------------------------------------------------------------------
+
+  /** At most one in-flight physical request per `${method} ${pathname}` (design.md). */
+  private enqueue<T>(key: string, fn: () => Promise<T>): Promise<T> {
+    const previousTail = this.chains.get(key) ?? Promise.resolve();
+    const run = previousTail.then(fn, fn);
+    this.chains.set(key, run);
+    return run;
+  }
+
+  private async request(
+    method: string,
+    pathname: string,
+    body: unknown,
+    signal?: AbortSignal,
+  ): Promise<string> {
+    const key = `${method} ${pathname}`;
+    const { status, text } = await this.enqueue(key, () =>
+      this.requestWithRetry(method, pathname, body, signal),
+    );
+
+    if (status === 400) {
+      const parsed = safeJsonParse(text);
+      const details = isRecord(parsed) && 'details' in parsed ? parsed.details : parsed;
+      throw new PodBadRequestError(`Pod rejected ${method} ${pathname} with 400`, status, details);
+    }
+    if (status < 200 || status >= 300) {
+      throw new PodHttpError(`Pod responded ${status} to ${method} ${pathname}`, status, text);
+    }
+    return text;
+  }
+
+  /**
+   * At most one retry, after ~500ms plus jitter, only for a network-level error or a 5xx
+   * (design.md, "Retry"). A 4xx — 400 in particular — and a caller abort are never retried.
+   */
+  private async requestWithRetry(
+    method: string,
+    pathname: string,
+    body: unknown,
+    signal?: AbortSignal,
+  ): Promise<Attempt> {
+    const attempt = (): Promise<Attempt> => this.singleAttempt(method, pathname, body, signal);
+
+    let first: Attempt;
+    try {
+      first = await attempt();
+    } catch (error) {
+      if (error instanceof PodAbortError) {
+        throw error;
+      }
+      if (error instanceof PodNetworkError || error instanceof PodTimeoutError) {
+        await this.backoff();
+        return attempt();
+      }
+      throw error;
+    }
+
+    if (first.status >= 500) {
+      await this.backoff();
+      return attempt();
+    }
+
+    return first;
+  }
+
+  private async singleAttempt(
+    method: string,
+    pathname: string,
+    body: unknown,
+    callerSignal?: AbortSignal,
+  ): Promise<Attempt> {
+    const timeoutSignal = AbortSignal.timeout(this.timeoutMs);
+    const signal = callerSignal ? AbortSignal.any([callerSignal, timeoutSignal]) : timeoutSignal;
+
+    const init: RequestInit = { method, signal };
+    if (body !== undefined) {
+      init.headers = { 'content-type': 'application/json' };
+      init.body = JSON.stringify(body);
+    }
+
+    let response: Response;
+    try {
+      response = await fetch(`${this.baseUrl}${pathname}`, init);
+    } catch (error) {
+      if (callerSignal?.aborted) {
+        throw new PodAbortError(`${method} ${pathname} aborted by caller`);
+      }
+      if (timeoutSignal.aborted) {
+        throw new PodTimeoutError(`${method} ${pathname} timed out after ~${this.timeoutMs}ms`);
+      }
+      const message = error instanceof Error ? error.message : String(error);
+      throw new PodNetworkError(`${method} ${pathname}: ${message}`, { cause: error });
+    }
+
+    const text = await response.text();
+    return { status: response.status, text };
+  }
+
+  private backoff(): Promise<void> {
+    const jitter = Math.floor(Math.random() * RETRY_JITTER_MS);
+    return new Promise((resolve) => setTimeout(resolve, RETRY_BASE_DELAY_MS + jitter));
+  }
+}
