@@ -4,6 +4,7 @@ import { fileURLToPath } from 'node:url';
 
 import { describe, expect, it, vi } from 'vitest';
 
+import type { Categories } from '@homebridge/hap-nodejs';
 import type { API, Logging, PlatformAccessory, PlatformConfig } from 'homebridge';
 
 import {
@@ -21,8 +22,8 @@ import { SettingsSchema, type Settings } from '../src/pod/types.js';
 import {
   createFakeLogging,
   FakeHomebridgeApi,
+  FakePlatformAccessory,
   simulateRestart,
-  type FakePlatformAccessory,
   type PlatformFactory,
 } from './fakeHomebridgeApi.js';
 import { loadFixture } from './loadFixture.js';
@@ -71,6 +72,11 @@ function roleOf(displayName: string): Role {
 function existingAccessory(api: FakeHomebridgeApi, host: string, role: Role): FakePlatformAccessory {
   const name = role === 'hub' ? 'Pod' : role === 'left' ? 'Pod Left' : 'Pod Right';
   return new api.platformAccessory(name, uuidFor(api.hap, host, role), categoryFor(api.hap, role));
+}
+
+/** `createFakeLogging` stashes every logged line on a non-`Logging`-typed `.lines` property. */
+function logLines(log: Logging): Array<{ level: string; message: string }> {
+  return (log as unknown as { lines: Array<{ level: string; message: string }> }).lines;
 }
 
 // ---------------------------------------------------------------------------------------
@@ -383,5 +389,252 @@ describe('never-rename-on-restore', () => {
     await simulateRestart(factoryWithPodClient(resolvingPodClient()), baseConfig(), [cachedLeft]);
 
     expect(cachedLeft.displayName).toBe('My Custom Left Name');
+  });
+});
+
+// ---------------------------------------------------------------------------------------
+// F1 — a malformed name from GET /api/settings must not crash accessory creation
+// ---------------------------------------------------------------------------------------
+
+describe('name seeding — malformed name from the Pod (F1)', () => {
+  it('an empty-string name falls back to the static name, and all three accessories still register', async () => {
+    const settings: Settings = {
+      ...fixtureSettings,
+      left: { ...fixtureSettings.left, name: '' },
+    };
+
+    const { api } = await simulateRestart(
+      factoryWithPodClient(resolvingPodClient(settings)),
+      baseConfig(),
+      [],
+    );
+
+    expect(api.registeredAccessories).toHaveLength(3);
+    const left = api.registeredAccessories.find((a) => a.UUID === uuidFor(api.hap, 'pod.local', 'left'));
+    const right = api.registeredAccessories.find((a) => a.UUID === uuidFor(api.hap, 'pod.local', 'right'));
+    expect(left?.displayName).toBe('Pod Left');
+    // The unaffected side still gets its real seeded name — only the malformed one falls back.
+    expect(right?.displayName).toBe(fixtureSettings.right.name);
+  });
+
+  it('a whitespace-only name falls back to the static name, and all three accessories still register', async () => {
+    const settings: Settings = {
+      ...fixtureSettings,
+      right: { ...fixtureSettings.right, name: '   ' },
+    };
+
+    const { api } = await simulateRestart(
+      factoryWithPodClient(resolvingPodClient(settings)),
+      baseConfig(),
+      [],
+    );
+
+    expect(api.registeredAccessories).toHaveLength(3);
+    const right = api.registeredAccessories.find((a) => a.UUID === uuidFor(api.hap, 'pod.local', 'right'));
+    expect(right?.displayName).toBe('Pod Right');
+  });
+});
+
+describe('per-accessory creation failure does not discard the batch (F1)', () => {
+  it('one accessory constructor throwing still lets the other two register, and logs which role failed', async () => {
+    const api = new FakeHomebridgeApi();
+    const log = createFakeLogging();
+
+    // A synthetic constructor failure, independent of the nameFor/trim fix above — this
+    // exercises the per-accessory try/catch itself, not just the specific empty-name cause of
+    // it, so a future different cause of a bad accessory is guarded too.
+    class ThrowingForRight extends FakePlatformAccessory {
+      constructor(displayName: string, uuid: string, category?: Categories) {
+        if (displayName === 'Pod Right') {
+          throw new Error('synthetic accessory-construction failure');
+        }
+        super(displayName, uuid, category);
+      }
+    }
+    (api as unknown as { platformAccessory: unknown }).platformAccessory = ThrowingForRight;
+
+    new FreeSleepPlatform(log, baseConfig(), api.asApi(), rejectingPodClient());
+    await api.fireDidFinishLaunching();
+
+    const names = api.registeredAccessories.map((a) => a.displayName).sort();
+    expect(names).toEqual(['Pod', 'Pod Left']);
+    expect(
+      logLines(log).some(
+        (l) => l.level === 'error' && l.message.includes('right') && l.message.includes('failed'),
+      ),
+    ).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------------------------
+// F2/F3 — a restored accessory's FirmwareRevision is re-applied, not left at Homebridge's
+// own '0' placeholder
+// ---------------------------------------------------------------------------------------
+
+describe('FirmwareRevision is re-applied on restore (F2)', () => {
+  it("every restored accessory's FirmwareRevision reads the package version, not Homebridge's placeholder '0'", async () => {
+    const seedApi = new FakeHomebridgeApi();
+    const previous = (['left', 'right', 'hub'] as const).map((role) =>
+      existingAccessory(seedApi, 'pod.local', role),
+    );
+
+    // Relies on simulateRestart's own F3 fix stamping '0' on each of these immediately before
+    // configureAccessory, exactly as real Homebridge's bridgeService.js does — without that
+    // fix, this test would pass trivially (nothing would ever have been '0' to begin with).
+    const { platform } = await simulateRestart(
+      factoryWithPodClient(rejectingPodClient()),
+      baseConfig(),
+      previous,
+    );
+    void platform;
+
+    for (const accessory of previous) {
+      const info = accessory.getService(seedApi.hap.Service.AccessoryInformation);
+      expect(info?.getCharacteristic(seedApi.hap.Characteristic.FirmwareRevision).value).toBe(
+        packageJson.version,
+      );
+    }
+  });
+});
+
+describe('simulateRestart stamps the Homebridge FirmwareRevision placeholder (F3)', () => {
+  it("stamps '0' on every previously-cached accessory before configureAccessory is invoked", async () => {
+    const seedApi = new FakeHomebridgeApi();
+    const accessory = existingAccessory(seedApi, 'pod.local', 'left');
+    let observedDuringConfigureAccessory: unknown;
+
+    class ObservingPlatform {
+      constructor(_log: Logging, _config: PlatformConfig, api: API) {
+        api.on('didFinishLaunching', () => {});
+      }
+
+      configureAccessory(a: PlatformAccessory): void {
+        observedDuringConfigureAccessory = a
+          .getService(seedApi.hap.Service.AccessoryInformation)
+          ?.getCharacteristic(seedApi.hap.Characteristic.FirmwareRevision).value;
+      }
+    }
+
+    await simulateRestart(
+      (log, config, api) => new ObservingPlatform(log, config, api),
+      baseConfig(),
+      [accessory],
+    );
+
+    expect(observedDuringConfigureAccessory).toBe('0');
+  });
+});
+
+// ---------------------------------------------------------------------------------------
+// F4 — a prune that actually removes a service is persisted; a no-op prune is not
+// ---------------------------------------------------------------------------------------
+
+describe('prune persistence (F4)', () => {
+  it('persists a restored accessory via updatePlatformAccessories when pruneServices actually removes a service', async () => {
+    const seedApi = new FakeHomebridgeApi();
+    const previous = (['left', 'right', 'hub'] as const).map((role) =>
+      existingAccessory(seedApi, 'pod.local', role),
+    );
+    const leftAccessory = previous.find((a) => a.displayName === 'Pod Left')!;
+    leftAccessory.addService(new seedApi.hap.Service.ContactSensor('Synthetic Extra', 'synthetic-subtype'));
+
+    const { api } = await simulateRestart(factoryWithPodClient(resolvingPodClient()), baseConfig(), previous);
+
+    expect(api.updatePlatformAccessoriesCalls.length).toBeGreaterThan(0);
+    expect(api.updatePlatformAccessoriesCalls.flat()).toContain(leftAccessory);
+  });
+
+  it('never calls updatePlatformAccessories when nothing was pruned, to avoid gratuitous disk writes', async () => {
+    const seedApi = new FakeHomebridgeApi();
+    const previous = (['left', 'right', 'hub'] as const).map((role) =>
+      existingAccessory(seedApi, 'pod.local', role),
+    );
+
+    const { api } = await simulateRestart(factoryWithPodClient(resolvingPodClient()), baseConfig(), previous);
+
+    expect(api.updatePlatformAccessoriesCalls).toHaveLength(0);
+  });
+});
+
+// ---------------------------------------------------------------------------------------
+// F7 — changing the configured host changes HomeKit identity outright
+// ---------------------------------------------------------------------------------------
+
+describe('changing the configured host changes identity (F7)', () => {
+  it('booting with host A then restarting with host B unregisters all three old accessories and registers three new ones, without crashing', async () => {
+    const seedApi = new FakeHomebridgeApi();
+    const previous = (['left', 'right', 'hub'] as const).map((role) =>
+      existingAccessory(seedApi, 'pod-a.local', role),
+    );
+
+    const { api } = await simulateRestart(
+      factoryWithPodClient(rejectingPodClient()),
+      baseConfig({ host: 'pod-b.local' }),
+      previous,
+    );
+
+    expect(api.unregisteredAccessories).toHaveLength(3);
+    expect(new Set(api.unregisteredAccessories)).toEqual(new Set(previous));
+
+    expect(api.registeredAccessories).toHaveLength(3);
+    const names = api.registeredAccessories.map((a) => a.displayName).sort();
+    expect(names).toEqual(['Pod', 'Pod Left', 'Pod Right']);
+    for (const accessory of api.registeredAccessories) {
+      expect(accessory.UUID).not.toBe(
+        [...previous].find((p) => p.displayName === accessory.displayName)?.UUID,
+      );
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------------------
+// N9 — a timed-out settings read actually aborts the underlying client call
+// ---------------------------------------------------------------------------------------
+
+describe('settings-read timeout aborts the underlying call (N9)', () => {
+  it('passes an AbortSignal to getSettings() that is aborted once the startup budget is exceeded', async () => {
+    vi.useFakeTimers();
+    try {
+      let receivedSignal: AbortSignal | undefined;
+      const client: MinimalPodClient = {
+        getSettings: (signal) => {
+          receivedSignal = signal;
+          return new Promise<Settings>(() => {});
+        },
+      };
+
+      const resultPromise = simulateRestart(factoryWithPodClient(client), baseConfig(), []);
+      await vi.advanceTimersByTimeAsync(SETTINGS_READ_TIMEOUT_MS + 1000);
+      await resultPromise;
+
+      expect(receivedSignal).toBeInstanceOf(AbortSignal);
+      expect(receivedSignal?.aborted).toBe(true);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------------------
+// N10 — an unrecognized top-level config key is warned about, by name
+// ---------------------------------------------------------------------------------------
+
+describe('unrecognized config keys are warned about (N10)', () => {
+  it("logs a warning naming a typo'd top-level config key", () => {
+    const api = new FakeHomebridgeApi();
+    const log = createFakeLogging();
+
+    new FreeSleepPlatform(log, { ...baseConfig(), hots: 'oops' } as PlatformConfig, api.asApi());
+
+    expect(logLines(log).some((l) => l.level === 'warn' && l.message.includes('hots'))).toBe(true);
+  });
+
+  it('logs no warning when every top-level key is recognized', () => {
+    const api = new FakeHomebridgeApi();
+    const log = createFakeLogging();
+
+    new FreeSleepPlatform(log, baseConfig(), api.asApi());
+
+    expect(logLines(log).some((l) => l.level === 'warn')).toBe(false);
   });
 });
