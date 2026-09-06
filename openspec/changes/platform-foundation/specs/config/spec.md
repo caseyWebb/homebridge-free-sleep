@@ -27,6 +27,22 @@ SHALL fail validation with an error that identifies `host` as the offending fiel
 - **WHEN** a config object provides a non-empty string `host`
 - **THEN** validation succeeds and the parsed config carries that host value
 
+### Requirement: `host` is normalized to lowercase
+
+The config schema SHALL lowercase `host` after trimming it, in addition to trimming
+surrounding whitespace. DNS hostnames are case-insensitive, and normalizing on read is a
+no-op for a literal IP address; without it, two spellings of the one configured host (for
+example `'Pod.local'` and `'pod.local'`) would derive two different HomeKit UUIDs
+(`uuidFor`, `src/platform.ts`) for what is meant to be the identical Pod, silently
+destroying that Pod's HomeKit identity.
+
+#### Scenario: Differently-cased host spellings normalize identically
+
+- **WHEN** a config object's `host` is `'Pod.local'` and, separately, another config
+  object's `host` is `'pod.local'`
+- **THEN** both parse to the identical `host` value, and identity derived from it (such as
+  a HomeKit accessory UUID) is identical between the two
+
 ### Requirement: `sides` defaults to `'both'` and rejects any other value
 
 The config schema SHALL accept `sides` as one of exactly `'both'`, `'left'`, or `'right'`.
