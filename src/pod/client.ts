@@ -153,10 +153,10 @@ export class PodClient {
    * scheduled job on the Pod (proposal.md's endpoint table). Implemented and mock-tested per
    * design.md's tech-lead resolution 2; no caller in this change.
    *
-   * Returns `void`, not the merged document: unlike a `GET`, the shape of this response is
-   * not the same read contract (the mock strips `id`, per its own executable spec — see
-   * `test/mockPod.test.ts`'s "id absent from the response"), and nothing in this change reads
-   * the response body.
+   * Returns `void`, not the merged document: the response body is in fact the same read
+   * contract as `GET /api/settings` (`res.json(settingsDB.data)`, `id` and all —
+   * `server/src/routes/settings/settings.ts`), but nothing in this change reads it, so there
+   * is no caller to hand a parsed `Settings` to.
    */
   async postSettings(patch: SettingsPatch, signal?: AbortSignal): Promise<void> {
     const result = SettingsPatchSchema.safeParse(patch);
@@ -172,27 +172,62 @@ export class PodClient {
 
   private async getJson<T>(pathname: string, schema: ReadSchema<T>, signal?: AbortSignal): Promise<T> {
     const key = `GET ${pathname}`;
-    let promise = this.inFlightGets.get(key) as Promise<T> | undefined;
-    if (!promise) {
-      promise = this.request('GET', pathname, undefined, signal).then((text) =>
+    let shared = this.inFlightGets.get(key) as Promise<T> | undefined;
+    if (!shared) {
+      // The physical request runs under its own internal signal — never a specific caller's
+      // — so it is never coupled to any one awaiter. Each caller races its *own* signal
+      // against this shared promise below instead (S1 in the pod-client code review): caller
+      // A aborting must reject only caller A, never a caller B deduped onto the same
+      // in-flight GET.
+      shared = this.request('GET', pathname, undefined, undefined).then((text) =>
         this.parseJson(text, schema, pathname),
       );
-      this.inFlightGets.set(key, promise);
-      promise
+      this.inFlightGets.set(key, shared);
+      shared
         .finally(() => {
-          if (this.inFlightGets.get(key) === promise) {
+          if (this.inFlightGets.get(key) === shared) {
             this.inFlightGets.delete(key);
           }
         })
         .catch(() => {
-          // Already surfaced to every awaiter of `promise` itself; this branch exists only
-          // so the cleanup chain above doesn't produce an unhandled rejection.
+          // Already surfaced to every awaiter of `shared` itself (via raceAgainstAbort below);
+          // this branch exists only so the cleanup chain above doesn't produce an unhandled
+          // rejection.
         });
     }
-    const value = await promise;
+    const value = await this.raceAgainstAbort(shared, signal, `GET ${pathname}`);
     // Never hand out the same object to two callers — one caller's mutation must not be
     // observable by another (design.md, "Dedupe").
     return structuredClone(value);
+  }
+
+  /**
+   * Races a shared (possibly deduped) promise against one caller's own `AbortSignal`. That
+   * caller's abort — including one that has already fired before this call is even made —
+   * rejects only its own await with `PodAbortError`, leaving the shared promise, and every
+   * other awaiter of it, untouched (S1 in the pod-client code review).
+   */
+  private raceAgainstAbort<T>(shared: Promise<T>, signal: AbortSignal | undefined, label: string): Promise<T> {
+    if (!signal) return shared;
+    if (signal.aborted) {
+      return Promise.reject(new PodAbortError(`${label} aborted by caller`));
+    }
+    return new Promise<T>((resolve, reject) => {
+      const onAbort = (): void => {
+        reject(new PodAbortError(`${label} aborted by caller`));
+      };
+      signal.addEventListener('abort', onAbort, { once: true });
+      shared.then(
+        (value) => {
+          signal.removeEventListener('abort', onAbort);
+          resolve(value);
+        },
+        (error: unknown) => {
+          signal.removeEventListener('abort', onAbort);
+          reject(error);
+        },
+      );
+    });
   }
 
   private parseJson<T>(text: string, schema: ReadSchema<T>, pathname: string): T {
@@ -271,14 +306,14 @@ export class PodClient {
         throw error;
       }
       if (error instanceof PodNetworkError || error instanceof PodTimeoutError) {
-        await this.backoff();
+        await this.backoff(signal);
         return attempt();
       }
       throw error;
     }
 
     if (first.status >= 500) {
-      await this.backoff();
+      await this.backoff(signal);
       return attempt();
     }
 
@@ -300,9 +335,18 @@ export class PodClient {
       init.body = JSON.stringify(body);
     }
 
-    let response: Response;
+    // Both the header round-trip AND the body read must be inside this try/catch. A per-
+    // attempt `AbortSignal.timeout` can fire after `fetch()` already resolved a `Response` —
+    // headers arrived, but the body is still streaming — and `response.text()` rejects with
+    // the same kind of abort error a failed `fetch()` does. Reading the body outside this
+    // block (B2 in the pod-client code review) let that reject with a raw DOMException
+    // instead of `PodTimeoutError`, and skipped the retry a timeout is supposed to get.
+    let status: number;
+    let text: string;
     try {
-      response = await fetch(`${this.baseUrl}${pathname}`, init);
+      const response = await fetch(`${this.baseUrl}${pathname}`, init);
+      text = await response.text();
+      status = response.status;
     } catch (error) {
       if (callerSignal?.aborted) {
         throw new PodAbortError(`${method} ${pathname} aborted by caller`);
@@ -314,12 +358,24 @@ export class PodClient {
       throw new PodNetworkError(`${method} ${pathname}: ${message}`, { cause: error });
     }
 
-    const text = await response.text();
-    return { status: response.status, text };
+    return { status, text };
   }
 
-  private backoff(): Promise<void> {
+  /** Abort-aware: a caller abort during the backoff wait rejects immediately with
+   * `PodAbortError` instead of sleeping out the full delay before the retry even starts. */
+  private backoff(signal?: AbortSignal): Promise<void> {
+    if (signal?.aborted) {
+      return Promise.reject(new PodAbortError('aborted during retry backoff'));
+    }
     const jitter = Math.floor(Math.random() * RETRY_JITTER_MS);
-    return new Promise((resolve) => setTimeout(resolve, RETRY_BASE_DELAY_MS + jitter));
+    return new Promise<void>((resolve, reject) => {
+      const timer = setTimeout(resolve, RETRY_BASE_DELAY_MS + jitter);
+      if (!signal) return;
+      const onAbort = (): void => {
+        clearTimeout(timer);
+        reject(new PodAbortError('aborted during retry backoff'));
+      };
+      signal.addEventListener('abort', onAbort, { once: true });
+    });
   }
 }
