@@ -1,0 +1,33 @@
+{
+  "left": {
+    "currentTemperatureLevel": 4,
+    "currentTemperatureF": 82,
+    "targetTemperatureF": 84,
+    "secondsRemaining": 1200,
+    "isOn": true,
+    "isAlarmVibrating": false
+  },
+  "right": {
+    "currentTemperatureLevel": 5,
+    "currentTemperatureF": 85,
+    "targetTemperatureF": 86,
+    "secondsRemaining": 1560,
+    "isOn": true,
+    "isAlarmVibrating": false
+  },
+  "waterLevel": "true",
+  "isPriming": false,
+  "settings": {
+    "v": 12,
+    "gainLeft": 3,
+    "gainRight": 4,
+    "ledBrightness": 60
+  },
+  "coverVersion": "Pod 5",
+  "hubVersion": "Pod 5",
+  "freeSleep": {
+    "version": "2.1.5",
+    "branch": "main"
+  },
+  "wifiStrength": 82
+}

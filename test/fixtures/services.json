@@ -1,0 +1,52 @@
+{
+  "sentryLogging": {
+    "enabled": true
+  },
+  "biometrics": {
+    "enabled": true,
+    "jobs": {
+      "installation": {
+        "name": "Biometrics installation",
+        "description": "Initial biometric sensor installation",
+        "status": "healthy",
+        "message": "Installation completed successfully",
+        "timestamp": "2026-05-14T08:00:00.000Z"
+      },
+      "stream": {
+        "name": "Biometrics stream",
+        "description": "Sensor data ingestion service",
+        "status": "healthy",
+        "message": "Streaming data smoothly",
+        "timestamp": "2026-05-14T09:58:00.000Z"
+      },
+      "analyzeSleepLeft": {
+        "name": "Analyze sleep - left",
+        "description": "Analyzes sleep data for left side",
+        "status": "healthy",
+        "message": "Last run completed 15 minutes ago",
+        "timestamp": "2026-05-14T09:45:00.000Z"
+      },
+      "analyzeSleepRight": {
+        "name": "Analyze sleep - right",
+        "description": "Analyzes sleep data for right side",
+        "status": "healthy",
+        "message": "Next run scheduled soon",
+        "timestamp": "2026-05-14T09:48:00.000Z"
+      },
+      "calibrateLeft": {
+        "name": "Calibration job - Left",
+        "description": "Sensor calibration for left side",
+        "status": "healthy",
+        "message": "Calibrated this morning",
+        "timestamp": "2026-05-14T07:00:00.000Z"
+      },
+      "calibrateRight": {
+        "name": "Calibration job - Right",
+        "description": "Sensor calibration for right side",
+        "status": "healthy",
+        "message": "Calibrated this morning",
+        "timestamp": "2026-05-14T07:00:00.000Z"
+      }
+    }
+  }
+}
