@@ -1,0 +1,41 @@
+schema: spec-driven
+
+context: |
+  Project: homebridge-free-sleep — a Homebridge plugin that exposes an Eight Sleep Pod
+  running the open-source `free-sleep` firmware (https://github.com/throwaway31265/free-sleep)
+  to Apple HomeKit.
+
+  Tech stack: TypeScript (ESM, NodeNext, strict), Node >=22, Homebridge 2.x / HAP-NodeJS,
+  vitest for tests, undici/fetch for HTTP. No runtime dependency on the free-sleep repo.
+
+  Architecture: the plugin is a pure HTTP client. It talks to free-sleep's unauthenticated
+  LAN REST API at http://<pod-ip>:3000/api/. It runs on separate always-on hardware, NOT on
+  the Pod. One dynamic platform publishes three bridged accessories (left side, right side,
+  hub).
+
+  Hard constraints that drive most design decisions (see docs/POD-API.md for the full,
+  source-verified list):
+  - GET /api/deviceStatus is a live hardware round-trip over a Unix socket with a sequential
+    queue. Never poll per-characteristic. One shared poller feeds a cache; every HAP onGet
+    reads that cache synchronously.
+  - Writes to settingsDB.json / schedulesDB.json make the Pod cancel and rebuild every
+    scheduled job. Settings writes must be rare and user-initiated.
+  - isOn:true is implemented server-side as a 12-hour duration; it silently expires.
+  - If either side has awayMode on, a write to one side is applied to BOTH sides.
+  - The Pod reboots daily. Connection loss is a normal state, not an error path.
+
+  Conventions: conventional commits. Prefer small, verifiable changes. Every behavioural
+  claim about the Pod API must cite a file path in the free-sleep repo
+  (~/Code/free-sleep) rather than being assumed.
+
+rules:
+  proposal:
+    - Always include a "Non-goals" section.
+    - State which free-sleep API endpoints the change touches and whether any write is
+      expensive (triggers a job rebuild on the Pod).
+  design:
+    - Cite free-sleep source paths for any claim about Pod behaviour.
+    - Call out HomeKit/HAP behaviour that can only be confirmed on a real paired device.
+  tasks:
+    - Every task must be independently verifiable, and say how (unit test, or a manual
+      check against a real Pod / the Home app).

@@ -1,0 +1,46 @@
+{
+  "name": "homebridge-free-sleep",
+  "displayName": "Free Sleep",
+  "version": "0.0.0",
+  "description": "Control an Eight Sleep Pod running free-sleep from Apple Home, locally and without the Eight Sleep cloud.",
+  "license": "MIT",
+  "type": "module",
+  "main": "dist/index.js",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/caseyWebb/homebridge-free-sleep.git"
+  },
+  "bugs": {
+    "url": "https://github.com/caseyWebb/homebridge-free-sleep/issues"
+  },
+  "engines": {
+    "node": "^22 || ^24 || ^26",
+    "homebridge": "^2.0.0"
+  },
+  "keywords": [
+    "homebridge-plugin",
+    "eight-sleep",
+    "free-sleep",
+    "homekit",
+    "thermostat",
+    "local"
+  ],
+  "files": [
+    "dist",
+    "config.schema.json"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "watch": "tsc --watch",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "lint": "eslint .",
+    "typecheck": "tsc --noEmit",
+    "prepublishOnly": "npm run build"
+  },
+  "devDependencies": {
+    "homebridge": "^2.4.0",
+    "typescript": "^5.9.0",
+    "vitest": "^3.2.0"
+  }
+}
