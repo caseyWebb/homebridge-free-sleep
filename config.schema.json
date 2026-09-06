@@ -1,0 +1,121 @@
+{
+  "pluginAlias": "FreeSleep",
+  "pluginType": "platform",
+  "singular": true,
+  "headerDisplay": "Exposes an Eight Sleep Pod running the free-sleep firmware to Apple HomeKit. `host` is the only field most installs need — everything else below is reserved for a future release and has no effect yet.",
+  "schema": {
+    "type": "object",
+    "properties": {
+      "host": {
+        "title": "Pod Host",
+        "type": "string",
+        "required": true,
+        "description": "The Pod's LAN hostname or IP address, e.g. 192.168.1.50."
+      },
+      "sides": {
+        "title": "Sides",
+        "type": "string",
+        "default": "both",
+        "oneOf": [
+          { "title": "Both", "enum": ["both"] },
+          { "title": "Left only", "enum": ["left"] },
+          { "title": "Right only", "enum": ["right"] }
+        ],
+        "description": "Which side accessories to publish."
+      },
+      "pollIntervals": {
+        "title": "Poll interval overrides (reserved, no effect yet)",
+        "type": "object",
+        "properties": {
+          "pollIntervalMs": {
+            "title": "Base poll interval (ms)",
+            "type": "integer",
+            "minimum": 5000
+          },
+          "fastPollIntervalMs": {
+            "title": "Fast-poll interval (ms)",
+            "type": "integer",
+            "minimum": 1000
+          },
+          "fastPollDurationMs": {
+            "title": "Fast-poll window duration (ms)",
+            "type": "integer",
+            "minimum": 0
+          },
+          "slowPollIntervalMs": {
+            "title": "Slow (backed-off) poll interval (ms)",
+            "type": "integer",
+            "minimum": 60000
+          },
+          "maxBackoffMs": {
+            "title": "Maximum backoff interval (ms)",
+            "type": "integer",
+            "minimum": 1000
+          },
+          "writeDebounceMs": {
+            "title": "Write debounce (ms)",
+            "type": "integer",
+            "minimum": 0
+          },
+          "writeMaxDebounceMs": {
+            "title": "Write debounce ceiling (ms)",
+            "type": "integer",
+            "minimum": 0
+          },
+          "alarmPollIntervalMs": {
+            "title": "Alarm-window poll interval (ms)",
+            "type": "integer",
+            "minimum": 1000
+          }
+        }
+      },
+      "writeSettleMs": {
+        "title": "Write settle window (ms, reserved, no effect yet)",
+        "type": "integer",
+        "default": 15000,
+        "minimum": 0
+      },
+      "noResponseAfterMs": {
+        "title": "No Response escalation delay (ms, reserved, no effect yet)",
+        "type": "integer",
+        "default": 600000,
+        "minimum": 0,
+        "description": "0 disables the No Response escalation."
+      },
+      "occupancySource": {
+        "title": "Occupancy source (reserved, no effect yet)",
+        "type": "string",
+        "default": "none",
+        "oneOf": [
+          { "title": "None", "enum": ["none"] },
+          { "title": "Presence", "enum": ["presence"] },
+          { "title": "Vitals", "enum": ["vitals"] }
+        ]
+      },
+      "waterLowSensorType": {
+        "title": "Water-low sensor type (reserved, no effect yet)",
+        "type": "string",
+        "default": "contact",
+        "oneOf": [
+          { "title": "Contact sensor", "enum": ["contact"] },
+          { "title": "Leak sensor", "enum": ["leak"] }
+        ]
+      },
+      "keepAlive": {
+        "title": "Keep-alive (reserved, no effect yet)",
+        "type": "boolean",
+        "default": true
+      },
+      "awayModeWritePolicy": {
+        "title": "Away-mode write policy (reserved, no effect yet)",
+        "type": "string",
+        "default": "mirror",
+        "oneOf": [
+          { "title": "Mirror", "enum": ["mirror"] },
+          { "title": "Block", "enum": ["block"] }
+        ]
+      }
+    },
+    "required": ["host"]
+  }
+}
