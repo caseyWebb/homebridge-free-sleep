@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-import { defaultTimerApi, SnapshotStore, type Change } from '../src/pod/snapshot.js';
+import { defaultTimerApi, SnapshotStore, type Change, type OverlayHandle } from '../src/pod/snapshot.js';
 import type { DeviceStatus, Schedules, Settings, SideStatus } from '../src/pod/types.js';
 import { createTimerHarness, type TimerHarness } from './timerHarness.js';
 import { startMockPod } from './mockPod.js';
@@ -300,6 +300,35 @@ describe('snapshot store: change notifications (3.1-3.5)', () => {
     });
     store.observeDeviceStatus(withDeviceStatus({ targetTemperatureF: 72 }));
     expect(order).toEqual(['notify:targetTemperatureF', 'notify:isOn']);
+  });
+
+  it('two overlay installs for the same key issued back-to-back from inside one notification never alias generations (nit: generation is reserved synchronously, not read back off the possibly-stale overlay map)', () => {
+    store.observeDeviceStatus(withDeviceStatus({ targetTemperatureF: 64 }));
+
+    const handles: OverlayHandle[] = [];
+    let installedBoth = false;
+    store.subscribe((changes) => {
+      if (!installedBoth && changes.some((c) => c.field === 'isOn')) {
+        installedBoth = true;
+        // Both installs happen synchronously from inside this notification, before either's own
+        // (necessarily deferred, per design.md's "Notification delivery") commit has actually
+        // applied — the exact window in which a generation computed from `this.overlay.get(key)`
+        // would alias.
+        handles.push(store.setOverlay('left', 'targetTemperatureF', 80, 15_000));
+        handles.push(store.setOverlay('left', 'targetTemperatureF', 90, 15_000));
+      }
+    });
+    store.observeDeviceStatus(withDeviceStatus({ targetTemperatureF: 64, isOn: true }));
+
+    expect(handles).toHaveLength(2);
+    expect(handles[0]!.generation).not.toBe(handles[1]!.generation);
+    expect(store.get().left.targetTemperatureF).toBe(90); // the later install wins
+
+    store.clearOverlay(handles[0]!); // stale handle — must not touch the still-live second entry
+    expect(store.get().left.targetTemperatureF).toBe(90);
+
+    store.clearOverlay(handles[1]!); // current handle — actually clears it
+    expect(store.get().left.targetTemperatureF).toBe(64); // reverts to the raw value
   });
 });
 

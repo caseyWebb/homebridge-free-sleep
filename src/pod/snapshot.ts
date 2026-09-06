@@ -273,12 +273,32 @@ export interface SnapshotOptions {
   logger?: Logger;
 }
 
+/**
+ * `PodPoller` never touches the overlay layer, so nothing in this module ever calls a poller's
+ * `stop()`; conversely nothing here disposes the overlay's own `setTimeout` handles on its own —
+ * `WriteQueue.stop()` is the only place that ever needs "everything torn down" (it is the
+ * overlay's sole writer, per the module doc above), and it does so by walking its own
+ * per-batch overlay-handle bookkeeping and calling `clearOverlay` on each, which already cancels
+ * that handle's expiry timer. `SnapshotStore` deliberately has no equivalent "dispose everything"
+ * method of its own.
+ */
 export class SnapshotStore {
   private readonly timers: TimerApi;
   private readonly logger: Logger;
 
   private raw: RawState = initialRawState();
   private readonly overlay = new Map<OverlayKey, OverlayEntry>();
+  /**
+   * A single monotonic counter backing every `OverlayHandle.generation`, reserved synchronously
+   * at call time rather than derived from `this.overlay.get(key)?.generation` — the latter would
+   * race two `setOverlay` calls for the same key issued back-to-back while a commit is already
+   * draining (e.g. two re-entrant installs from inside one notification, design.md "Notification
+   * delivery"): both would read the same not-yet-applied prior generation and compute an
+   * identical "next" value, aliasing two distinct installations under one generation number and
+   * defeating the staleness check in `clearOverlay`/`expireOverlay`. A shared counter across all
+   * keys (rather than per-key) is simplest and only makes the uniqueness guarantee stronger.
+   */
+  private overlayGenerationSeq = 0;
   private effective: EffectiveSnapshot;
 
   private readonly listeners = new Set<Listener>();
@@ -298,14 +318,6 @@ export class SnapshotStore {
   /** Synchronous, I/O-free, returns the current frozen commit by reference. */
   get(): EffectiveSnapshot {
     return this.effective;
-  }
-
-  /**
-   * The raw (pre-overlay) view — exists for the overlay-agreement check internally and for
-   * diagnostics. Computed fresh on each call rather than cached, since it is rarely read.
-   */
-  getObserved(): EffectiveSnapshot {
-    return deepFreeze(this.computeEffective(true));
   }
 
   // ---- observations (writer: PodPoller) -----------------------------------------------
@@ -366,7 +378,7 @@ export class SnapshotStore {
       );
     }
     const key = overlayKey(side, field);
-    const generation = (this.overlay.get(key)?.generation ?? 0) + 1;
+    const generation = ++this.overlayGenerationSeq;
     this.commit(() => {
       const existing = this.overlay.get(key);
       if (existing?.timerHandle) {
