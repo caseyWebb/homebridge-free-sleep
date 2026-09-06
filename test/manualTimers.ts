@@ -39,9 +39,24 @@ function realTick(ms: number): Promise<void> {
 }
 
 const SETTLE_STEP_MS = 20;
-/** The queue must go this long with no change before settle() declares quiescence — comfortably
+/**
+ * The queue must go this long with no change before settle() declares quiescence — comfortably
  * above `RETRY_BASE_DELAY_MS + RETRY_JITTER_MS` (`src/pod/client.ts`, ~700ms worst case), the one
- * real, un-fakeable delay this file has to wait through. */
+ * real, un-fakeable delay this file has to wait through.
+ *
+ * S3 (code review, `thermostat-and-offline`): this is a timing-based heuristic with a real but
+ * bounded margin (~200ms above the ~700ms worst case; bisection found failures only at windows
+ * ≤600ms), not a proof. An explicit-signal replacement was investigated and deliberately NOT
+ * adopted: the natural signal — "the mock Pod's in-flight request count is 0" — is a false
+ * positive for exactly the window this constant exists to cover, because `PodClient`'s retry
+ * backoff (the ~700ms worst case above) is a real `setTimeout` that fires *between* HTTP
+ * requests, while the mock genuinely has zero requests in flight. A signal that actually
+ * distinguishes "backed off, about to retry" from "truly idle" would have to originate inside
+ * `PodClient` itself (e.g. a "retry pending" flag), which means adding a test-only seam to
+ * production code purely to make this harness provable — a worse trade than a documented,
+ * empirically-bisected timing margin. If this constant ever needs to grow, re-bisect against
+ * `RETRY_BASE_DELAY_MS + RETRY_JITTER_MS` rather than picking a new number by feel.
+ */
 const SETTLE_STABLE_WINDOW_MS = 900;
 /** Overall cap, in case something never settles at all (e.g. a `stop()` mid-chain) — comfortably
  * above `PodClient`'s own worst-case timeout-plus-retry budget (`platform.ts`'s
