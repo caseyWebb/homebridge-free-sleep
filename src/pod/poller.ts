@@ -26,6 +26,7 @@ import {
 import {
   defaultLogger,
   defaultTimerApi,
+  type EffectiveSnapshot,
   type ErrorKind,
   type Logger,
   type SnapshotStore,
@@ -62,6 +63,15 @@ interface EndpointClassSpec<T> {
   read: (client: PodClient, signal: AbortSignal) => Promise<T>;
   apply: (snapshot: SnapshotStore, value: T) => void;
   recordFailure?: (snapshot: SnapshotStore, kind: ErrorKind) => void;
+  /**
+   * Extension point for #19 (design.md, "The poller is a registry of endpoint-class
+   * descriptors"): evaluated against the current snapshot before each poll of this class. A
+   * class with no `enabled` is always enabled. A disabled class skips the actual request but
+   * keeps its schedule running — the next scheduled tick re-evaluates the predicate, so the
+   * class polls again on its own as soon as it flips back to enabled, with no external kick
+   * needed. None of the four shipped classes uses this today.
+   */
+  enabled?: (snapshot: EffectiveSnapshot) => boolean;
 }
 
 interface ModeEntry {
@@ -250,8 +260,26 @@ export class PodPoller {
     return this.runPoll(rt);
   }
 
+  private isEnabled(rt: ClassRuntime): boolean {
+    return rt.spec.enabled ? rt.spec.enabled(this.snapshot.get()) : true;
+  }
+
   private async runPoll(rt: ClassRuntime): Promise<void> {
     rt.inFlight = true;
+
+    if (!this.isEnabled(rt)) {
+      // Disabled right now: skip the request entirely, but still resolve anyone waiting on this
+      // tick and keep the class's own schedule alive so it re-checks — and re-enables itself —
+      // on the next tick, with no external kick required.
+      const waiters = rt.refreshWaiters;
+      rt.refreshWaiters = [];
+      rt.inFlight = false;
+      rt.lastPollAt = this.timers.now();
+      waiters.forEach((resolve) => resolve());
+      if (!rt.stopped && !this.stopped) this.scheduleNext(rt);
+      return;
+    }
+
     const controller = new AbortController();
     rt.abortController = controller;
 
@@ -308,7 +336,16 @@ export class PodPoller {
   // -----------------------------------------------------------------------------------
 
   async bootstrap(): Promise<void> {
-    const enabledClasses = [...this.classes.values()];
+    if (this.stopped) return; // never contact the Pod once stopped
+
+    const allClasses = [...this.classes.values()];
+    const enabledClasses = allClasses.filter((rt) => this.isEnabled(rt));
+    // A class that is disabled right now still needs its recurring schedule kicked off — its
+    // own `fire`/`runPoll` re-evaluates `enabled` on every future tick — it just does not get an
+    // actual request (or a slot in the deadline race) at bootstrap time.
+    for (const rt of allClasses) {
+      if (!enabledClasses.includes(rt)) this.scheduleNext(rt);
+    }
     const deadline = new Promise<void>((resolve) => {
       this.bootstrapDeadlineHandle = this.timers.setTimeout(resolve, this.bootstrapTimeoutMs);
     });
@@ -350,6 +387,7 @@ export class PodPoller {
 
   async refresh(classId: EndpointClassId): Promise<void> {
     const rt = this.runtime(classId);
+    if (this.stopped || rt.stopped) return; // never contact the Pod once stopped
     if (rt.inFlight) {
       await new Promise<void>((resolve) => rt.refreshWaiters.push(resolve));
       return;

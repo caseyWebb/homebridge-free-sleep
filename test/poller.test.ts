@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { PodPoller } from '../src/pod/poller.js';
-import { SnapshotStore, type Logger, type TimerApi } from '../src/pod/snapshot.js';
+import { SnapshotStore, type EffectiveSnapshot, type Logger, type TimerApi } from '../src/pod/snapshot.js';
 import type { DeviceStatus, Schedules, Services, Settings } from '../src/pod/types.js';
 import { createFakePodClient, type FakePodClient } from './fakePodClient.js';
 import { createTimerHarness, type TimerHarness } from './timerHarness.js';
@@ -464,6 +464,63 @@ describe('poller: stop() (6.6)', () => {
     await vi.advanceTimersByTimeAsync(5000);
     poller.stop();
     expect(timers.pendingCount()).toBe(0);
+  });
+});
+
+describe('poller: stop() guards further Pod contact (S3 regression)', () => {
+  it('refresh() called after stop() issues no request', async () => {
+    const { fake, poller } = setup({ slowPollIntervalMs: 300_000 });
+    await poller.bootstrap();
+    poller.stop();
+
+    const before = fake.settings.calls;
+    await poller.refresh('settings');
+    expect(fake.settings.calls).toBe(before);
+  });
+
+  it('bootstrap() called after stop() issues no request at all', async () => {
+    const { fake, poller } = setup();
+    poller.stop();
+
+    await poller.bootstrap();
+    expect(fake.deviceStatus.calls).toBe(0);
+    expect(fake.settings.calls).toBe(0);
+    expect(fake.schedules.calls).toBe(0);
+    expect(fake.services.calls).toBe(0);
+  });
+});
+
+describe('poller: per-class enabled predicate (S4 regression)', () => {
+  it('a class gated on a snapshot field is skipped while disabled, keeps its own schedule, and re-enables itself once the field flips — with no external kick', async () => {
+    const { fake, poller, snapshot, timers } = setup({ slowPollIntervalMs: 60_000 });
+    timers.random = () => 0.5;
+
+    // Reach into the private class registry to gate the (otherwise-unused-here) `services`
+    // class on a snapshot field — exactly the shape #19 will wire for real
+    // (design.md: "the `enabled` predicate is there so #19 can gate on
+    // `services.biometrics.enabled`"). No public constructor option exists for this yet, since
+    // none of the four shipped classes needs it — this test exercises the mechanism itself.
+    const internal = poller as unknown as {
+      classes: Map<string, { spec: { enabled?: (snapshot: EffectiveSnapshot) => boolean } }>;
+    };
+    internal.classes.get('services')!.spec.enabled = (s) => s.left.awayMode === true;
+
+    await poller.bootstrap();
+    expect(fake.services.calls).toBe(0); // disabled at bootstrap — no observed awayMode yet
+    expect(fake.deviceStatus.calls).toBe(1); // the other three classes are unaffected
+    expect(fake.settings.calls).toBe(1);
+    expect(fake.schedules.calls).toBe(1);
+
+    await vi.advanceTimersByTimeAsync(60_000); // one full slow-class period
+    expect(fake.services.calls).toBe(0); // still disabled — the schedule kept running, the request was skipped
+
+    snapshot.observeSettings({
+      ...settingsFixture,
+      left: { ...settingsFixture.left, awayMode: true },
+    });
+    await vi.advanceTimersByTimeAsync(60_000); // next scheduled check re-evaluates and finds it enabled
+    expect(fake.services.calls).toBe(1); // re-enabled itself — no refresh()/requestMode() call was needed
+    poller.stop();
   });
 });
 
