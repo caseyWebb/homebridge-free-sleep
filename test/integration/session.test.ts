@@ -15,14 +15,25 @@ import type { PlatformConfig } from 'homebridge';
 
 import { PodClient } from '../../src/pod/client.js';
 import { FreeSleepPlatform } from '../../src/platform.js';
+import { SettingsSchema } from '../../src/pod/types.js';
 import { PLATFORM_NAME } from '../../src/settings.js';
 import {
   createFakeLogging,
   FakeHomebridgeApi,
   FakePlatformAccessory,
 } from '../fakeHomebridgeApi.js';
+import { loadFixture } from '../loadFixture.js';
 import { createManualTimers, type ManualTimers } from '../manualTimers.js';
 import { startMockPod, type MockPod } from '../mockPod.js';
+
+/** Side accessory display names come from the mock's own `settings.json` fixture (via
+ * `nameFor`'s settings-name-seeding), not a fallback — read them from the same fixture rather
+ * than hardcoding a snapshot of its current values, which the `real-fixtures` change already
+ * showed can legitimately change. */
+const fixtureSettings = SettingsSchema.parse(loadFixture('settings.json'));
+const LEFT_NAME = fixtureSettings.left.name;
+const RIGHT_NAME = fixtureSettings.right.name;
+const HUB_NAME = 'Pod';
 
 function clientFor(pod: MockPod): PodClient {
   const { hostname, port } = new URL(pod.url);
@@ -89,11 +100,11 @@ describe('session harness (8.2)', () => {
     try {
       expect(api.registeredAccessories).toHaveLength(3);
       const names = api.registeredAccessories.map((a) => a.displayName).sort();
-      expect(names).toEqual(['Left side', 'Pod', 'Right side']);
+      expect(names).toEqual([LEFT_NAME, HUB_NAME, RIGHT_NAME].sort());
 
-      const left = accessoryByName(api, 'Left side');
-      const right = accessoryByName(api, 'Right side');
-      const hub = accessoryByName(api, 'Pod');
+      const left = accessoryByName(api, LEFT_NAME);
+      const right = accessoryByName(api, RIGHT_NAME);
+      const hub = accessoryByName(api, HUB_NAME);
       expect(left.services.some((s) => s.UUID === api.hap.Service.Thermostat.UUID)).toBe(true);
       expect(right.services.some((s) => s.UUID === api.hap.Service.Thermostat.UUID)).toBe(true);
       expect(hub.services.some((s) => s.UUID === api.hap.Service.ContactSensor.UUID)).toBe(true);
@@ -144,7 +155,7 @@ describe('slider-drag guardrail (8.4)', () => {
   it('six TargetTemperature writes 50ms apart produce exactly one POST carrying the last degree, and all six resolve', async () => {
     const { pod, api, timers } = await bootSession();
     try {
-      const left = accessoryByName(api, 'Left side');
+      const left = accessoryByName(api, LEFT_NAME);
       const hap = api.hap;
       const service = left.getServiceById(hap.Service.Thermostat, 'thermostat')!;
       const targetTemp = service.getCharacteristic(hap.Characteristic.TargetTemperature);
@@ -188,7 +199,7 @@ describe('outage guardrail (8.5)', () => {
       pollIntervals: { pollIntervalMs: 5000, maxBackoffMs: 10_000 },
     });
     try {
-      const hub = accessoryByName(api, 'Pod');
+      const hub = accessoryByName(api, HUB_NAME);
       const hap = api.hap;
       const connectionService = hub.getServiceById(hap.Service.ContactSensor, 'connection')!;
       const contactState = connectionService.getCharacteristic(hap.Characteristic.ContactSensorState);
@@ -212,7 +223,7 @@ describe('outage guardrail (8.5)', () => {
       // Every read during the outage must still serve a last-known value, never throw.
       await expect(readEveryCharacteristic(api)).resolves.toBeUndefined();
 
-      const left = accessoryByName(api, 'Left side');
+      const left = accessoryByName(api, LEFT_NAME);
       const targetTemp = left.getServiceById(hap.Service.Thermostat, 'thermostat')!.getCharacteristic(hap.Characteristic.TargetTemperature);
       expect(await targetTemp.handleGetRequest()).not.toBeNull();
 
@@ -244,7 +255,7 @@ describe('offline-then-escalate (8.6)', () => {
       noResponseAfterMs: 30_000,
     });
     try {
-      const left = accessoryByName(api, 'Left side');
+      const left = accessoryByName(api, LEFT_NAME);
       const hap = api.hap;
       const targetTemp = left
         .getServiceById(hap.Service.Thermostat, 'thermostat')!
