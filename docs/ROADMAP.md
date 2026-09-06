@@ -1,17 +1,23 @@
 # Roadmap
 
-Milestones map 1:1 to GitHub milestones. Each is independently shippable — you should have a
-working, paired HomeKit accessory at the end of M2 and can stop any time after that.
+Milestones map 1:1 to GitHub milestones, and every bullet below is a tracked issue. Each
+milestone is independently shippable — you should have a working, paired HomeKit accessory at
+the end of M2 and can stop any time after that.
+
+Design rationale lives in [POD-API.md](POD-API.md) (what the Pod actually does) and
+[HOMEKIT.md](HOMEKIT.md) (how we model it in HAP). Several non-obvious decisions are recorded
+there rather than in the issues.
 
 ## M1 — Foundations
 
 Repo, build, and a typed client that can talk to a real Pod. No HomeKit yet.
 
-- Project scaffolding: TypeScript ESM/NodeNext, vitest, lint, CI.
-- `FreeSleepClient` — typed HTTP client with timeouts, retry and backoff.
-- Vendored types derived from free-sleep's zod schemas.
-- Vendored stateful Pod test double, based on upstream's MSW mock.
-- Temperature conversion utilities (°F ↔ °C) with round-trip tests.
+- #1 Build tooling: ESLint, vitest, CI on Node 22/24/26.
+- #2 Vendor Pod types from free-sleep's zod schemas.
+- #3 Capture real Pod fixtures.
+- #4 `PodClient`: typed HTTP client with timeout, dedupe, retry policy.
+- #5 Stateful mock Pod as the executable spec.
+- #6 Temperature conversion and `TargetTemperature` props.
 
 **Done when:** `npm test` is green and a smoke script can read live status from the real Pod.
 
@@ -19,12 +25,13 @@ Repo, build, and a typed client that can talk to a real Pod. No HomeKit yet.
 
 The minimum viable plugin: each side of the bed as a HomeKit thermostat.
 
-- Dynamic platform, accessory cache, config schema.
-- `PodPoller`: single shared poll, cached snapshot, change diffing, `updateCharacteristic` push.
-- `WriteQueue`: per-side debounce, coalescing, optimistic state, confirm reads.
-- Thermostat service per side.
-- Offline handling across the daily reboot — note this is *not* HAP "No Response" by default;
-  see docs/HOMEKIT.md for why `updateCharacteristic(c, new Error())` does not work.
+- #7 Dynamic platform, accessory topology, and config schema.
+- #8 `PodPoller`: single shared poll, cached snapshot, change diffing.
+- #9 Thermostat service per side.
+- #10 `WriteQueue`: debounce, coalesce, optimistic overlay.
+- #11 Offline handling across the daily reboot — note this is *not* HAP "No Response" by
+  default; see [HOMEKIT.md](HOMEKIT.md) for why `updateCharacteristic(c, new Error())` is a
+  no-op in an `onGet`-based plugin.
 
 **Done when:** paired in the Home app, both sides controllable, state survives a Pod reboot.
 
@@ -32,28 +39,29 @@ The minimum viable plugin: each side of the bed as a HomeKit thermostat.
 
 The things that make it trustworthy rather than a demo.
 
-- Keep-alive so "on" does not silently expire after 12 hours.
-- Away-mode write guard for the both-sides coupling.
-- Temperature rounding that does not make the Home slider jitter.
-- Load check: no new franken timeouts in the Pod's logs versus baseline.
+- #12 Keep-alive so "on" does not silently expire after 12 hours.
+- #13 Away-mode write guard for the both-sides coupling.
+- #14 Eliminate Home app temperature slider jitter.
+- #15 Load check: no new franken timeouts on the Pod.
 
 **Done when:** the plugin runs unattended for a week with no manual intervention.
 
 ## M4 — Everything else worth exposing
 
-- Away Mode switch per side.
-- Skip Alarm switch per side (via `scheduleOverrides.alarm.expiresAt`).
-- Alarm event as a StatelessProgrammableSwitch plus a Dismiss switch, with scheduled
-  fast-poll windows so short alarms are not missed.
-- Hub connection sensor so outages are visible as data rather than as No Response.
-- Occupancy sensor per side, auto-gated on `biometrics.enabled`.
-- Hub accessory: prime switch, water-low sensor, LED lightbulb.
+- #16 Alarm event and dismiss, with scheduled fast-poll.
+- #17 Skip Next Alarm switch per side (via `scheduleOverrides.alarm.expiresAt`, **not**
+  `.disabled` — see [POD-API.md](POD-API.md)).
+- #18 Away Mode switch per side.
+- #19 Occupancy sensor per side.
+- #20 Hub accessory: water, prime, LED, test alarm, server fault.
 
 ## M5 — Release
 
-- README with setup instructions and the biometrics/occupancy caveats.
-- `config.schema.json` polished for the Homebridge UI.
-- Publish to npm, verify discoverability in Homebridge UI.
+- #21 README, config reference, and honest feature caveats.
+- #22 Publish to npm and verify Homebridge UI discoverability.
+
+The repo is **private** until this milestone. Flip it with
+`gh repo edit caseyWebb/homebridge-free-sleep --visibility public`.
 
 ## Explicit non-goals
 
@@ -68,12 +76,6 @@ The things that make it trustworthy rather than a demo.
 
 ## Possible upstream contributions to free-sleep
 
-Not required for anything above, but they would each make this plugin better:
-
-- **SSE for device status.** `FrankenMonitor` already keeps a fresh snapshot in memory and
-  refreshes it every 2 s (Pod 4/5) or 60 s (Pod 3). Exposing it as
-  `GET /api/deviceStatus/stream` would let clients drop polling entirely. Useful to Home
-  Assistant users too.
-- **Expose `taps` over HTTP**, which would unlock tap-to-trigger-a-scene.
-- **Persist presence**, or report a "presence is unknown" state after restart, instead of
-  defaulting to `present: false`.
+Tracked in #23. Not required for anything above, but each would make this plugin better —
+the highest-value one by far is exposing `FrankenMonitor`'s existing in-memory snapshot as an
+SSE stream, which would remove polling entirely.
