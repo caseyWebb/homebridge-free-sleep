@@ -1,0 +1,360 @@
+import { afterEach, describe, expect, it } from 'vitest';
+
+import { startMockPod, type MockPod } from './mockPod.js';
+import { loadFixture } from './loadFixture.js';
+
+const deviceStatusFixture = loadFixture('deviceStatus.json');
+const settingsFixture = loadFixture('settings.json') as { id: string };
+const schedulesFixture = loadFixture('schedules.json');
+const servicesFixture = loadFixture('services.json');
+
+let pods: MockPod[] = [];
+
+async function start(...args: Parameters<typeof startMockPod>): Promise<MockPod> {
+  const pod = await startMockPod(...args);
+  pods.push(pod);
+  return pod;
+}
+
+afterEach(async () => {
+  await Promise.all(pods.map((pod) => pod.close()));
+  pods = [];
+});
+
+describe('transport', () => {
+  it('listens on an ephemeral port and serves the fixture over real HTTP', async () => {
+    const pod = await start();
+    expect(pod.url).toMatch(/^http:\/\/127\.0\.0\.1:\d+$/);
+
+    const response = await fetch(`${pod.url}/api/deviceStatus`);
+    expect(response.status).toBe(200);
+    const body = await response.json();
+    expect(body).toEqual(deviceStatusFixture);
+  });
+
+  it('close() resolves', async () => {
+    const pod = await startMockPod();
+    await expect(pod.close()).resolves.toBeUndefined();
+  });
+
+  it('seeds all four GET endpoints from the fixtures', async () => {
+    const pod = await start();
+    const [deviceStatus, settings, schedules, services] = await Promise.all([
+      fetch(`${pod.url}/api/deviceStatus`).then((r) => r.json()),
+      fetch(`${pod.url}/api/settings`).then((r) => r.json()),
+      fetch(`${pod.url}/api/schedules`).then((r) => r.json()),
+      fetch(`${pod.url}/api/services`).then((r) => r.json()),
+    ]);
+    expect(deviceStatus).toEqual(deviceStatusFixture);
+    expect(settings).toEqual(settingsFixture);
+    expect(schedules).toEqual(schedulesFixture);
+    expect(services).toEqual(servicesFixture);
+  });
+
+  it('an override at startup is reflected in a read', async () => {
+    const pod = await start({ state: { settings: { left: { awayMode: true } } } });
+    const settings = (await fetch(`${pod.url}/api/settings`).then((r) => r.json())) as {
+      left: { awayMode: boolean };
+    };
+    expect(settings.left.awayMode).toBe(true);
+  });
+
+  it('reset() after a write restores the seed and empties requests/commands', async () => {
+    const pod = await start();
+    await fetch(`${pod.url}/api/deviceStatus`, {
+      method: 'POST',
+      body: JSON.stringify({ left: { isOn: false } }),
+      headers: { 'content-type': 'application/json' },
+    });
+    expect(pod.requests.length).toBeGreaterThan(0);
+
+    pod.reset();
+    expect(pod.requests).toEqual([]);
+    expect(pod.commands).toEqual([]);
+    const deviceStatus = await fetch(`${pod.url}/api/deviceStatus`).then((r) => r.json());
+    expect(deviceStatus).toEqual(deviceStatusFixture);
+  });
+
+  it('three mocks started concurrently get distinct ports and independent state', async () => {
+    const [a, b, c] = await Promise.all([
+      start({ state: { settings: { left: { awayMode: true } } } }),
+      start(),
+      start(),
+    ]);
+    const ports = [a.url, b.url, c.url];
+    expect(new Set(ports).size).toBe(3);
+
+    const aSettings = (await fetch(`${a.url}/api/settings`).then((r) => r.json())) as {
+      left: { awayMode: boolean };
+    };
+    const bSettings = (await fetch(`${b.url}/api/settings`).then((r) => r.json())) as {
+      left: { awayMode: boolean };
+    };
+    expect(aSettings.left.awayMode).toBe(true);
+    expect(bSettings.left.awayMode).toBe(false);
+  });
+
+  it('records method, path, headers, parsed body, status, and timestamp for both a valid and an invalid write', async () => {
+    const pod = await start();
+
+    await fetch(`${pod.url}/api/deviceStatus`, {
+      method: 'POST',
+      body: JSON.stringify({ left: { targetTemperatureF: 70 } }),
+      headers: { 'content-type': 'application/json' },
+    });
+    await fetch(`${pod.url}/api/deviceStatus`, {
+      method: 'POST',
+      body: JSON.stringify({ left: { bogusField: true } }),
+      headers: { 'content-type': 'application/json' },
+    });
+
+    expect(pod.requests).toHaveLength(2);
+    expect(pod.requests[0]?.status).toBe(204);
+    expect(pod.requests[0]?.method).toBe('POST');
+    expect(pod.requests[0]?.path).toBe('/api/deviceStatus');
+    expect(pod.requests[0]?.headers['content-type']).toBe('application/json');
+    expect(pod.requests[0]?.at).toBeTypeOf('number');
+
+    expect(pod.requests[1]?.status).toBe(400);
+    expect(pod.requests[1]?.body).toEqual({ left: { bogusField: true } });
+  });
+
+  describe('fault injection', () => {
+    it('a scripted 500 is followed by a normal 200 once exhausted', async () => {
+      const pod = await start();
+      pod.fault('GET /api/deviceStatus', { kind: 'status', status: 500, times: 1 });
+
+      const first = await fetch(`${pod.url}/api/deviceStatus`);
+      expect(first.status).toBe(500);
+
+      const second = await fetch(`${pod.url}/api/deviceStatus`);
+      expect(second.status).toBe(200);
+    });
+
+    it('a hang is ended by the caller\'s own timeout', async () => {
+      const pod = await start();
+      pod.fault('GET /api/deviceStatus', { kind: 'hang', times: 1 });
+
+      await expect(
+        fetch(`${pod.url}/api/deviceStatus`, { signal: AbortSignal.timeout(200) }),
+      ).rejects.toThrow();
+    });
+
+    it('a reset surfaces as a network-level fetch failure', async () => {
+      const pod = await start();
+      pod.fault('GET /api/deviceStatus', { kind: 'reset', times: 1 });
+
+      await expect(fetch(`${pod.url}/api/deviceStatus`)).rejects.toThrow();
+
+      // normal service resumes once the fault is exhausted
+      const response = await fetch(`${pod.url}/api/deviceStatus`);
+      expect(response.status).toBe(200);
+    });
+  });
+});
+
+async function postDeviceStatus(pod: MockPod, body: unknown): Promise<Response> {
+  return fetch(`${pod.url}/api/deviceStatus`, {
+    method: 'POST',
+    body: JSON.stringify(body),
+    headers: { 'content-type': 'application/json' },
+  });
+}
+
+async function postSettings(pod: MockPod, body: unknown): Promise<Response> {
+  return fetch(`${pod.url}/api/settings`, {
+    method: 'POST',
+    body: JSON.stringify(body),
+    headers: { 'content-type': 'application/json' },
+  });
+}
+
+type PartialDeviceStatus = {
+  left: { isOn: boolean; secondsRemaining: number; targetTemperatureF: number };
+  right: { isOn: boolean; secondsRemaining: number; targetTemperatureF: number };
+};
+
+async function getDeviceStatus(pod: MockPod): Promise<PartialDeviceStatus> {
+  const response = await fetch(`${pod.url}/api/deviceStatus`);
+  return (await response.json()) as PartialDeviceStatus;
+}
+
+describe('strict request validation (5.1)', () => {
+  it('an unknown key gives 400 naming the key, with no state change', async () => {
+    const pod = await start();
+    const before = await getDeviceStatus(pod);
+
+    const response = await postDeviceStatus(pod, { left: { turboMode: true } });
+    expect(response.status).toBe(400);
+    const responseBody = (await response.json()) as { error: string; details: unknown[] };
+    expect(responseBody.error).toBe('Invalid request data');
+    expect(JSON.stringify(responseBody.details)).toMatch(/turboMode/);
+
+    const after = await getDeviceStatus(pod);
+    expect(after).toEqual(before);
+  });
+
+  it('an out-of-range temperature gives 400', async () => {
+    const pod = await start();
+    const response = await postDeviceStatus(pod, { left: { targetTemperatureF: 200 } });
+    expect(response.status).toBe(400);
+  });
+
+  it('a valid device-status write gives 204 with an empty body', async () => {
+    const pod = await start();
+    const response = await postDeviceStatus(pod, { left: { targetTemperatureF: 70 } });
+    expect(response.status).toBe(204);
+    const text = await response.text();
+    expect(text).toBe('');
+  });
+
+  it('a valid settings write gives 200 with id absent from the response', async () => {
+    const pod = await start();
+    const response = await postSettings(pod, { left: { awayMode: true } });
+    expect(response.status).toBe(200);
+    const body = (await response.json()) as Record<string, unknown>;
+    expect('id' in body).toBe(false);
+    expect(body.left).toMatchObject({ awayMode: true });
+  });
+});
+
+describe('zero-duration silent no-op and power-off (5.2)', () => {
+  it('secondsRemaining: 0 does not turn a side off', async () => {
+    const pod = await start();
+    await postDeviceStatus(pod, { left: { secondsRemaining: 600 } });
+    const response = await postDeviceStatus(pod, { left: { secondsRemaining: 0 } });
+    expect(response.status).toBe(204);
+
+    const after = await getDeviceStatus(pod);
+    expect(after.left.isOn).toBe(true);
+    expect(after.left.secondsRemaining).toBe(600);
+  });
+
+  it('isOn: false does turn a side off', async () => {
+    const pod = await start();
+    await postDeviceStatus(pod, { left: { secondsRemaining: 600 } });
+    await postDeviceStatus(pod, { left: { isOn: false } });
+
+    const after = await getDeviceStatus(pod);
+    expect(after.left.isOn).toBe(false);
+    expect(after.left.secondsRemaining).toBe(0);
+  });
+
+  it('secondsRemaining: 900 sets 900', async () => {
+    const pod = await start();
+    await postDeviceStatus(pod, { left: { secondsRemaining: 900 } });
+    const after = await getDeviceStatus(pod);
+    expect(after.left.secondsRemaining).toBe(900);
+    expect(after.left.isOn).toBe(true);
+  });
+});
+
+describe('twelve-hour expansion and derived power state (5.3)', () => {
+  it('isOn: true sets 43200 and reads isOn: true', async () => {
+    const pod = await start();
+    await postDeviceStatus(pod, { left: { isOn: true } });
+    const after = await getDeviceStatus(pod);
+    expect(after.left.secondsRemaining).toBe(43200);
+    expect(after.left.isOn).toBe(true);
+  });
+
+  it('power state follows remaining time directly, with no stored flag', async () => {
+    const pod = await start();
+    await postDeviceStatus(pod, { left: { secondsRemaining: 1 } });
+    expect((await getDeviceStatus(pod)).left.isOn).toBe(true);
+
+    await postDeviceStatus(pod, { left: { isOn: false } });
+    expect((await getDeviceStatus(pod)).left.isOn).toBe(false);
+  });
+});
+
+describe('away-mode both-sides mirroring (5.4)', () => {
+  it('a write to one side hits both when the other is in away mode', async () => {
+    const pod = await start({ state: { settings: { right: { awayMode: true } } } });
+    await postDeviceStatus(pod, { left: { targetTemperatureF: 70 } });
+    const after = await getDeviceStatus(pod);
+    expect(after.left.targetTemperatureF).toBe(70);
+    expect(after.right.targetTemperatureF).toBe(70);
+  });
+
+  it('with neither side away, a write to one side affects only that side', async () => {
+    const pod = await start();
+    const before = await getDeviceStatus(pod);
+    await postDeviceStatus(pod, { left: { targetTemperatureF: 70 } });
+    const after = await getDeviceStatus(pod);
+    expect(after.left.targetTemperatureF).toBe(70);
+    expect(after.right.targetTemperatureF).toBe(before.right.targetTemperatureF);
+  });
+});
+
+describe('fixed command expansion and ordering (5.5)', () => {
+  it('a body with properties in reverse order still produces the canonical sequence', async () => {
+    const pod = await start();
+    await postDeviceStatus(pod, {
+      left: { isAlarmVibrating: false, secondsRemaining: 300, targetTemperatureF: 68, isOn: true },
+    });
+    const names = pod.commands.map((c) => c.name);
+    expect(names).toEqual([
+      'LEFT_TEMP_DURATION', // isOn
+      'TEMP_LEVEL_LEFT', // targetTemperatureF
+      'LEFT_TEMP_DURATION', // secondsRemaining
+      'ALARM_CLEAR', // isAlarmVibrating
+    ]);
+  });
+
+  it('a body setting fields on both sides logs all left commands before all right', async () => {
+    const pod = await start();
+    await postDeviceStatus(pod, {
+      left: { targetTemperatureF: 68 },
+      right: { targetTemperatureF: 72 },
+    });
+    const sides = pod.commands.map((c) => c.side);
+    expect(sides).toEqual(['left', 'right']);
+  });
+
+  it('{left: {isOn: true, secondsRemaining: 600}} logs 43200 then 600, and leaves the side at 600', async () => {
+    const pod = await start();
+    await postDeviceStatus(pod, { left: { isOn: true, secondsRemaining: 600 } });
+    const durationCommands = pod.commands.filter((c) => c.name === 'LEFT_TEMP_DURATION');
+    expect(durationCommands.map((c) => c.value)).toEqual(['43200', '600']);
+
+    const after = await getDeviceStatus(pod);
+    expect(after.left.secondsRemaining).toBe(600);
+  });
+
+  it('top level: PRIME -> left -> right -> settings', async () => {
+    const pod = await start();
+    await postDeviceStatus(pod, {
+      isPriming: true,
+      left: { targetTemperatureF: 68 },
+      right: { targetTemperatureF: 72 },
+      settings: { ledBrightness: 10 },
+    });
+    expect(pod.commands.map((c) => c.name)).toEqual([
+      'PRIME',
+      'TEMP_LEVEL_LEFT',
+      'TEMP_LEVEL_RIGHT',
+      'SET_SETTINGS',
+    ]);
+  });
+});
+
+describe('no plugin policy (5.6)', () => {
+  it('two identical writes both apply and both appear in pod.requests', async () => {
+    const pod = await start();
+    const first = await postDeviceStatus(pod, { left: { secondsRemaining: 500 } });
+    const second = await postDeviceStatus(pod, { left: { secondsRemaining: 500 } });
+    expect(first.status).toBe(204);
+    expect(second.status).toBe(204);
+    expect(pod.requests.filter((r) => r.path === '/api/deviceStatus')).toHaveLength(2);
+  });
+
+  it('a write to a side in away mode is applied (mirrored), not suppressed', async () => {
+    const pod = await start({ state: { settings: { left: { awayMode: true } } } });
+    const response = await postDeviceStatus(pod, { right: { targetTemperatureF: 66 } });
+    expect(response.status).toBe(204);
+    const after = await getDeviceStatus(pod);
+    expect(after.left.targetTemperatureF).toBe(66);
+    expect(after.right.targetTemperatureF).toBe(66);
+  });
+});

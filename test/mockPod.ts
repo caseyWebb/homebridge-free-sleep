@@ -1,0 +1,561 @@
+/**
+ * A stateful in-process mock Pod on `node:http`, seeded from `test/fixtures/`.
+ *
+ * This is the executable spec for `PodClient` (openspec/changes/pod-client/design.md,
+ * "The mock is a `node:http` server, not MSW"): it reproduces free-sleep's actual write
+ * semantics — the truthiness guards, the 12-hour power-on duration, the away-mode mirroring,
+ * the fixed command ordering — rather than an idealised API, citing
+ * `server/src/routes/deviceStatus/updateDeviceStatus.ts` and
+ * `server/src/routes/settings/settings.ts` at v2.1.5 / `dc0c710` throughout.
+ *
+ * Deliberately implements **no plugin policy**: no write deduplication, no away-mode guard,
+ * no coalescing. Those are the policies later changes (#10, #12, #13) test *against* this
+ * mock's recording, so the mock must apply every write it is given, honestly.
+ */
+
+import { createServer, type IncomingMessage, type ServerResponse, type Server } from 'node:http';
+import type { AddressInfo } from 'node:net';
+
+import {
+  DeviceStatusPatchSchema,
+  DeviceStatusSchema,
+  SchedulesSchema,
+  ServicesSchema,
+  SettingsPatchSchema,
+  SettingsSchema,
+  type DeviceStatus,
+  type DeviceStatusPatch,
+  type Schedules,
+  type Services,
+  type Settings,
+  type Side,
+  type SideStatus,
+} from '../src/pod/types.js';
+import { loadFixture } from './loadFixture.js';
+
+// ---------------------------------------------------------------------------------------
+// Public shape
+// ---------------------------------------------------------------------------------------
+
+export interface Command {
+  /** The name upstream passes to `executeFunction` — e.g. `'LEFT_TEMP_DURATION'`, `'PRIME'`. */
+  name: string;
+  /** Present for per-side commands; absent for top-level ones (`PRIME`, `SET_SETTINGS`). */
+  side?: Side;
+  /** The string argument `executeFunction` was called with, when there is one. */
+  value?: string;
+}
+
+export interface RecordedRequest {
+  method: string;
+  path: string;
+  headers: Record<string, string | string[] | undefined>;
+  body: unknown;
+  status: number;
+  at: number;
+}
+
+export type FaultKind = 'status' | 'hang' | 'reset';
+
+export interface FaultOptions {
+  kind: FaultKind;
+  /** Only meaningful for `kind: 'status'`. Defaults to 500. */
+  status?: number | undefined;
+  times: number;
+}
+
+/**
+ * Internal side-status representation: `isOn` is never stored, only derived on read.
+ *
+ * A standalone interface rather than `Omit<SideStatus, 'isOn'>` — `SideStatus` is inferred
+ * from a `.passthrough()` zod schema, which carries an index signature that collapses
+ * `Omit`'s field-level typing (every field becomes `unknown`). Declaring this shape directly
+ * keeps the fields concretely typed.
+ */
+interface MockSideStatus {
+  currentTemperatureLevel: number;
+  currentTemperatureF: number;
+  targetTemperatureF: number;
+  secondsRemaining: number;
+  isAlarmVibrating: boolean;
+  taps?: { doubleTap: number; tripleTap: number; quadTap: number };
+}
+
+interface MockDeviceStatusState {
+  left: MockSideStatus;
+  right: MockSideStatus;
+  waterLevel: string;
+  isPriming: boolean;
+  settings: DeviceStatus['settings'];
+  coverVersion: string;
+  hubVersion: string;
+  freeSleep: DeviceStatus['freeSleep'];
+  wifiStrength: number;
+}
+
+export interface MockPodState {
+  deviceStatus: MockDeviceStatusState;
+  settings: Settings;
+  schedules: Schedules;
+  services: Services;
+}
+
+interface SideStatusOverride {
+  currentTemperatureLevel?: number;
+  currentTemperatureF?: number;
+  targetTemperatureF?: number;
+  secondsRemaining?: number;
+  isAlarmVibrating?: boolean;
+}
+
+interface DeviceStatusOverride {
+  left?: SideStatusOverride;
+  right?: SideStatusOverride;
+  waterLevel?: string;
+  isPriming?: boolean;
+}
+
+interface SideSettingsOverride {
+  name?: string;
+  awayMode?: boolean;
+}
+
+interface SettingsOverride {
+  left?: SideSettingsOverride;
+  right?: SideSettingsOverride;
+  timeZone?: string;
+  temperatureFormat?: 'celsius' | 'fahrenheit';
+  rebootDaily?: boolean;
+}
+
+export interface StartMockPodOptions {
+  state?: {
+    deviceStatus?: DeviceStatusOverride;
+    settings?: SettingsOverride;
+    /** Whole-document override; no partial-merge convenience needed by any current test. */
+    schedules?: Schedules;
+    /** Whole-document override; no partial-merge convenience needed by any current test. */
+    services?: Services;
+  };
+}
+
+export interface MockPod {
+  url: string;
+  /** Live, readable and writable by the test directly — see design.md, "Mock shape". */
+  state: MockPodState;
+  requests: RecordedRequest[];
+  commands: Command[];
+  fault(endpoint: string, options: FaultOptions): void;
+  reset(): void;
+  close(): Promise<void>;
+}
+
+// ---------------------------------------------------------------------------------------
+// Small internal utilities
+// ---------------------------------------------------------------------------------------
+
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+/** Recursive plain-object merge — a local equivalent of upstream's own `mergeDeep`. */
+function deepMergeInto(
+  base: Record<string, unknown>,
+  patch: Record<string, unknown> | undefined,
+): Record<string, unknown> {
+  if (!patch) return base;
+  const result: Record<string, unknown> = { ...base };
+  for (const key of Object.keys(patch)) {
+    const patchValue = patch[key];
+    const baseValue = result[key];
+    result[key] =
+      isPlainObject(patchValue) && isPlainObject(baseValue)
+        ? deepMergeInto(baseValue, patchValue)
+        : patchValue;
+  }
+  return result;
+}
+
+function toMockSideStatus(side: SideStatus): MockSideStatus {
+  return {
+    currentTemperatureLevel: side.currentTemperatureLevel,
+    currentTemperatureF: side.currentTemperatureF,
+    targetTemperatureF: side.targetTemperatureF,
+    secondsRemaining: side.secondsRemaining,
+    isAlarmVibrating: side.isAlarmVibrating,
+    ...(side.taps !== undefined ? { taps: side.taps } : {}),
+  };
+}
+
+function serializeSideStatus(side: MockSideStatus): SideStatus {
+  return { ...side, isOn: side.secondsRemaining > 0 };
+}
+
+function serializeDeviceStatus(deviceStatus: MockDeviceStatusState): DeviceStatus {
+  return {
+    left: serializeSideStatus(deviceStatus.left),
+    right: serializeSideStatus(deviceStatus.right),
+    waterLevel: deviceStatus.waterLevel,
+    isPriming: deviceStatus.isPriming,
+    settings: { ...deviceStatus.settings },
+    coverVersion: deviceStatus.coverVersion,
+    hubVersion: deviceStatus.hubVersion,
+    freeSleep: { ...deviceStatus.freeSleep },
+    wifiStrength: deviceStatus.wifiStrength,
+  };
+}
+
+function stripId(settings: Settings): Record<string, unknown> {
+  const clone: Record<string, unknown> = { ...settings };
+  delete clone.id;
+  return clone;
+}
+
+/**
+ * `calculateLevelFromF`, copied verbatim from
+ * `server/src/routes/deviceStatus/updateDeviceStatus.ts` — used only to compute the string
+ * argument recorded for `TEMP_LEVEL_LEFT`/`TEMP_LEVEL_RIGHT` commands.
+ */
+function calculateLevelFromF(temperatureF: number): number {
+  const level = ((temperatureF - 82.5) / 27.5) * 100;
+  return Math.round(level);
+}
+
+// ---------------------------------------------------------------------------------------
+// Initial state
+// ---------------------------------------------------------------------------------------
+
+function buildInitialState(overrides?: StartMockPodOptions['state']): MockPodState {
+  const deviceStatusFixture = DeviceStatusSchema.parse(loadFixture('deviceStatus.json'));
+  const settingsFixture = SettingsSchema.parse(loadFixture('settings.json'));
+  const schedulesFixture = SchedulesSchema.parse(loadFixture('schedules.json'));
+  const servicesFixture = ServicesSchema.parse(loadFixture('services.json'));
+
+  const mergedDeviceStatus = deepMergeInto(
+    deviceStatusFixture as unknown as Record<string, unknown>,
+    overrides?.deviceStatus as unknown as Record<string, unknown> | undefined,
+  ) as unknown as DeviceStatus;
+  const mergedSettings = overrides?.settings
+    ? (deepMergeInto(
+        settingsFixture as unknown as Record<string, unknown>,
+        overrides.settings as unknown as Record<string, unknown>,
+      ) as unknown as Settings)
+    : settingsFixture;
+  const schedules = overrides?.schedules ?? schedulesFixture;
+  const services = overrides?.services ?? servicesFixture;
+
+  return {
+    deviceStatus: {
+      left: toMockSideStatus(mergedDeviceStatus.left),
+      right: toMockSideStatus(mergedDeviceStatus.right),
+      waterLevel: mergedDeviceStatus.waterLevel,
+      isPriming: mergedDeviceStatus.isPriming,
+      settings: { ...mergedDeviceStatus.settings },
+      coverVersion: mergedDeviceStatus.coverVersion,
+      hubVersion: mergedDeviceStatus.hubVersion,
+      freeSleep: { ...mergedDeviceStatus.freeSleep },
+      wifiStrength: mergedDeviceStatus.wifiStrength,
+    },
+    settings: mergedSettings,
+    schedules,
+    services,
+  };
+}
+
+// ---------------------------------------------------------------------------------------
+// Write semantics — the five behaviours (design.md, "Mock shape and the command log")
+// ---------------------------------------------------------------------------------------
+
+function updateSide(
+  state: MockPodState,
+  side: Side,
+  patch: NonNullable<DeviceStatusPatch['left']>,
+  commands: Command[],
+): void {
+  const controlBothSides = state.settings.left.awayMode || state.settings.right.awayMode;
+  const updateLeft = side === 'left' || controlBothSides;
+  const updateRight = side === 'right' || controlBothSides;
+  const { isOn, targetTemperatureF, secondsRemaining, isAlarmVibrating } = patch;
+
+  // isOn: true -> 43200s (12h); isOn: false -> 0s. Power state is never stored — every read
+  // derives it as secondsRemaining > 0 (design.md, "Mock shape and the command log").
+  if (isOn !== undefined) {
+    const onDuration = isOn ? 43200 : 0;
+    if (updateLeft) {
+      state.deviceStatus.left.secondsRemaining = onDuration;
+      commands.push({ name: 'LEFT_TEMP_DURATION', side: 'left', value: String(onDuration) });
+    }
+    if (updateRight) {
+      state.deviceStatus.right.secondsRemaining = onDuration;
+      commands.push({ name: 'RIGHT_TEMP_DURATION', side: 'right', value: String(onDuration) });
+    }
+  }
+
+  // Truthiness guard copied verbatim: `if (targetTemperatureF)` — 0 is out of range anyway,
+  // so this is harmless, but it is the same bug upstream has.
+  if (targetTemperatureF) {
+    const level = calculateLevelFromF(targetTemperatureF);
+    if (updateLeft) {
+      state.deviceStatus.left.targetTemperatureF = targetTemperatureF;
+      commands.push({ name: 'TEMP_LEVEL_LEFT', side: 'left', value: String(level) });
+    }
+    if (updateRight) {
+      state.deviceStatus.right.targetTemperatureF = targetTemperatureF;
+      commands.push({ name: 'TEMP_LEVEL_RIGHT', side: 'right', value: String(level) });
+    }
+  }
+
+  // Truthiness guard copied verbatim: `if (secondsRemaining)` — secondsRemaining: 0 is a
+  // silent no-op. This runs *after* the isOn block, so an explicit duration in the same
+  // patch overwrites the 12h/0 the isOn block just set (docs/POD-API.md: "never put isOn
+  // and secondsRemaining in the same patch").
+  if (secondsRemaining) {
+    const seconds = Math.round(secondsRemaining);
+    if (updateLeft) {
+      state.deviceStatus.left.secondsRemaining = seconds;
+      commands.push({ name: 'LEFT_TEMP_DURATION', side: 'left', value: String(seconds) });
+    }
+    if (updateRight) {
+      state.deviceStatus.right.secondsRemaining = seconds;
+      commands.push({ name: 'RIGHT_TEMP_DURATION', side: 'right', value: String(seconds) });
+    }
+  }
+
+  // Alarm handling is NOT subject to away-mode mirroring upstream — it only ever touches
+  // `side`, and only sends ALARM_CLEAR (never a per-side name) when the value is falsy;
+  // the state is forced to false either way (`updateDeviceStatus.ts`: "Can only set
+  // isAlarmVibrating to false for now").
+  if (isAlarmVibrating !== undefined) {
+    if (!isAlarmVibrating) {
+      commands.push({ name: 'ALARM_CLEAR', side, value: 'empty' });
+    }
+    state.deviceStatus[side].isAlarmVibrating = false;
+  }
+}
+
+function applyDeviceStatusPatch(
+  state: MockPodState,
+  patch: DeviceStatusPatch,
+  commands: Command[],
+): void {
+  if (patch.isPriming) {
+    commands.push({ name: 'PRIME' });
+  }
+  if (patch.left) {
+    updateSide(state, 'left', patch.left, commands);
+  }
+  if (patch.right) {
+    updateSide(state, 'right', patch.right, commands);
+  }
+  if (patch.settings) {
+    Object.assign(state.deviceStatus.settings, patch.settings);
+    commands.push({ name: 'SET_SETTINGS', value: JSON.stringify(patch.settings) });
+  }
+}
+
+// ---------------------------------------------------------------------------------------
+// HTTP transport
+// ---------------------------------------------------------------------------------------
+
+function readBody(req: IncomingMessage): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const chunks: Buffer[] = [];
+    req.on('data', (chunk: Buffer) => chunks.push(chunk));
+    req.on('end', () => resolve(Buffer.concat(chunks).toString('utf8')));
+    req.on('error', reject);
+  });
+}
+
+function parseJsonBody(raw: string): unknown {
+  if (raw.length === 0) return {};
+  try {
+    return JSON.parse(raw);
+  } catch {
+    return undefined;
+  }
+}
+
+export async function startMockPod(options: StartMockPodOptions = {}): Promise<MockPod> {
+  const requests: RecordedRequest[] = [];
+  const commands: Command[] = [];
+  const faults = new Map<string, { kind: FaultKind; status?: number | undefined; remaining: number }>();
+
+  const initialSnapshot = buildInitialState(options.state);
+  const state: MockPodState = structuredClone(initialSnapshot);
+
+  function record(entry: RecordedRequest): void {
+    requests.push(entry);
+  }
+
+  async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise<void> {
+    const url = new URL(req.url ?? '/', 'http://127.0.0.1');
+    const pathname = url.pathname;
+    const method = req.method ?? 'GET';
+    const endpointKey = `${method} ${pathname}`;
+
+    const activeFault = faults.get(endpointKey);
+    if (activeFault) {
+      const remaining = activeFault.remaining - 1;
+      if (remaining <= 0) {
+        faults.delete(endpointKey);
+      } else {
+        faults.set(endpointKey, { ...activeFault, remaining });
+      }
+
+      if (activeFault.kind === 'status') {
+        const raw = await readBody(req);
+        const body = parseJsonBody(raw);
+        const status = activeFault.status ?? 500;
+        record({ method, path: pathname, headers: req.headers, body, status, at: Date.now() });
+        res.writeHead(status, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ error: 'Injected fault' }));
+        return;
+      }
+
+      if (activeFault.kind === 'reset') {
+        const raw = await readBody(req);
+        const body = parseJsonBody(raw);
+        record({ method, path: pathname, headers: req.headers, body, status: 0, at: Date.now() });
+        req.socket.destroy();
+        return;
+      }
+
+      // 'hang': accept the connection, consume the body, and never respond. The client's
+      // own timeout is what ends this — see docs/POD-API.md and design.md's client timeout.
+      await readBody(req);
+      res.on('close', () => {
+        record({
+          method,
+          path: pathname,
+          headers: req.headers,
+          body: undefined,
+          status: 0,
+          at: Date.now(),
+        });
+      });
+      return;
+    }
+
+    const raw = await readBody(req);
+    const body = method === 'GET' ? undefined : parseJsonBody(raw);
+
+    let status = 200;
+    let responseBody: unknown;
+    let noContent = false;
+
+    switch (endpointKey) {
+      case 'GET /api/deviceStatus':
+        responseBody = serializeDeviceStatus(state.deviceStatus);
+        break;
+
+      case 'GET /api/settings':
+        responseBody = state.settings;
+        break;
+
+      case 'GET /api/schedules':
+        responseBody = state.schedules;
+        break;
+
+      case 'GET /api/services':
+        responseBody = state.services;
+        break;
+
+      case 'POST /api/deviceStatus': {
+        const result = DeviceStatusPatchSchema.safeParse(body);
+        if (!result.success) {
+          status = 400;
+          responseBody = { error: 'Invalid request data', details: result.error.issues };
+          break;
+        }
+        applyDeviceStatusPatch(state, result.data, commands);
+        status = 204;
+        noContent = true;
+        break;
+      }
+
+      case 'POST /api/settings': {
+        const result = SettingsPatchSchema.safeParse(body);
+        if (!result.success) {
+          status = 400;
+          responseBody = { error: 'Invalid request data', details: result.error.issues };
+          break;
+        }
+        // Never allow the caller to overwrite the stored id — mirrors settings.ts's
+        // `delete body.id` before merging.
+        const patch: Record<string, unknown> = { ...result.data };
+        delete patch.id;
+        state.settings = deepMergeInto(
+          state.settings as unknown as Record<string, unknown>,
+          patch,
+        ) as unknown as Settings;
+        status = 200;
+        responseBody = stripId(state.settings);
+        break;
+      }
+
+      default:
+        status = 404;
+        responseBody = { error: 'Not Found' };
+    }
+
+    record({ method, path: pathname, headers: req.headers, body, status, at: Date.now() });
+
+    if (noContent) {
+      res.writeHead(204);
+      res.end();
+      return;
+    }
+    res.writeHead(status, { 'content-type': 'application/json' });
+    res.end(JSON.stringify(responseBody));
+  }
+
+  const server: Server = createServer((req, res) => {
+    handleRequest(req, res).catch(() => {
+      // A handler failure (e.g. the client aborted mid-read) should drop the connection
+      // rather than crash the mock's test process.
+      req.socket.destroy();
+    });
+  });
+
+  await new Promise<void>((resolve, reject) => {
+    server.once('error', reject);
+    server.listen(0, '127.0.0.1', () => resolve());
+  });
+
+  const address = server.address();
+  if (address === null || typeof address === 'string') {
+    throw new Error('mock Pod failed to bind a port');
+  }
+  const url = `http://127.0.0.1:${(address as AddressInfo).port}`;
+
+  function fault(endpoint: string, faultOptions: FaultOptions): void {
+    faults.set(endpoint, {
+      kind: faultOptions.kind,
+      status: faultOptions.status,
+      remaining: faultOptions.times,
+    });
+  }
+
+  function reset(): void {
+    const fresh = structuredClone(initialSnapshot);
+    state.deviceStatus = fresh.deviceStatus;
+    state.settings = fresh.settings;
+    state.schedules = fresh.schedules;
+    state.services = fresh.services;
+    requests.length = 0;
+    commands.length = 0;
+    faults.clear();
+  }
+
+  function close(): Promise<void> {
+    return new Promise((resolve, reject) => {
+      server.close((err) => {
+        if (err) reject(err);
+        else resolve();
+      });
+      server.closeAllConnections();
+    });
+  }
+
+  return { url, state, requests, commands, fault, reset, close };
+}
