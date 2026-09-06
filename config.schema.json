@@ -2,7 +2,7 @@
   "pluginAlias": "FreeSleep",
   "pluginType": "platform",
   "singular": true,
-  "headerDisplay": "Exposes an Eight Sleep Pod running the free-sleep firmware to Apple HomeKit. `host` is the only field most installs need — everything else below is reserved for a future release and has no effect yet.",
+  "headerDisplay": "Exposes an Eight Sleep Pod running the free-sleep firmware to Apple HomeKit. `host` is the only field most installs need. `sides`, the poll/write timing overrides, and the No Response delay are live; the remaining fields are reserved for a future release and have no effect yet.",
   "schema": {
     "type": "object",
     "properties": {
@@ -24,7 +24,7 @@
         "description": "Which side accessories to publish."
       },
       "pollIntervals": {
-        "title": "Poll interval overrides (reserved, no effect yet)",
+        "title": "Poll interval overrides (advanced)",
         "type": "object",
         "properties": {
           "pollIntervalMs": {
@@ -75,13 +75,13 @@
         }
       },
       "writeSettleMs": {
-        "title": "Write settle window (ms, reserved, no effect yet)",
+        "title": "Write settle window (ms, advanced)",
         "type": "integer",
         "default": 15000,
         "minimum": 0
       },
       "noResponseAfterMs": {
-        "title": "No Response escalation delay (ms, reserved, no effect yet)",
+        "title": "No Response escalation delay (ms; 0 disables)",
         "type": "integer",
         "default": 600000,
         "minimum": 0,
