@@ -36,7 +36,12 @@
 
 import { z } from 'zod';
 
-const PollIntervalsSchema = z
+/**
+ * The un-defaulted object schema, exported separately from `PollIntervalsSchema` below so a
+ * test can inspect its `.shape` directly (`ZodDefault` — what wrapping this in `.default({})`
+ * produces — has no `.shape` of its own in zod v4).
+ */
+export const PollIntervalsFieldsSchema = z
   .object({
     /** Base `deviceStatus`/`settings`/`schedules`/`services` poll interval. Default 30000. */
     pollIntervalMs: z.number().int().min(5000, { message: 'pollIntervalMs must be at least 5000ms' }).optional(),
@@ -74,15 +79,20 @@ const PollIntervalsSchema = z
       .int()
       .min(1000, { message: 'alarmPollIntervalMs must be at least 1000ms' })
       .optional(),
-  })
-  .default({});
+  });
+
+export const PollIntervalsSchema = PollIntervalsFieldsSchema.default({});
 
 export const FreeSleepConfigSchema = z.object({
   /**
    * The Pod's LAN hostname or IP address. Required, non-empty, un-defaulted (config spec,
-   * "`host` is required and un-defaulted"). Trimmed of surrounding whitespace.
+   * "`host` is required and un-defaulted"). Trimmed of surrounding whitespace and lowercased —
+   * DNS names are case-insensitive (a no-op for a literal IP address) — so that `'Pod.local'`
+   * and `'pod.local'` are the same configured host: `uuidFor`/`serialNumberFor` derive HomeKit
+   * identity directly from this string, and two spellings of the one Pod must never silently
+   * produce two different accessories (config spec, "`host` is normalized to lowercase").
    */
-  host: z.string().trim().min(1, { message: 'host is required' }),
+  host: z.string().trim().min(1, { message: 'host is required' }).toLowerCase(),
 
   /**
    * Which side accessories to publish. Defaults to `'both'` (config spec, "`sides` defaults
@@ -132,3 +142,22 @@ export const FreeSleepConfigSchema = z.object({
 
 export type FreeSleepConfig = z.infer<typeof FreeSleepConfigSchema>;
 export type PollIntervalsConfig = z.infer<typeof PollIntervalsSchema>;
+
+/**
+ * Top-level keys Homebridge itself injects into every platform's config block — never
+ * user-authored config for this plugin, so `unrecognizedConfigKeys` below always allowlists
+ * them silently rather than warning about them.
+ */
+const HOMEBRIDGE_INJECTED_KEYS: ReadonlySet<string> = new Set(['platform', 'name', '_bridge']);
+
+/**
+ * Every top-level key in `rawConfig` that `FreeSleepConfigSchema` does not define and
+ * Homebridge does not itself inject — almost always a typo (e.g. `hots` for `host`) that would
+ * otherwise be silently ignored rather than validated (N10 in the platform-foundation code
+ * review). Called independently of `safeParse` so a typo is surfaced even when the rest of the
+ * config is otherwise valid.
+ */
+export function unrecognizedConfigKeys(rawConfig: Record<string, unknown>): string[] {
+  const known = new Set(Object.keys(FreeSleepConfigSchema.shape));
+  return Object.keys(rawConfig).filter((key) => !known.has(key) && !HOMEBRIDGE_INJECTED_KEYS.has(key));
+}
