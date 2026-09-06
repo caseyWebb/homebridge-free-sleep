@@ -83,11 +83,14 @@ src/pod/poller.ts      (imports: ./client.js, ./snapshot.js, ./errors.js, ./type
 src/pod/writeQueue.ts  (imports: ./client.js, ./snapshot.js, ./errors.js, ./types.js)
 ```
 
-`writeQueue.ts` does **not** import `poller.ts`. It needs to request the fast cadence, which
-would be a cycle (`poller → writeQueue` is not needed, but a future guard makes it tempting).
-The queue therefore takes a `requestFastPoll: (untilMs) => void` callback in its options, which
-the platform wires to `poller.requestMode('deviceStatus', …)`. One function, no cycle, and the
-queue stays testable without a poller at all.
+`writeQueue.ts` does **not** import `poller.ts`. It needs to request the post-write
+confirmation, which would be a cycle (`poller → writeQueue` is not needed, but a future guard
+makes it tempting). The queue therefore takes a `requestFastPoll: (lane, untilMs) => void`
+callback in its options — `lane` names which endpoint class the dispatch confirms, so the
+platform can wire a `deviceStatus`-lane write to `poller.requestMode('deviceStatus', …)` (the
+extended fast-poll window) and a `settings`-lane write to `poller.refresh('settings')` instead (a
+single confirming read; a settings write gains nothing from accelerating `deviceStatus` polling).
+One function, no cycle, and the queue stays testable without a poller at all.
 
 Nothing under `src/pod/` imports Homebridge, HAP-NodeJS, or anything from `test/`.
 
@@ -101,8 +104,7 @@ overlay:  Map<`${side}.${field}`, { value, expiresAt }>                     ← 
 effective = applyOverlay(raw)                                               ← what everyone reads
 ```
 
-`get()` returns `effective`. `getObserved()` returns `raw` and exists for exactly one caller —
-the overlay-agreement check — plus diagnostics.
+`get()` returns `effective` — the only read path every HAP `onGet` uses.
 
 **Every state mutation is a *commit*.** A commit takes a new `raw`, a new `overlay`, or both;
 computes the new `effective`; deep-freezes it; compares the watched fields of the previous and
@@ -377,7 +379,7 @@ under a `polling` object, only its mapping changes.
 | `fastPollDurationMs` | 90 000 | — | write mode window |
 | `slowPollIntervalMs` | 300 000 | min 60 000 | settings/schedules/services base |
 | `maxBackoffMs` | 60 000 | — | backoff cap |
-| `bootstrapTimeoutMs` | 10 000 | — | bootstrap deadline |
+| `bootstrapTimeoutMs` | 10 000 | min 1 000 | bootstrap deadline |
 | `writeDebounceMs` | 400 | min 100 | side lanes |
 | `writeMaxDebounceMs` | 2 000 | — | all lanes |
 | `writeSettleMs` | 15 000 | — | overlay window (name fixed by #14) |

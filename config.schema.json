@@ -35,7 +35,7 @@
           "fastPollIntervalMs": {
             "title": "Fast-poll interval (ms)",
             "type": "integer",
-            "minimum": 1000
+            "minimum": 3000
           },
           "fastPollDurationMs": {
             "title": "Fast-poll window duration (ms)",
@@ -55,7 +55,7 @@
           "writeDebounceMs": {
             "title": "Write debounce (ms)",
             "type": "integer",
-            "minimum": 0
+            "minimum": 100
           },
           "writeMaxDebounceMs": {
             "title": "Write debounce ceiling (ms)",
@@ -64,6 +64,11 @@
           },
           "alarmPollIntervalMs": {
             "title": "Alarm-window poll interval (ms)",
+            "type": "integer",
+            "minimum": 3000
+          },
+          "bootstrapTimeoutMs": {
+            "title": "Bootstrap deadline (ms)",
             "type": "integer",
             "minimum": 1000
           }

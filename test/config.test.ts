@@ -198,6 +198,7 @@ describe('FreeSleepConfigSchema — reserved keys', () => {
       ['writeDebounceMs', -1],
       ['writeMaxDebounceMs', -1],
       ['alarmPollIntervalMs', 0],
+      ['bootstrapTimeoutMs', 0],
     ] as const)('rejects an out-of-range pollIntervals.%s', (field, value) => {
       const result = FreeSleepConfigSchema.safeParse({
         host: 'pod.local',
@@ -220,6 +221,7 @@ describe('FreeSleepConfigSchema — reserved keys', () => {
       ['writeDebounceMs', 800],
       ['writeMaxDebounceMs', 3000],
       ['alarmPollIntervalMs', 5000],
+      ['bootstrapTimeoutMs', 15000],
     ] as const)('parses a valid non-default pollIntervals.%s unchanged', (field, value) => {
       const result = FreeSleepConfigSchema.safeParse({
         host: 'pod.local',
@@ -229,6 +231,22 @@ describe('FreeSleepConfigSchema — reserved keys', () => {
       if (result.success) {
         expect(result.data.pollIntervals[field]).toBe(value);
       }
+    });
+
+    // Config boundary alignment: fastPollIntervalMs/alarmPollIntervalMs share poller.ts's
+    // HARD_FLOOR_MS (3000), and writeDebounceMs shares writeQueue.ts's own Math.max(100, …)
+    // floor — so a configured value the module would silently clamp anyway must instead fail
+    // loudly in config, naming both the configured and the enforced value.
+    it.each([
+      ['fastPollIntervalMs', 2999],
+      ['alarmPollIntervalMs', 2999],
+      ['writeDebounceMs', 99],
+    ] as const)('rejects pollIntervals.%s one below the module floor it mirrors', (field, value) => {
+      const result = FreeSleepConfigSchema.safeParse({
+        host: 'pod.local',
+        pollIntervals: { [field]: value },
+      });
+      expect(result.success).toBe(false);
     });
   });
 });
