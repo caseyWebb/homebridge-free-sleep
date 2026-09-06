@@ -17,12 +17,12 @@ import { createServer, type IncomingMessage, type ServerResponse, type Server } 
 import type { AddressInfo } from 'node:net';
 
 import {
-  DeviceStatusPatchSchema,
   DeviceStatusSchema,
   SchedulesSchema,
   ServicesSchema,
   SettingsPatchSchema,
   SettingsSchema,
+  UpstreamDeviceStatusPatchSchema,
   type DeviceStatus,
   type DeviceStatusPatch,
   type Schedules,
@@ -55,7 +55,7 @@ export interface RecordedRequest {
   at: number;
 }
 
-export type FaultKind = 'status' | 'hang' | 'reset';
+export type FaultKind = 'status' | 'hang' | 'hangMidBody' | 'reset';
 
 export interface FaultOptions {
   kind: FaultKind;
@@ -67,19 +67,11 @@ export interface FaultOptions {
 /**
  * Internal side-status representation: `isOn` is never stored, only derived on read.
  *
- * A standalone interface rather than `Omit<SideStatus, 'isOn'>` — `SideStatus` is inferred
- * from a `.passthrough()` zod schema, which carries an index signature that collapses
- * `Omit`'s field-level typing (every field becomes `unknown`). Declaring this shape directly
- * keeps the fields concretely typed.
+ * `SideStatus` is now inferred from a plain (strip-mode, not `.passthrough()`) zod object —
+ * see types.ts's N1 note — so it carries concrete field types rather than an index signature,
+ * and `Omit` works as expected without collapsing every field to `unknown`.
  */
-interface MockSideStatus {
-  currentTemperatureLevel: number;
-  currentTemperatureF: number;
-  targetTemperatureF: number;
-  secondsRemaining: number;
-  isAlarmVibrating: boolean;
-  taps?: { doubleTap: number; tripleTap: number; quadTap: number };
-}
+type MockSideStatus = Omit<SideStatus, 'isOn'>;
 
 interface MockDeviceStatusState {
   left: MockSideStatus;
@@ -205,12 +197,6 @@ function serializeDeviceStatus(deviceStatus: MockDeviceStatusState): DeviceStatu
   };
 }
 
-function stripId(settings: Settings): Record<string, unknown> {
-  const clone: Record<string, unknown> = { ...settings };
-  delete clone.id;
-  return clone;
-}
-
 /**
  * `calculateLevelFromF`, copied verbatim from
  * `server/src/routes/deviceStatus/updateDeviceStatus.ts` — used only to compute the string
@@ -322,12 +308,13 @@ function updateSide(
   }
 
   // Alarm handling is NOT subject to away-mode mirroring upstream — it only ever touches
-  // `side`, and only sends ALARM_CLEAR (never a per-side name) when the value is falsy;
-  // the state is forced to false either way (`updateDeviceStatus.ts`: "Can only set
+  // `side` for the *state* update, and calls `executeFunction('ALARM_CLEAR', 'empty')` with
+  // no side argument at all (never a per-side command name) when the value is falsy; the
+  // state is forced to false either way (`updateDeviceStatus.ts`: "Can only set
   // isAlarmVibrating to false for now").
   if (isAlarmVibrating !== undefined) {
     if (!isAlarmVibrating) {
-      commands.push({ name: 'ALARM_CLEAR', side, value: 'empty' });
+      commands.push({ name: 'ALARM_CLEAR', value: 'empty' });
     }
     state.deviceStatus[side].isAlarmVibrating = false;
   }
@@ -375,6 +362,16 @@ function parseJsonBody(raw: string): unknown {
   }
 }
 
+/** Every `"METHOD /path"` this mock actually routes — see the `switch` in `handleRequest`. */
+const KNOWN_ENDPOINTS = new Set([
+  'GET /api/deviceStatus',
+  'GET /api/settings',
+  'GET /api/schedules',
+  'GET /api/services',
+  'POST /api/deviceStatus',
+  'POST /api/settings',
+]);
+
 export async function startMockPod(options: StartMockPodOptions = {}): Promise<MockPod> {
   const requests: RecordedRequest[] = [];
   const commands: Command[] = [];
@@ -420,6 +417,28 @@ export async function startMockPod(options: StartMockPodOptions = {}): Promise<M
         return;
       }
 
+      if (activeFault.kind === 'hangMidBody') {
+        // Headers (and a deliberately unterminated partial body chunk) go out, then the
+        // response never ends — reproducing a timeout that fires *after* `fetch()`'s promise
+        // has already resolved with a `Response`, mid-`response.text()`. See B2 in the
+        // pod-client code review: this is the case a try/catch around only the `fetch()` call
+        // (and not the body read too) fails to map to `PodTimeoutError`.
+        await readBody(req);
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.write('{"left":{"currentTemperatureLevel":0'); // unterminated JSON on purpose
+        res.on('close', () => {
+          record({
+            method,
+            path: pathname,
+            headers: req.headers,
+            body: undefined,
+            status: 0,
+            at: Date.now(),
+          });
+        });
+        return;
+      }
+
       // 'hang': accept the connection, consume the body, and never respond. The client's
       // own timeout is what ends this — see docs/POD-API.md and design.md's client timeout.
       await readBody(req);
@@ -461,12 +480,22 @@ export async function startMockPod(options: StartMockPodOptions = {}): Promise<M
         break;
 
       case 'POST /api/deviceStatus': {
-        const result = DeviceStatusPatchSchema.safeParse(body);
+        // Validate against the full upstream contract (every DeviceStatusSchema field,
+        // deep-partial, strict) — not PodClient's own narrower outgoing schema. See
+        // UpstreamDeviceStatusPatchSchema's doc comment in types.ts (S3 in the pod-client
+        // code review): the mock models the real Pod, which structurally accepts fields the
+        // client never happens to send.
+        const result = UpstreamDeviceStatusPatchSchema.safeParse(body);
         if (!result.success) {
           status = 400;
           responseBody = { error: 'Invalid request data', details: result.error.issues };
           break;
         }
+        // `applyDeviceStatusPatch` only branches on the fields it has write semantics for
+        // (design.md, "Mock shape and the command log") — matching upstream's own
+        // `updateDeviceStatus.ts`, which likewise destructures only a subset of the fields
+        // its own validation schema accepts. `result.data`'s wider shape is structurally
+        // assignable to `DeviceStatusPatch`.
         applyDeviceStatusPatch(state, result.data, commands);
         status = 204;
         noContent = true;
@@ -489,7 +518,11 @@ export async function startMockPod(options: StartMockPodOptions = {}): Promise<M
           patch,
         ) as unknown as Settings;
         status = 200;
-        responseBody = stripId(state.settings);
+        // The *request* body has its `id` deleted above (mirrors settings.ts's own
+        // `delete body.id` before merging), but the *response* is `res.json(settingsDB.data)`
+        // — the stored document, id intact (settings.ts). Only the request-side delete
+        // happens; the response is never stripped.
+        responseBody = state.settings;
         break;
       }
 
@@ -529,6 +562,13 @@ export async function startMockPod(options: StartMockPodOptions = {}): Promise<M
   const url = `http://127.0.0.1:${(address as AddressInfo).port}`;
 
   function fault(endpoint: string, faultOptions: FaultOptions): void {
+    if (!KNOWN_ENDPOINTS.has(endpoint)) {
+      throw new Error(
+        `pod.fault(${JSON.stringify(endpoint)}, …): not a known "METHOD /path" endpoint — ` +
+          `expected one of ${[...KNOWN_ENDPOINTS].join(', ')}. A typo'd fault target silently ` +
+          'never fires, which is worse than a loud failure here.',
+      );
+    }
     faults.set(endpoint, {
       kind: faultOptions.kind,
       status: faultOptions.status,
