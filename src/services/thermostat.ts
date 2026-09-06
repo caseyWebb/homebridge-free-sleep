@@ -34,6 +34,13 @@ interface ThermostatContext {
   publishedF?: PublishedF;
   /** HAP `TemperatureDisplayUnits` value (0 = CELSIUS, 1 = FAHRENHEIT), seeded once. */
   displayUnits?: number;
+  /**
+   * The mode shadow (S2 fix) — mirrors `publishedF`'s "claim on write" pattern for
+   * `TargetHeatingCoolingState`, which otherwise has none. Without it, `submitSide`'s
+   * synchronous overlay install (which lands before HAP has even assigned the characteristic's
+   * new `.value`) round-trips through `refresh()` as an echo push back at the writer.
+   */
+  publishedIsOn?: boolean;
 }
 
 function contextOf(ctx: ServiceContext): ThermostatContext {
@@ -89,6 +96,13 @@ export class ThermostatService {
 
     this.wireReads();
     this.wireWrites();
+
+    // B1: publish whatever the bootstrap already observed before this service is registered —
+    // without this, every characteristic keeps HAP's own default (target 12.78°C, current 0°C)
+    // until the next change event, which a Pod that stays reachable all launch may never send.
+    // `refresh()` is idempotent and reads only `ctx.snapshot.get()`, so calling it here is safe
+    // regardless of whether the bootstrap actually reached the Pod.
+    this.refresh();
   }
 
   // ---------------------------------------------------------------------------------------
@@ -206,6 +220,11 @@ export class ThermostatService {
 
     targetStateChar.onSet(async (value) => {
       const isOn = value === hap.Characteristic.TargetHeatingCoolingState.AUTO;
+      // Claim the mode into the shadow before submitting — mirrors the temperature path (design.md,
+      // "The °F shadow") so `submitSide`'s synchronous overlay-install echo, which fires before
+      // HAP has assigned `.value`, is suppressed rather than pushed back at the writer (S2).
+      const context = contextOf(this.ctx);
+      context.publishedIsOn = isOn;
       try {
         await this.ctx.writeQueue.submitSide(this.side, { isOn });
       } catch (error) {
@@ -230,9 +249,15 @@ export class ThermostatService {
     });
 
     // Never reaches the Pod — accessory.context only (specs/thermostat-service/spec.md,
-    // "Display units are served and stored locally, and never written to the Pod").
+    // "Display units are served and stored locally, and never written to the Pod"). N9:
+    // persisted via `updatePlatformAccessories` (mirroring `platform.ts`'s F4 prune-persistence
+    // pattern) only on an actual change, so the unit survives an unclean shutdown without a
+    // gratuitous disk write on every repeat write of the same unit.
     displayUnitsChar.onSet((value) => {
-      contextOf(this.ctx).displayUnits = value as number;
+      const context = contextOf(this.ctx);
+      if (context.displayUnits === value) return;
+      context.displayUnits = value as number;
+      this.ctx.api.updatePlatformAccessories([this.ctx.accessory]);
     });
   }
 
@@ -265,17 +290,28 @@ export class ThermostatService {
       'targetF',
     );
 
-    if (side.isOn !== undefined) {
-      const targetStateChar = this.service.getCharacteristic(hap.Characteristic.TargetHeatingCoolingState);
-      const nextTargetState = side.isOn
-        ? hap.Characteristic.TargetHeatingCoolingState.AUTO
-        : hap.Characteristic.TargetHeatingCoolingState.OFF;
-      if (targetStateChar.value !== nextTargetState) targetStateChar.updateValue(nextTargetState);
-    }
+    this.pushMode(this.service.getCharacteristic(hap.Characteristic.TargetHeatingCoolingState), side.isOn, context);
 
     const currentStateChar = this.service.getCharacteristic(hap.Characteristic.CurrentHeatingCoolingState);
     const nextCurrentState = this.computeCurrentState(currentStateChar, side);
     if (currentStateChar.value !== nextCurrentState) currentStateChar.updateValue(nextCurrentState);
+  }
+
+  /**
+   * The mode analogue of `pushTemperature` (S2 fix): claims into `context.publishedIsOn` rather
+   * than comparing against `characteristic.value` directly, so a write's synchronous
+   * overlay-install echo — which reaches `refresh()` before HAP has assigned the characteristic's
+   * new `.value` — is suppressed exactly like a temperature write's overlay echo already is. A
+   * genuinely divergent later observation (the shadow disagrees with the newly observed `isOn`)
+   * still pushes.
+   */
+  private pushMode(characteristic: Characteristic, isOn: boolean | undefined, context: ThermostatContext): void {
+    if (isOn === undefined) return;
+    if (context.publishedIsOn === isOn) return;
+    context.publishedIsOn = isOn;
+    const hap = this.ctx.api.hap;
+    const next = isOn ? hap.Characteristic.TargetHeatingCoolingState.AUTO : hap.Characteristic.TargetHeatingCoolingState.OFF;
+    characteristic.updateValue(next);
   }
 
   private pushTemperature(

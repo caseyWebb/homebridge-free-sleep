@@ -571,6 +571,79 @@ describe('failed-write revert (5.4)', () => {
 });
 
 // ---------------------------------------------------------------------------------------
+// S2 — a mode write claims a shadow too, so it is not echoed back to the writer
+// ---------------------------------------------------------------------------------------
+
+describe('a mode write claims the shadow without pushing (S2)', () => {
+  it('write -> overlay change event -> confirming observation of the same mode produces zero updateValue calls', async () => {
+    const { ctx, fake } = setup();
+    const hap = ctx.api.hap;
+    const { service, setHandlers } = build(ctx, 'left');
+    const svc = ctx.accessory.getServiceById(hap.Service.Thermostat, THERMOSTAT_SUBTYPE)!;
+    const targetStateChar = svc.getCharacteristic(hap.Characteristic.TargetHeatingCoolingState);
+    const spy = vi.spyOn(targetStateChar, 'updateValue');
+
+    ctx.snapshot.subscribe(() => service.refresh());
+
+    const pending = setHandlers.get(UUID.targetState)!(hap.Characteristic.TargetHeatingCoolingState.AUTO, {} as never, undefined);
+    await vi.advanceTimersByTimeAsync(400);
+    await pending;
+    // Before the S2 fix, `submitSide`'s synchronous overlay install reached `refresh()` before
+    // HAP had assigned the characteristic's own new value, producing exactly one echo push here.
+    expect(spy).not.toHaveBeenCalled();
+
+    const confirming = structuredClone(deviceStatusFixture);
+    confirming.left.isOn = true;
+    confirming.left.secondsRemaining = 43200;
+    ctx.snapshot.observeDeviceStatus(confirming);
+    expect(spy).not.toHaveBeenCalled();
+    void fake;
+  });
+});
+
+describe('failed mode write revert (S2)', () => {
+  it('a rejected mode write still reverts, pushing the observed mode back exactly once', async () => {
+    const { ctx, fake } = setup();
+    const hap = ctx.api.hap;
+    const { service, setHandlers } = build(ctx, 'left');
+    const svc = ctx.accessory.getServiceById(hap.Service.Thermostat, THERMOSTAT_SUBTYPE)!;
+    const spy = vi.spyOn(svc.getCharacteristic(hap.Characteristic.TargetHeatingCoolingState), 'updateValue');
+    ctx.snapshot.subscribe(() => service.refresh());
+
+    fake.postDeviceStatusOutcome = { kind: 'error', error: new Error('rejected') };
+    const pending = setHandlers.get(UUID.targetState)!(hap.Characteristic.TargetHeatingCoolingState.AUTO, {} as never, undefined);
+    const assertion = expect(pending).rejects.toBeTruthy();
+    await vi.advanceTimersByTimeAsync(400);
+    await assertion;
+
+    // The failed dispatch cleared the overlay; the effective `isOn` reverts to the last raw
+    // observation (`false`/OFF for `left`'s fixture) and the resulting change event pushes it —
+    // the "a genuinely divergent later observation still pushes" half of the S2 fix.
+    expect(spy).toHaveBeenCalledTimes(1);
+    expect(spy).toHaveBeenCalledWith(hap.Characteristic.TargetHeatingCoolingState.OFF);
+  });
+});
+
+// ---------------------------------------------------------------------------------------
+// N9 — a TemperatureDisplayUnits write is persisted, only on an actual change
+// ---------------------------------------------------------------------------------------
+
+describe('TemperatureDisplayUnits is persisted on an actual change (N9)', () => {
+  it('a unit write calls updatePlatformAccessories; a repeat write of the same unit does not', () => {
+    const { ctx, api } = setup({ observe: false });
+    const hap = ctx.api.hap;
+    const { setHandlers } = build(ctx, 'left');
+
+    const before = api.updatePlatformAccessoriesCalls.length;
+    setHandlers.get(UUID.displayUnits)!(hap.Characteristic.TemperatureDisplayUnits.FAHRENHEIT, {} as never, undefined);
+    expect(api.updatePlatformAccessoriesCalls.length).toBe(before + 1);
+
+    setHandlers.get(UUID.displayUnits)!(hap.Characteristic.TemperatureDisplayUnits.FAHRENHEIT, {} as never, undefined);
+    expect(api.updatePlatformAccessoriesCalls.length).toBe(before + 1);
+  });
+});
+
+// ---------------------------------------------------------------------------------------
 // 6.4 — No-Response escalation (implemented here; ConnectionService deliberately never
 // escalates its own reads — see src/services/connection.ts's module doc)
 // ---------------------------------------------------------------------------------------

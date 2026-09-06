@@ -51,6 +51,14 @@ export class ConnectionService {
     ensureCharacteristic(this.service, hap.Characteristic.StatusActive);
 
     this.wireReads();
+
+    // B1: publish whatever the bootstrap already observed before this service is registered —
+    // without this, every characteristic keeps HAP's own default (StatusActive false,
+    // ContactSensorState CONTACT_NOT_DETECTED) until the next change event, and Homebridge can
+    // persist that default forever if it never fires (e.g. a Pod that stays reachable all
+    // launch). `refresh()` is idempotent and reads only `ctx.snapshot.get()`, so calling it here
+    // is safe regardless of whether the bootstrap actually reached the Pod.
+    this.refresh();
   }
 
   private wireReads(): void {

@@ -168,12 +168,16 @@ describe('reachability mapping and change-only pushes (6.2)', () => {
   it('success -> five consecutive failures -> success pushes ContactSensorState exactly twice', () => {
     const s = setup();
     const ctx = contextFor(s);
+    // Observed before construction — mirrors production, where the platform only constructs a
+    // service after the poller's bootstrap has already settled (tasks.md 7.2) — so the
+    // constructor's own B1 `refresh()` call already settles the characteristic to DETECTED
+    // before the spy below is attached.
+    ctx.snapshot.observeDeviceStatus(structuredClone(deviceStatusFixture));
     const service = new ConnectionService(ctx);
     const hapService = s.accessory.getServiceById(s.api.hap.Service.ContactSensor, CONNECTION_SUBTYPE)!;
     const spy = vi.spyOn(hapService.getCharacteristic(s.api.hap.Characteristic.ContactSensorState), 'updateValue');
 
-    ctx.snapshot.observeDeviceStatus(structuredClone(deviceStatusFixture));
-    service.refresh(); // online already true at construction time isn't tracked; refresh reflects current state, no-op if unchanged
+    service.refresh(); // already settled by the constructor; no-op since nothing has changed
 
     for (let i = 0; i < 5; i++) {
       ctx.snapshot.recordDeviceStatusFailure('network');

@@ -25,6 +25,7 @@ import {
 } from '../src/pod/types.js';
 import { THERMOSTAT_SUBTYPE, type ThermostatService } from '../src/services/thermostat.js';
 import { CONNECTION_SUBTYPE } from '../src/services/connection.js';
+import { fToC } from '../src/pod/temperature.js';
 import {
   createFakeLogging,
   FakeHomebridgeApi,
@@ -215,12 +216,53 @@ describe('handlers are wired after bootstrap settles (tasks.md 7.2)', () => {
     try {
       const timers = createTimerHarness();
       const client = clientFor(pod);
-      const { platform } = await simulateRestart(factory(client, timers), baseConfig(), []);
+      const { api, platform } = await simulateRestart(factory(client, timers), baseConfig(), []);
 
       const left = internals(platform).thermostats.get('left')!;
       expect(left).toBeDefined();
+      const hap = api.hap;
+
       // Reaching the underlying characteristic through the same accessory the platform built,
-      // rather than re-deriving a handler — the read must reflect the mock's seeded fixture.
+      // and reading it through HAP's own real `handleGetRequest` — the same path a real
+      // HomeKit controller's read takes (matching `test/integration/session.test.ts`'s own
+      // convention) — the read must reflect the mock's seeded fixture (B1 regression guard:
+      // without a bootstrap-time `refresh()` call in each service's constructor, every
+      // characteristic below would still be sitting at HAP's own default — 12.78°C target, 0°C
+      // current, StatusActive false — rather than the observed value).
+      const leftAccessory = api.registeredAccessories.find((a) => a.displayName === fixtureSettings.left.name)!;
+      expect(leftAccessory).toBeDefined();
+      const thermostatService = leftAccessory.getServiceById(hap.Service.Thermostat, THERMOSTAT_SUBTYPE)!;
+      // Precision 1, not exact: HAP snaps a pushed float onto each characteristic's minStep
+      // grid (`TargetTemperature`'s explicit 5/9 step, `CurrentTemperature`'s default 0.1) —
+      // matching the same convention `test/services/thermostat.test.ts` already uses for a
+      // snapped value.
+      expect(await thermostatService.getCharacteristic(hap.Characteristic.TargetTemperature).handleGetRequest()).toBeCloseTo(
+        fToC(fixtureDeviceStatus.left.targetTemperatureF),
+        1,
+      );
+      expect(await thermostatService.getCharacteristic(hap.Characteristic.CurrentTemperature).handleGetRequest()).toBeCloseTo(
+        fToC(fixtureDeviceStatus.left.currentTemperatureF),
+        1,
+      );
+      expect(await thermostatService.getCharacteristic(hap.Characteristic.TargetHeatingCoolingState).handleGetRequest()).toBe(
+        fixtureDeviceStatus.left.isOn
+          ? hap.Characteristic.TargetHeatingCoolingState.AUTO
+          : hap.Characteristic.TargetHeatingCoolingState.OFF,
+      );
+      // TemperatureDisplayUnits is seeded lazily, inside its own `onGet` handler — only a real
+      // read (not the raw `.value`) actually triggers the seed from settings.
+      expect(await thermostatService.getCharacteristic(hap.Characteristic.TemperatureDisplayUnits).handleGetRequest()).toBe(
+        fixtureSettings.temperatureFormat === 'celsius'
+          ? hap.Characteristic.TemperatureDisplayUnits.CELSIUS
+          : hap.Characteristic.TemperatureDisplayUnits.FAHRENHEIT,
+      );
+
+      const hubAccessory = api.registeredAccessories.find((a) => a.displayName === 'Pod')!;
+      const connectionService = hubAccessory.getServiceById(hap.Service.ContactSensor, CONNECTION_SUBTYPE)!;
+      expect(await connectionService.getCharacteristic(hap.Characteristic.ContactSensorState).handleGetRequest()).toBe(
+        hap.Characteristic.ContactSensorState.CONTACT_DETECTED,
+      );
+      expect(await connectionService.getCharacteristic(hap.Characteristic.StatusActive).handleGetRequest()).toBe(true);
     } finally {
       vi.useRealTimers();
       await pod.close();
@@ -231,8 +273,12 @@ describe('handlers are wired after bootstrap settles (tasks.md 7.2)', () => {
     vi.useFakeTimers();
     try {
       const timers = createTimerHarness();
+      let deviceStatusCalls = 0;
       const client: MinimalPodClient = {
-        getDeviceStatus: () => Promise.reject(new Error('unreachable')),
+        getDeviceStatus: () => {
+          deviceStatusCalls += 1;
+          return Promise.reject(new Error('unreachable'));
+        },
         getSettings: () => Promise.reject(new Error('unreachable')),
         getSchedules: () => Promise.reject(new Error('unreachable')),
         getServices: () => Promise.reject(new Error('unreachable')),
@@ -247,6 +293,23 @@ describe('handlers are wired after bootstrap settles (tasks.md 7.2)', () => {
       expect(left).toBeDefined();
       expect(right).toBeDefined();
       expect(internals(platform).connectionService).toBeDefined();
+
+      // Polling is running despite every request failing: advancing well past one
+      // deviceStatus poll interval (30s base, backed off to 60s after the bootstrap's own
+      // failure) produces at least one more attempt beyond the bootstrap's.
+      const callsAtBootstrap = deviceStatusCalls;
+      expect(callsAtBootstrap).toBeGreaterThan(0);
+      await advanceFakeTime(65_000, 100);
+      expect(deviceStatusCalls).toBeGreaterThan(callsAtBootstrap);
+
+      // A read still returns rather than throwing — default `noResponseAfterMs` (10 minutes)
+      // is well past this test's advanced time.
+      const hap = api.hap;
+      const leftAccessory = api.registeredAccessories.find((a) => a.displayName === 'Pod Left')!;
+      const targetTemp = leftAccessory
+        .getServiceById(hap.Service.Thermostat, THERMOSTAT_SUBTYPE)!
+        .getCharacteristic(hap.Characteristic.TargetTemperature);
+      await expect(targetTemp.handleGetRequest()).resolves.toBeTypeOf('number');
     } finally {
       vi.useRealTimers();
     }
