@@ -1,8 +1,36 @@
+import { readFileSync } from 'node:fs';
+import { createRequire } from 'node:module';
+import path from 'node:path';
+
 import { describe, expect, it, vi } from 'vitest';
 
 import type { DynamicPlatformPlugin, Logging, PlatformConfig } from 'homebridge';
 
 import { FakeHomebridgeApi, simulateRestart } from './fakeHomebridgeApi.js';
+
+const require = createRequire(import.meta.url);
+
+// N13 in the platform-foundation code review: this file's own doc comment explains *why*
+// `@homebridge/hap-nodejs` is pinned to exactly the version `homebridge` itself depends on —
+// with two different builds installed, every characteristic read/write across the `API['hap']`
+// boundary stops typechecking. This test turns "someone bumps `homebridge` and CI goes red with
+// a wall of unrelated-looking type errors" into one clear, named failure instead.
+describe('@homebridge/hap-nodejs version pin', () => {
+  it("this repo's resolved @homebridge/hap-nodejs version matches the version homebridge itself depends on", () => {
+    // `homebridge`'s `package.json` declares an `exports` map that does not publish
+    // `./package.json` as a subpath, so `require('homebridge/package.json')` is rejected by
+    // Node's exports enforcement — resolve its main entry instead and read the package.json
+    // sitting next to it on disk.
+    const homebridgeEntry = require.resolve('homebridge');
+    const homebridgePackageJsonPath = path.join(path.dirname(homebridgeEntry), '..', 'package.json');
+    const homebridgePackageJson = JSON.parse(readFileSync(homebridgePackageJsonPath, 'utf-8')) as {
+      dependencies: Record<string, string>;
+    };
+    const hapNodeJsPackageJson = require('@homebridge/hap-nodejs/package.json') as { version: string };
+
+    expect(hapNodeJsPackageJson.version).toBe(homebridgePackageJson.dependencies['@homebridge/hap-nodejs']);
+  });
+});
 
 /** A trivial `DynamicPlatformPlugin` used only to exercise the harness itself. */
 class NoopPlatform implements DynamicPlatformPlugin {
@@ -10,13 +38,16 @@ class NoopPlatform implements DynamicPlatformPlugin {
 }
 
 describe('FakeHomebridgeApi', () => {
-  it('constructing it and firing a recorded didFinishLaunching listener executes without error', () => {
+  it('constructing it and firing a recorded didFinishLaunching listener executes without error', async () => {
     const api = new FakeHomebridgeApi();
     let fired = false;
     api.on('didFinishLaunching', () => {
       fired = true;
     });
-    expect(() => api.fireDidFinishLaunching()).not.toThrow();
+    // Awaited (N12 in the platform-foundation code review): `fireDidFinishLaunching` is async,
+    // and an un-awaited call here would let an async listener's rejection surface as an
+    // unhandled rejection instead of failing this test.
+    await expect(api.fireDidFinishLaunching()).resolves.toBeUndefined();
     expect(fired).toBe(true);
   });
 });

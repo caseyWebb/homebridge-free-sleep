@@ -210,6 +210,16 @@ export async function simulateRestart<P extends DynamicPlatformPlugin>(
   const platform = platformFactory(log, config, api.asApi());
 
   for (const accessory of previousAccessories) {
+    // Mirrors real Homebridge's `bridgeService.js` (`accessory.getService(Service
+    // .AccessoryInformation)?.setCharacteristic(Characteristic.FirmwareRevision, '0')`,
+    // `bridgeService.js:326`), which stamps this placeholder on every cached accessory
+    // immediately before calling `configureAccessory` — "so the plugin has the opportunity to
+    // override it." Without this, F2 (re-applying `AccessoryInformation` on restore) would be
+    // untestable: a restored accessory's `FirmwareRevision` would already be correct from
+    // whatever the test seeded it with, never actually exercising the fix.
+    accessory
+      .getService(hapNodeJs.Service.AccessoryInformation)
+      ?.setCharacteristic(hapNodeJs.Characteristic.FirmwareRevision, '0');
     platform.configureAccessory(accessory as unknown as PlatformAccessory);
   }
 
