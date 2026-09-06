@@ -22,7 +22,7 @@
     "branch": "main"
   },
   "waterLevel": "true",
-  "isPriming": false,
+  "isPriming": true,
   "settings": {
     "v": 1,
     "gainLeft": 400,

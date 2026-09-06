@@ -35,3 +35,17 @@ contains both the zod schemas that define the wire types
 - Risk: this specific unit's `coverVersion` / `waterLevel` shape may differ from the
   synthetic assumption. Mitigated by deriving from upstream's own schemas (which the
   Pod's server actually validates against) and by keeping #3 open as the tripwire.
+
+## Update 2026-09-06
+
+A Pod became reachable and real captures landed, closing #3 (`test/fixtures/README.md` has
+the full provenance table). The `coverVersion`/`waterLevel` risk called out above
+materialized, benignly: the real unit reports `coverVersion`/`hubVersion: "Pod 3"`, not the
+`"Pod 5"` this ADR and design.md's Open Question 3 had guessed. Nothing in the codebase
+branches on this value, so the wrong guess cost nothing — the full test suite passed against
+the real capture without a single fixture-content-driven test change. `waterLevel`'s shape
+(the raw string `"true"`, not a boolean) matched the synthetic assumption exactly.
+
+This ADR is now historical context: the fixtures it motivated generating synthetically are
+real captures, and the decision that made that acceptable (derive from upstream's own
+schemas, keep #3 open as a tripwire) is validated rather than superseded.
