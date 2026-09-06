@@ -113,12 +113,20 @@ Alternatives considered:
 
 ### Read schemas are lenient; request schemas are strict
 
-Two variants of each shape:
+Two variants of each shape, applied uniformly across all four blocks (device status,
+settings, schedules, services) — not just device status (B1 in the pod-client code review:
+the first pass of this file only applied the read/request split to device status, leaving
+settings' tap discriminated union and `.min`/`.max` amounts, its `temperatureFormat` enum, and
+schedules' `TimeSchema` regex still enforcing request-side constraints on responses):
 
-- **Read** (`DeviceStatusSchema`, …): `.passthrough()` instead of `.strict()`, and no
-  `.min(55).max(110)` on `targetTemperatureF`.
+- **Read** (`DeviceStatusSchema`, `SettingsSchema`, `SchedulesSchema`, `ServicesSchema`): plain
+  `z.object()` (strip mode) instead of `.strict()`, no `.min(55).max(110)` on
+  `targetTemperatureF`, no tap `type` discriminant or `amount`/`snoozeDuration` bounds, no
+  `temperatureFormat` enum, no `TimeSchema` `HH:mm` regex — every value-level constraint that
+  exists only to validate a *request* is dropped from the read side.
 - **Request** (`DeviceStatusPatchSchema`, `SettingsPatchSchema`): `.strict()`, `.int()`,
-  `.min(55).max(110)` — a local mirror of what the Pod enforces.
+  `.min(55).max(110)`, the tap discriminated union with its bounds, the `temperatureFormat`
+  enum — a local mirror of what the Pod enforces.
 
 Rationale, all Pod-side:
 
@@ -127,14 +135,21 @@ Rationale, all Pod-side:
   (`server/src/routes/deviceStatus/deviceStatus.ts`), and `GET /api/settings` is
   `res.json(settingsDB.data)` (`server/src/routes/settings/settings.ts`). A strict read schema
   would therefore fail on data the Pod is perfectly happy to emit — e.g. a free-sleep version
-  newer than the one we vendored adding a field. Given the Pod reboots daily and a poll
-  failure degrades the whole plugin, "reject the snapshot" is the wrong failure mode.
+  newer than the one we vendored adding a field, or a tap `type` / `temperatureFormat` value
+  a newer client wrote into `settingsDB.json` that this older client has never heard of. Given
+  the Pod reboots daily and a poll failure degrades the whole plugin, "reject the snapshot" is
+  the wrong failure mode.
 - `targetTemperatureF` on read comes from `calculateTempInF` over a hardware level
   (`server/src/8sleep/loadDeviceStatus.ts`), not from the validated write path, so it is not
   guaranteed to sit inside 55–110. Rejecting a whole snapshot over one out-of-range reading
-  would be self-inflicted.
-- Conversely a *write* outside 55–110 is guaranteed to come back 400 from the Pod, so failing
-  locally is strictly better: it costs no round-trip and produces a better error.
+  would be self-inflicted. The same logic applies to a tap's `amount`/`snoozeDuration` and to
+  a schedule's `time` string: none of them are re-validated once persisted to
+  `settingsDB.json`/`schedulesDB.json`, so a read schema that enforces the request-side bound
+  can fail on data that got there validly at write time under an older bound, or via a
+  hand-edited DB.
+- Conversely a *write* outside any of these bounds is guaranteed to come back 400 from the
+  Pod, so failing locally is strictly better: it costs no round-trip and produces a better
+  error.
 
 `taps` stays in the read schema as `.optional()` exactly as upstream declares it
 (`deviceStatusSchema.ts`), even though the HTTP route never populates it —
@@ -249,7 +264,7 @@ pod.url            // http://127.0.0.1:<ephemeral>
 pod.state          // live, readable and writable by the test
 pod.requests       // RecordedRequest[]: method, path, headers, body, status, at
 pod.commands       // Command[]: the ordered hardware commands a write expanded into
-pod.fault(endpoint, { kind: 'status'|'hang'|'reset', status?, times })
+pod.fault(endpoint, { kind: 'status'|'hang'|'hangMidBody'|'reset', status?, times })
 pod.reset()        // restore seed state, clear requests and commands
 await pod.close()
 ```
@@ -267,7 +282,9 @@ upstream passes to `executeFunction`:
 - top level: `PRIME` → left side → right side → `SET_SETTINGS`
 - per side: `LEFT|RIGHT_TEMP_DURATION` (from `isOn`, `'43200'` or `'0'`) →
   `TEMP_LEVEL_LEFT|RIGHT` (from `targetTemperatureF`) → `LEFT|RIGHT_TEMP_DURATION` (from
-  `secondsRemaining`) → `ALARM_CLEAR` (from `isAlarmVibrating`)
+  `secondsRemaining`) → `ALARM_CLEAR` (from `isAlarmVibrating`, recorded with no `side` at
+  all — upstream calls `executeFunction('ALARM_CLEAR', 'empty')` with no side argument,
+  unlike every other per-side command name; N4 in the pod-client code review)
 
 so `{ left: { isOn: true, secondsRemaining: 600 } }` produces
 `['LEFT_TEMP_DURATION 43200', 'LEFT_TEMP_DURATION 600']` in that order and leaves 600 — which
@@ -284,9 +301,27 @@ state.settings.right.awayMode;` — the same expression as upstream, deliberatel
 the coupling is unmistakable to a reader.
 
 Response codes match upstream exactly: `POST /api/deviceStatus` → `204` with an empty body;
-`POST /api/settings` → `200` with the whole merged settings document, `id` stripped
-(`server/src/routes/settings/settings.ts`); validation failure → `400 {error: 'Invalid request
-data', details: [...]}` on all POST routes.
+`POST /api/settings` → `200` with the whole merged settings document, `id` intact — `settings.ts`
+deletes `id` only from the *request* body before merging (so a caller can never overwrite the
+stored id), then responds with `res.json(settingsDB.data)`, the stored document, id and all;
+validation failure → `400 {error: 'Invalid request data', details: [...]}` on all POST routes.
+
+`POST /api/deviceStatus` validates against `types.ts`'s `UpstreamDeviceStatusPatchSchema`, not
+`DeviceStatusPatchSchema` (S3 in the pod-client code review). The latter is `PodClient`'s own
+outgoing contract — the handful of fields it has a defined write policy for — and is narrower
+than what the real Pod's own request validation
+(`DeviceStatusSchema.deepPartial().safeParse(body)`,
+`server/src/routes/deviceStatus/deviceStatus.ts`) actually accepts: `currentTemperatureF`,
+`currentTemperatureLevel`, `taps`, `waterLevel`, `coverVersion`, `hubVersion`, `freeSleep`,
+`wifiStrength` are all structurally valid in a request body even though nothing branches on
+them (`updateDeviceStatus.ts` only destructures the fields it has semantics for). A body the
+mock receives did not necessarily come from `PodClient` — `test/mockPod.test.ts` posts raw
+bodies directly — so the mock validates against the *upstream-equivalent* schema, or it would
+400 a body a real Pod accepts.
+
+A `pod.fault(..., { kind: 'hangMidBody' })` writes response headers and a deliberately
+unterminated partial JSON body chunk, then never ends the response — reproducing a timeout
+that fires *after* `fetch()` has already resolved a `Response`, mid-`response.text()` (B2).
 
 ### How later changes reuse the mock
 
@@ -326,6 +361,15 @@ the new caller receives the same promise. Never for POST: two identical writes a
 deliberate commands (a keep-alive re-post is *literally* an identical repeated write, and
 #12 depends on both being sent).
 
+The physical (deduped) request runs under no particular caller's `AbortSignal` at all — each
+caller instead races its *own* signal against the shared promise. Coupling the shared request
+to whichever caller happened to arrive first was a real bug (S1 in the pod-client code
+review): caller A aborting would abort the underlying fetch out from under a caller B deduped
+onto the same in-flight GET, and a caller whose signal was already aborted before it even
+called in would prevent the shared request from starting at all. Decoupling means (a) any one
+caller's abort — including one that already fired — only ever rejects that caller's own await,
+and (b) the shared physical request is unaffected by, and outlives, any single caller's abort.
+
 Deduplicated callers share one resolved object, so the client returns a value that cannot be
 mutated across callers. Chosen: `structuredClone` per caller. Alternative
 (`Object.freeze` deep) rejected — it makes the value awkward for callers that legitimately
@@ -338,6 +382,13 @@ Pod's 25 s connect path means an unlucky first request after its daily reboot wi
 which the retry covers. Worst case for one call is therefore ~8 s + backoff + 8 s ≈ 16.5 s —
 acceptable because no HAP `onGet` ever awaits this (they read the poller's cache; see
 `docs/POD-API.md`, "The four things that shape the whole plugin").
+
+The timeout can fire after `fetch()` has already resolved a `Response` — headers arrived, but
+the body is still streaming — and `response.text()` rejects the same way an aborted `fetch()`
+call does. Both the header round-trip and the body read must therefore sit inside the same
+try/catch that maps errors to `PodTimeoutError`/`PodNetworkError`/`PodAbortError` (B2 in the
+pod-client code review); reading the body outside that block let a mid-body timeout reject
+with a raw `DOMException` instead, and skipped the retry a timeout is supposed to get.
 
 **Retry.** At most one, after ~500 ms plus jitter. Retry on: a network-level error, or 5xx.
 Do not retry: any 4xx, a caller abort, or a response-shape error.
@@ -399,7 +450,15 @@ name and the host on failure.
 
 It performs **no writes**, so it cannot trigger the job rebuild that `settingsDB.json` /
 `schedulesDB.json` writes cause (`server/src/jobs/jobScheduler.ts`) and cannot disturb a bed
-someone is sleeping in.
+someone is sleeping in. `test/smoke.test.ts` (N7 in the pod-client code review) is the
+regression test for that claim: it drives the script's exported, `argv`-parameterised `main()`
+against a mock Pod and asserts every recorded request is a `GET`.
+
+`parseHostArg`'s `<host>[:<port>]` split needs its own IPv6 handling (N6): a bracketed
+`[<addr>]` or `[<addr>]:<port>` (RFC 3986 §3.2.2) is parsed out same as the plain-host case,
+while a bare (unbracketed) address with more than one colon — an IPv6 literal is itself full of
+colons — is treated as host-only, since there is no unambiguous place to split off a port
+without the brackets.
 
 Execution: `node --experimental-strip-types scripts/smoke.ts <host>` (Node ≥ 22.6; type
 stripping is unflagged from 22.18 / 24). The script and the modules it imports therefore avoid
