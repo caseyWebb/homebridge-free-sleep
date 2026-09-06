@@ -161,7 +161,6 @@ describe('slider-drag guardrail (8.4)', () => {
       const targetTemp = service.getCharacteristic(hap.Characteristic.TargetTemperature);
 
       const degreesF = [66, 68, 70, 72, 74, 76];
-      const cToF = (c: number): number => (c * 9) / 5 + 32;
       const fToC = (f: number): number => ((f - 32) * 5) / 9;
 
       const pending: Array<Promise<unknown>> = [];
@@ -177,7 +176,7 @@ describe('slider-drag guardrail (8.4)', () => {
       expect(posts).toHaveLength(1);
       const body = posts[0]!.left as Record<string, unknown>;
       expect(body.targetTemperatureF).toBe(76);
-      void cToF;
+      expect(body).not.toHaveProperty('isOn');
     } finally {
       await pod.close();
     }
