@@ -116,6 +116,11 @@
 - [x] 7.1 From a clean clone: `npm ci && npm run lint && npm run typecheck && npm test`;
   verify all four exit 0 in sequence. (Verified: `rm -rf node_modules dist && npm ci &&
   npm run lint && npm run typecheck && npm test` run as a single chained command, exit 0.)
-- [ ] 7.2 Confirm CI is green on all three Node versions on the PR (task 5.3), then confirm
+- [x] 7.2 Confirm CI is green on all three Node versions on the PR (task 5.3), then confirm
   the repo state matches the spec's requirements one by one — lint gate, typecheck-covers-tests
   gate, build-emits-src-only, test gate, CI matrix, `supports-hap` metadata, root `CLAUDE.md`.
+  (Verified 2026-09-06: CI run 34049275180 green on Node 22/24/26 — on main rather than a PR,
+  since the workflow landed after the change merged; see 5.3. Repo state walked requirement by
+  requirement: lint/typecheck/test gates behave per spec (7.1), build emits src-only (task 2.2),
+  matrix matches engines.node (5.2), `supports-hap` present without `supports-matter` (1.3),
+  root CLAUDE.md complete (6.1).)
