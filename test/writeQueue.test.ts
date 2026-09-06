@@ -27,13 +27,20 @@ interface Setup {
   queue: WriteQueue;
 }
 
-function setup(options: Partial<Omit<WriteQueueOptions, 'client' | 'snapshot' | 'requestFastPoll' | 'timers'>> = {}): Setup {
+function setup(
+  options: Partial<Omit<WriteQueueOptions, 'client' | 'snapshot' | 'requestFastPoll' | 'timers'>> = {},
+  seed: { deviceStatus?: DeviceStatus } = {},
+): Setup {
   const timers = createTimerHarness();
   const snapshot = new SnapshotStore({ timers });
-  snapshot.observeDeviceStatus(structuredClone(deviceStatusFixture));
+  // `seed.deviceStatus` lets an individual test pin an exact starting device-status shape
+  // (e.g. a specific side's isOn) instead of coupling to whatever the real fixture happens to
+  // contain — see the B1 regression test below.
+  const deviceStatus = seed.deviceStatus ?? deviceStatusFixture;
+  snapshot.observeDeviceStatus(structuredClone(deviceStatus));
   snapshot.observeSettings(structuredClone(settingsFixture));
   const fake = createFakePodClient({
-    deviceStatus: deviceStatusFixture,
+    deviceStatus,
     settings: settingsFixture,
     schedules: schedulesFixture,
     services: servicesFixture,
@@ -491,10 +498,16 @@ describe('write queue: fast poll is lane-aware (S2 regression)', () => {
 
 describe('write queue: per-batch overlay ownership (B1 regression)', () => {
   it('a later same-side write cycle that omits isOn does not clear a still-live isOn overlay installed by an earlier cycle, and each keeps its own settle window', async () => {
-    // The fixture's left.isOn is already `true`, so the overlay must disagree with it (`false`)
-    // to stay observably live rather than retiring by agreement the instant it is installed.
-    expect(deviceStatusFixture.left.isOn).toBe(true);
-    const { queue, snapshot } = setup({ writeSettleMs: 15_000 });
+    // This test needs the raw (pre-overlay) left.isOn to start `true`, so that submitting
+    // isOn:false installs an overlay that *disagrees* with raw and stays observably live,
+    // rather than retiring by agreement the instant it's installed. Pinned explicitly via
+    // `seed.deviceStatus` rather than coupled to whatever the fixture's left.isOn happens to
+    // be (it's `false` in the real Pod 3 capture) — see B1 in the pod-client code review.
+    const rawDeviceStatus: DeviceStatus = {
+      ...deviceStatusFixture,
+      left: { ...deviceStatusFixture.left, isOn: true },
+    };
+    const { queue, snapshot } = setup({ writeSettleMs: 15_000 }, { deviceStatus: rawDeviceStatus });
     const received: Change[] = [];
     snapshot.subscribe((changes) => received.push(...changes));
 
@@ -525,7 +538,7 @@ describe('write queue: per-batch overlay ownership (B1 regression)', () => {
     expect(snapshot.get().left.targetTemperatureF).toBe(70);
 
     await vi.advanceTimersByTimeAsync(2); // past cycle 1's own expiry, still short of cycle 2's
-    expect(snapshot.get().left.isOn).toBe(deviceStatusFixture.left.isOn); // reverted to raw (true)
+    expect(snapshot.get().left.isOn).toBe(rawDeviceStatus.left.isOn); // reverted to raw (true)
     expect(snapshot.get().left.targetTemperatureF).toBe(70); // cycle 2 unaffected
     queue.stop();
   });

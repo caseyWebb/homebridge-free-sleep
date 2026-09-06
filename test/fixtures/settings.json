@@ -1,10 +1,10 @@
 {
-  "id": "demo-user",
-  "timeZone": "America/Los_Angeles",
+  "id": "00000000-0000-0000-0000-000000000000",
+  "timeZone": "America/Chicago",
   "temperatureFormat": "fahrenheit",
   "rebootDaily": true,
   "left": {
-    "name": "Left side",
+    "name": "Left",
     "awayMode": false,
     "scheduleOverrides": {
       "temperatureSchedules": {
@@ -37,7 +37,7 @@
     }
   },
   "right": {
-    "name": "Right side",
+    "name": "Right",
     "awayMode": false,
     "scheduleOverrides": {
       "temperatureSchedules": {
@@ -71,6 +71,6 @@
   },
   "primePodDaily": {
     "enabled": true,
-    "time": "14:30"
+    "time": "14:00"
   }
 }
