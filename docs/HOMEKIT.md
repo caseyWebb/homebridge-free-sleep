@@ -72,11 +72,20 @@ and `minStep = 5/9`, grid point *k* is exactly `fToC(55 + k)` — every integer 
 nothing else is. With `0.5` the grid points sit 0.9 °F apart, so consecutive slider positions
 round to the same whole °F and the Fahrenheit slider visibly skips degrees.
 
-**`maxValue` needs the `+0.2` margin.** HAP computes an effective max as
-`minStep * Math.floor((maxValue - minValue) / minStep) + minValue`. With exact endpoints the
-division yields `54.99999999999999` in IEEE-754, floors to 54, and **110 °F becomes
-permanently unreachable**. Unit-testing our own arithmetic does not catch this — the test has
-to go through HAP's validator:
+**`maxValue` needs the `+0.2` margin.** What a client actually sees as "the values this
+characteristic accepts" comes from `validValuesIterator()`, and for a numeric characteristic
+with no explicit `validValues` list it enumerates the grid with a plain loop —
+`for (let i = minValue; i <= maxValue; i += minStep) yield i` — not by computing a step count
+via division. With exact endpoints — `minValue = fToC(55)`, `maxValue = fToC(110)`,
+`minStep = 5/9` — the quotient `(maxValue - minValue) / minStep` evaluates to exactly `55` in
+IEEE-754, so a floored-division account of the bug (as this section previously described) is
+not what actually happens here: the loop instead accumulates floating-point error across the
+~55 repeated `i += minStep` additions, and that error is what makes the last iteration
+overshoot `maxValue` one step early — **110 °F becomes permanently unreachable**, yielding 55
+grid points instead of 56. Confirmed against the installed `@homebridge/hap-nodejs`: with the
+exact endpoint the iterator yields 55 values (top value 109 °F); with the `+0.2` margin it
+yields 56 (top value 110 °F). Unit-testing our own arithmetic does not catch this — the test
+has to go through HAP's validator:
 
 ```ts
 expect(Array.from(char.validValuesIterator())).toHaveLength(56);
