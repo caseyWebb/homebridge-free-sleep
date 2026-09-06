@@ -150,6 +150,26 @@ describe('transport', () => {
       const response = await fetch(`${pod.url}/api/deviceStatus`);
       expect(response.status).toBe(200);
     });
+
+    it('a typo\'d endpoint throws loudly instead of silently never firing (N3)', async () => {
+      const pod = await start();
+      expect(() => pod.fault('GET /api/deviceStatis', { kind: 'status', times: 1 })).toThrow();
+      expect(() => pod.fault('DELETE /api/deviceStatus', { kind: 'status', times: 1 })).toThrow();
+    });
+
+    it('every endpoint the mock actually routes is accepted by fault()', async () => {
+      const pod = await start();
+      for (const endpoint of [
+        'GET /api/deviceStatus',
+        'GET /api/settings',
+        'GET /api/schedules',
+        'GET /api/services',
+        'POST /api/deviceStatus',
+        'POST /api/settings',
+      ]) {
+        expect(() => pod.fault(endpoint, { kind: 'status', times: 1 })).not.toThrow();
+      }
+    });
   });
 });
 
@@ -200,6 +220,35 @@ describe('strict request validation (5.1)', () => {
     expect(response.status).toBe(400);
   });
 
+  describe('accepts every field upstream\'s DeviceStatusSchema.deepPartial() accepts (S3)', () => {
+    // PodClient's own outgoing DeviceStatusPatchSchema never sends these — it only has a
+    // defined write policy for a handful of fields — but a real Pod's request validation
+    // (`DeviceStatusSchema.deepPartial().safeParse(body)`) structurally accepts the rest of
+    // `DeviceStatusSchema` too. The mock must not 400 a body a real Pod would accept.
+    it.each([
+      ['a side-level currentTemperatureF', { left: { currentTemperatureF: 71 } }],
+      ['a side-level currentTemperatureLevel', { left: { currentTemperatureLevel: 5 } }],
+      ['a side-level taps object', { left: { taps: { doubleTap: 1, tripleTap: 2, quadTap: 3 } } }],
+      ['a top-level waterLevel', { waterLevel: 'true' }],
+      ['a top-level coverVersion', { coverVersion: 'Pod 5' }],
+      ['a top-level hubVersion', { hubVersion: 'Pod 5' }],
+      ['a top-level freeSleep object', { freeSleep: { version: '2.1.5', branch: 'main' } }],
+      ['a top-level wifiStrength', { wifiStrength: 90 }],
+    ])('%s gives 204, not 400', async (_label, patch) => {
+      const pod = await start();
+      const response = await postDeviceStatus(pod, patch);
+      expect(response.status).toBe(204);
+    });
+
+    it('a field this schema still does not recognize gives 400 naming it', async () => {
+      const pod = await start();
+      const response = await postDeviceStatus(pod, { turboMode: true });
+      expect(response.status).toBe(400);
+      const body = (await response.json()) as { details: unknown[] };
+      expect(JSON.stringify(body.details)).toMatch(/turboMode/);
+    });
+  });
+
   it('a valid device-status write gives 204 with an empty body', async () => {
     const pod = await start();
     const response = await postDeviceStatus(pod, { left: { targetTemperatureF: 70 } });
@@ -208,13 +257,26 @@ describe('strict request validation (5.1)', () => {
     expect(text).toBe('');
   });
 
-  it('a valid settings write gives 200 with id absent from the response', async () => {
+  it('a valid settings write gives 200 with the stored id intact in the response', async () => {
     const pod = await start();
+    const before = await fetch(`${pod.url}/api/settings`).then((r) => r.json()) as { id: string };
     const response = await postSettings(pod, { left: { awayMode: true } });
     expect(response.status).toBe(200);
     const body = (await response.json()) as Record<string, unknown>;
-    expect('id' in body).toBe(false);
+    // settings.ts deletes `id` only from the *request* body before merging; the response is
+    // `res.json(settingsDB.data)` — the stored document, id intact.
+    expect(body.id).toBe(before.id);
     expect(body.left).toMatchObject({ awayMode: true });
+  });
+
+  it('a settings write cannot overwrite the stored id even if the request body sends one', async () => {
+    const pod = await start();
+    const before = await fetch(`${pod.url}/api/settings`).then((r) => r.json()) as { id: string };
+    const response = await postSettings(pod, { id: 'attacker-supplied', left: { awayMode: true } });
+    expect(response.status).toBe(200);
+    const body = (await response.json()) as Record<string, unknown>;
+    expect(body.id).toBe(before.id);
+    expect(body.id).not.toBe('attacker-supplied');
   });
 });
 
@@ -300,6 +362,14 @@ describe('fixed command expansion and ordering (5.5)', () => {
       'LEFT_TEMP_DURATION', // secondsRemaining
       'ALARM_CLEAR', // isAlarmVibrating
     ]);
+  });
+
+  it('ALARM_CLEAR is recorded with no side, matching executeFunction(\'ALARM_CLEAR\', \'empty\') (N4)', async () => {
+    const pod = await start();
+    await postDeviceStatus(pod, { left: { isAlarmVibrating: false } });
+    const alarmClear = pod.commands.find((c) => c.name === 'ALARM_CLEAR');
+    expect(alarmClear).toBeDefined();
+    expect(alarmClear!.side).toBeUndefined();
   });
 
   it('a body setting fields on both sides logs all left commands before all right', async () => {
