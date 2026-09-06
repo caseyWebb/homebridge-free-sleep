@@ -1,3 +1,6 @@
+import { readdirSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
+
 import { describe, expect, it } from 'vitest';
 
 import { loadFixture } from './loadFixture.js';
@@ -8,21 +11,46 @@ import {
   SettingsSchema,
 } from '../src/pod/types.js';
 
-// Table-driven so adding a fixture file without adding a row here is itself caught: the
-// no-taps and structural-failure tests below only exercise what's listed, and a reviewer
-// diffing `ls test/fixtures/*.json` against this table will notice a missing row.
-const fixtures = [
-  { name: 'deviceStatus.json', schema: DeviceStatusSchema },
-  { name: 'deviceStatus.bothOff.json', schema: DeviceStatusSchema },
-  { name: 'deviceStatus.waterLow.json', schema: DeviceStatusSchema },
-  { name: 'deviceStatus.waterUnknown.json', schema: DeviceStatusSchema },
-  { name: 'settings.json', schema: SettingsSchema },
-  { name: 'schedules.json', schema: SchedulesSchema },
-  { name: 'services.json', schema: ServicesSchema },
-];
+interface ReadSchema {
+  parse(data: unknown): unknown;
+}
+
+/**
+ * Maps a fixture filename to the read schema it must parse against, by prefix rather than by
+ * exact name.
+ *
+ * S5 in the pod-client code review: the previous version of this file was a hardcoded table
+ * of exact filenames, so a new fixture added to `test/fixtures/` without a matching row here
+ * silently exercised nothing — the promised "adding a fixture without a row is itself caught"
+ * property didn't actually hold, since the fixture list was `readdirSync`-independent. This
+ * version enumerates `test/fixtures/*.json` directly and FAILS the corresponding test for any
+ * filename `schemaFor` doesn't recognize, so an unmapped fixture is a loud test failure, not a
+ * silent gap.
+ */
+function schemaFor(name: string): ReadSchema {
+  if (name.startsWith('deviceStatus')) return DeviceStatusSchema;
+  if (name === 'settings.json') return SettingsSchema;
+  if (name === 'schedules.json') return SchedulesSchema;
+  if (name === 'services.json') return ServicesSchema;
+  throw new Error(
+    `test/fixtures/${name} has no schema mapping in fixtures.test.ts's schemaFor() — add one ` +
+      "there before this fixture can be trusted to parse against its intended read schema.",
+  );
+}
+
+const fixturesDir = fileURLToPath(new URL('fixtures/', import.meta.url));
+const fixtureFiles = readdirSync(fixturesDir).filter((name) => name.endsWith('.json'));
 
 describe('every fixture parses through its read schema', () => {
-  it.each(fixtures)('$name parses', ({ name, schema }) => {
+  // Sanity check on the enumeration itself: if `test/fixtures/*.json` is ever empty (a
+  // misconfigured path, a botched rename), `it.each` below would silently run zero cases and
+  // the whole describe block would report as passing.
+  it('finds at least one fixture file to check', () => {
+    expect(fixtureFiles.length).toBeGreaterThan(0);
+  });
+
+  it.each(fixtureFiles)('%s parses', (name) => {
+    const schema = schemaFor(name);
     const data = loadFixture(name);
     expect(() => schema.parse(data)).not.toThrow();
   });
