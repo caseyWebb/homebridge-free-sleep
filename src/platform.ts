@@ -2,12 +2,15 @@
  * `FreeSleepPlatform` — the `DynamicPlatformPlugin` that publishes and maintains the
  * plugin's bridged HomeKit accessories (design.md, "Restore flow").
  *
- * After this change every accessory carries only `AccessoryInformation` — no thermostat,
- * sensor, or switch service exists yet (that is `thermostat-and-offline`). This module owns:
+ * Every side accessory carries a `Thermostat`; the hub carries the "Pod Connection"
+ * `ContactSensor` (`thermostat-and-offline`, specs/platform/spec.md). This module owns:
  * stable UUID/SerialNumber derivation from the *configured* host, `configureAccessory`
  * restore with prune-on-restore, unregistering the unused side when `sides !== 'both'`,
- * one-time display-name seeding from `GET /api/settings`, and the bail-without-host startup
- * guard (specs/platform/spec.md).
+ * one-time display-name seeding from `GET /api/settings`, the bail-without-host startup
+ * guard, and — new in this change — constructing and owning the snapshot store, poller and
+ * write queue for the whole platform's lifetime, bootstrapping before any HAP handler is
+ * registered, routing snapshot change events to the services that publish them, and stopping
+ * everything on Homebridge shutdown (design.md, "Platform wiring").
  *
  * Per docs/HOMEKIT.md's Homebridge 2.x API notes: HAP **types** come from `homebridge`;
  * runtime enums/classes always come from `api.hap`, never a direct `@homebridge/hap-nodejs`
@@ -26,8 +29,22 @@ import type {
 } from 'homebridge';
 
 import { FreeSleepConfigSchema, unrecognizedConfigKeys, type FreeSleepConfig } from './config.ts';
-import type { Settings } from './pod/types.ts';
+import type {
+  DeviceStatus,
+  DeviceStatusPatch,
+  Schedules,
+  Services as PodServices,
+  Settings,
+  SettingsPatch,
+  Side,
+} from './pod/types.ts';
 import { DEFAULT_TIMEOUT_MS, PodClient, RETRY_BASE_DELAY_MS, RETRY_JITTER_MS } from './pod/client.ts';
+import { PodPoller } from './pod/poller.ts';
+import { defaultTimerApi, SnapshotStore, type Change, type TimerApi } from './pod/snapshot.ts';
+import { WriteQueue } from './pod/writeQueue.ts';
+import { CONNECTION_SUBTYPE, ConnectionService } from './services/connection.ts';
+import { isThermostatChange, THERMOSTAT_SUBTYPE, ThermostatService } from './services/thermostat.ts';
+import type { ServiceContext } from './services/types.ts';
 import { PLATFORM_NAME, PLUGIN_NAME } from './settings.ts';
 
 const require = createRequire(import.meta.url);
@@ -36,14 +53,29 @@ const packageJson = require('../package.json') as { version: string };
 
 export type Role = 'left' | 'right' | 'hub';
 
+/** Base interval a write-triggered fast-poll window runs at — matches `PodPoller`'s own
+ * `fastPollIntervalMs` default (`src/pod/poller.ts`), duplicated here rather than imported
+ * because nothing in `poller.ts` exports it; kept in sync by `pollIntervals.fastPollIntervalMs`
+ * overriding both call sites identically when configured. */
+const DEFAULT_FAST_POLL_INTERVAL_MS = 5000;
+
 /**
- * The subset of `PodClient`'s public interface this change calls. A hand-written fake
- * satisfying just this shape stands in for the real client in tests (design.md,
- * "Testability without a paired Home app") — no dependency on `pod-client`'s own mock Pod,
- * since nothing here needs real transport behavior.
+ * The subset of `PodClient`'s public interface this change calls — now the full read/write
+ * surface, since `thermostat-and-offline` shares this one injected client between the
+ * one-time settings-name-seeding read, the poller, and the write queue (design.md's coupling
+ * points: `PodPoller`/`WriteQueue` both take a concrete `PodClient`, so a fake satisfying this
+ * structural shape is handed to them via `as unknown as PodClient` — the same escape hatch
+ * `test/fakePodClient.ts` already uses). A hand-written fake satisfying just this shape stands
+ * in for the real client in tests (design.md, "Testability without a paired Home app") — no
+ * dependency on `pod-client`'s own mock Pod, since nothing here needs real transport behavior.
  */
 export interface MinimalPodClient {
+  getDeviceStatus(signal?: AbortSignal): Promise<DeviceStatus>;
   getSettings(signal?: AbortSignal): Promise<Settings>;
+  getSchedules(signal?: AbortSignal): Promise<Schedules>;
+  getServices(signal?: AbortSignal): Promise<PodServices>;
+  postDeviceStatus(patch: DeviceStatusPatch, signal?: AbortSignal): Promise<void>;
+  postSettings(patch: SettingsPatch, signal?: AbortSignal): Promise<void>;
 }
 
 /**
@@ -99,16 +131,18 @@ interface WantedAccessory {
 
 /**
  * The currently-enabled non-`AccessoryInformation` services, per role, as
- * `${Service.UUID}:${subtype}` compound keys. Empty for every role after this change — no
- * accessory carries anything beyond `AccessoryInformation` yet (proposal.md's "done when").
- * `thermostat-and-offline` extends this table as it adds services; `pruneServices` below reads
- * it and never needs to change shape itself (design.md, "Restore flow").
+ * `${Service.UUID}:${subtype}` compound keys — side accessories enable the thermostat subtype,
+ * the hub enables the connection-sensor subtype (tasks.md 1.2). Computed from `hap` rather than
+ * a module-level constant, since the UUIDs come from `api.hap.Service.*`, never a direct
+ * `@homebridge/hap-nodejs` import (docs/HOMEKIT.md). `pruneServices` below reads this and never
+ * needs to change shape itself as more services are added (design.md, "Restore flow").
  */
-const ENABLED_SERVICE_KEYS: Readonly<Record<Role, ReadonlySet<string>>> = {
-  left: new Set(),
-  right: new Set(),
-  hub: new Set(),
-};
+function enabledServiceKeysFor(hap: HAP, role: Role): ReadonlySet<string> {
+  if (role === 'hub') {
+    return new Set([`${hap.Service.ContactSensor.UUID}:${CONNECTION_SUBTYPE}`]);
+  }
+  return new Set([`${hap.Service.Thermostat.UUID}:${THERMOSTAT_SUBTYPE}`]);
+}
 
 export class FreeSleepPlatform implements DynamicPlatformPlugin {
   private readonly cachedByUuid = new Map<string, PlatformAccessory>();
@@ -124,9 +158,32 @@ export class FreeSleepPlatform implements DynamicPlatformPlugin {
   private readonly log: Logging;
   private readonly api: API;
 
-  constructor(log: Logging, rawConfig: PlatformConfig, api: API, podClient?: MinimalPodClient) {
+  /** Shared with the poller, the write queue and every service (design.md's `ServiceContext`). */
+  private readonly timers: TimerApi;
+  /** The escalation predicate's fallback `since` when the Pod has never been observed reachable
+   * this launch (design.md, "No Response"). */
+  private readonly platformStartedAt: number;
+
+  /** Constructed once, only when `config` parses successfully (tasks.md 7.1). */
+  private readonly snapshot: SnapshotStore | undefined;
+  private readonly poller: PodPoller | undefined;
+  private readonly writeQueue: WriteQueue | undefined;
+  private unsubscribeSnapshot: (() => void) | undefined;
+
+  private readonly thermostats = new Map<Side, ThermostatService>();
+  private connectionService: ConnectionService | undefined;
+
+  constructor(
+    log: Logging,
+    rawConfig: PlatformConfig,
+    api: API,
+    podClient?: MinimalPodClient,
+    timers?: TimerApi,
+  ) {
     this.log = log;
     this.api = api;
+    this.timers = timers ?? defaultTimerApi;
+    this.platformStartedAt = this.timers.now();
 
     for (const key of unrecognizedConfigKeys(rawConfig as unknown as Record<string, unknown>)) {
       this.log.warn(
@@ -147,18 +204,121 @@ export class FreeSleepPlatform implements DynamicPlatformPlugin {
     }
 
     this.config = parsed.data;
-    this.podClient = podClient ?? new PodClient({ host: parsed.data.host });
+    const client = podClient ?? new PodClient({ host: parsed.data.host });
+    this.podClient = client;
+
+    // One cached-snapshot store, one poller and one write queue per launch, shared across
+    // every accessory and service (specs/platform/spec.md, tasks.md 7.1). `client` satisfies
+    // `MinimalPodClient`'s structural shape, which is a strict subset of `PodClient`'s public
+    // surface — the `as unknown as PodClient` cast is the same escape hatch
+    // `test/fakePodClient.ts` already uses to hand a fake into these two, which both declare
+    // `client: PodClient` (a concrete class, not an interface).
+    const snapshot = new SnapshotStore({ timers: this.timers });
+    this.snapshot = snapshot;
+
+    const pollOptions = parsed.data.pollIntervals;
+    const poller = new PodPoller({
+      client: client as unknown as PodClient,
+      snapshot,
+      timers: this.timers,
+      ...(pollOptions.pollIntervalMs !== undefined ? { pollIntervalMs: pollOptions.pollIntervalMs } : {}),
+      ...(pollOptions.slowPollIntervalMs !== undefined ? { slowPollIntervalMs: pollOptions.slowPollIntervalMs } : {}),
+      ...(pollOptions.fastPollIntervalMs !== undefined ? { fastPollIntervalMs: pollOptions.fastPollIntervalMs } : {}),
+      ...(pollOptions.maxBackoffMs !== undefined ? { maxBackoffMs: pollOptions.maxBackoffMs } : {}),
+      ...(pollOptions.bootstrapTimeoutMs !== undefined ? { bootstrapTimeoutMs: pollOptions.bootstrapTimeoutMs } : {}),
+    });
+    this.poller = poller;
+
+    const fastPollIntervalMs = pollOptions.fastPollIntervalMs ?? DEFAULT_FAST_POLL_INTERVAL_MS;
+    const writeQueue = new WriteQueue({
+      client: client as unknown as PodClient,
+      snapshot,
+      // `left`/`right` writes accelerate deviceStatus polling for a confirming read; a
+      // `settings` write (unused by this change) is confirmed by a single re-read instead
+      // (design.md's coupling points; `pod-write-queue`'s own module doc).
+      requestFastPoll: (lane, untilMs) => {
+        if (lane === 'deviceStatus') {
+          poller.requestMode('deviceStatus', { intervalMs: fastPollIntervalMs, untilMs, reason: 'write' });
+        } else {
+          void poller.refresh('settings');
+        }
+      },
+      timers: this.timers,
+      ...(pollOptions.writeDebounceMs !== undefined ? { writeDebounceMs: pollOptions.writeDebounceMs } : {}),
+      ...(pollOptions.writeMaxDebounceMs !== undefined ? { writeMaxDebounceMs: pollOptions.writeMaxDebounceMs } : {}),
+      writeSettleMs: parsed.data.writeSettleMs,
+      ...(pollOptions.fastPollDurationMs !== undefined ? { fastPollDurationMs: pollOptions.fastPollDurationMs } : {}),
+    });
+    this.writeQueue = writeQueue;
+
+    // Subscribed exactly once (specs/platform/spec.md, tasks.md 7.3); each service call is
+    // individually wrapped so one throwing service does not stop the others from being
+    // notified.
+    this.unsubscribeSnapshot = snapshot.subscribe((changes) => this.handleSnapshotChanges(changes));
 
     this.api.on('didFinishLaunching', () => {
       return this.discoverAccessories().catch((error: unknown) => {
         this.log.error(`FreeSleep: unexpected error during accessory discovery: ${describeError(error)}`);
       });
     });
+
+    // Stop polling, stop the write path, and drop the snapshot subscription — no pending
+    // timer, no in-flight work that could still touch HomeKit (specs/platform/spec.md,
+    // tasks.md 7.4).
+    this.api.on('shutdown', () => {
+      this.poller?.stop();
+      this.writeQueue?.stop();
+      this.unsubscribeSnapshot?.();
+      this.unsubscribeSnapshot = undefined;
+    });
   }
 
   /** Homebridge calls this once per cached accessory, before `didFinishLaunching` fires. */
   configureAccessory(accessory: PlatformAccessory): void {
     this.cachedByUuid.set(accessory.UUID, accessory);
+  }
+
+  private handleSnapshotChanges(changes: readonly Change[]): void {
+    for (const change of changes) {
+      try {
+        if (isThermostatChange(change)) {
+          this.thermostats.get(change.side)?.refresh();
+        } else if (change.scope === 'device' && change.field === 'connectionOnline') {
+          this.connectionService?.refresh();
+        }
+        // isAlarmVibrating, awayMode, waterLevelState, isPriming: no published service watches
+        // these fields yet — ignored, without error (design.md's routing table; #13/#16/#19/#20).
+      } catch (error) {
+        this.log.warn(`FreeSleep: a service failed to handle a snapshot change: ${describeError(error)}`);
+      }
+    }
+  }
+
+  private serviceContextFor(accessory: PlatformAccessory): ServiceContext | undefined {
+    if (!this.config || !this.snapshot || !this.writeQueue) return undefined;
+    return {
+      api: this.api,
+      log: this.log,
+      accessory,
+      snapshot: this.snapshot,
+      writeQueue: this.writeQueue,
+      timers: this.timers,
+      config: this.config,
+    };
+  }
+
+  /** Adds (or restores, via each service's own `getServiceById`) the service(s) `role` enables
+   * on `accessory` — a thermostat for a side, the connection sensor for the hub. Called only
+   * after the poller's bootstrap has settled (tasks.md 7.2), so the very first `onGet` a
+   * controller makes already has real data. */
+  private constructServicesFor(role: Role, accessory: PlatformAccessory): void {
+    const ctx = this.serviceContextFor(accessory);
+    if (!ctx) return;
+    if (role === 'hub') {
+      this.connectionService = new ConnectionService(ctx);
+    } else {
+      this.thermostats.set(role, new ThermostatService(ctx, role, this.platformStartedAt));
+    }
   }
 
   private async discoverAccessories(): Promise<void> {
@@ -183,9 +343,21 @@ export class FreeSleepPlatform implements DynamicPlatformPlugin {
       }
     }
 
+    // Kicked off now rather than awaited immediately: the bootstrap read is independent of the
+    // one-time name-seeding read below, and overlapping the two bounded waits keeps a
+    // fully-unreachable-Pod worst case bounded by whichever budget is larger, not their sum.
+    // Still settled — per specs/platform/spec.md — before any service (and so any HAP handler)
+    // is constructed, a few lines below.
+    const bootstrapSettled = this.poller?.bootstrap() ?? Promise.resolve();
+
     const needsSettings = wanted.some((w) => w.role !== 'hub' && !this.cachedByUuid.has(w.uuid));
     const settings = needsSettings ? await this.tryReadSettings() : undefined;
 
+    interface Planned {
+      role: Role;
+      accessory: PlatformAccessory;
+    }
+    const planned: Planned[] = [];
     const newAccessories: PlatformAccessory[] = [];
     for (const w of wanted) {
       const existing = this.cachedByUuid.get(w.uuid);
@@ -203,6 +375,7 @@ export class FreeSleepPlatform implements DynamicPlatformPlugin {
           // write.
           this.api.updatePlatformAccessories([existing]);
         }
+        planned.push({ role: w.role, accessory: existing });
         continue;
       }
 
@@ -215,6 +388,7 @@ export class FreeSleepPlatform implements DynamicPlatformPlugin {
         const accessory = new this.api.platformAccessory(name, w.uuid, categoryFor(hap, w.role));
         this.setAccessoryInformation(accessory, host, w.role);
         this.cachedByUuid.set(w.uuid, accessory);
+        planned.push({ role: w.role, accessory });
         newAccessories.push(accessory);
       } catch (error) {
         this.log.error(
@@ -222,6 +396,18 @@ export class FreeSleepPlatform implements DynamicPlatformPlugin {
             'continuing with the remaining accessories.',
         );
       }
+    }
+
+    // Bootstrap before wiring any handler (specs/platform/spec.md; design.md, "Platform
+    // wiring"). A bootstrap that fails or times out still resolves — `PodPoller.bootstrap()`
+    // races every enabled class against its own deadline — so this never blocks publishing.
+    await bootstrapSettled;
+
+    // Construct services after the bootstrap settles and before `registerPlatformAccessories`
+    // — every `setProps` call inside a service's constructor must happen before the accessory
+    // is published (tasks.md 2.3).
+    for (const p of planned) {
+      this.constructServicesFor(p.role, p.accessory);
     }
 
     if (newAccessories.length > 0) {
@@ -280,18 +466,18 @@ export class FreeSleepPlatform implements DynamicPlatformPlugin {
 
   /**
    * Removes any service on `accessory` whose `(UUID, subtype)` pair is not part of `role`'s
-   * currently-enabled set (`ENABLED_SERVICE_KEYS`). `AccessoryInformation` has no subtype and
-   * is always enabled, so it is never a removal candidate. Every role's enabled set is empty
-   * today, so every non-`AccessoryInformation` service is pruned — a no-op in practice,
-   * exercised by a unit test with a synthetic extra service, so `thermostat-and-offline` only
-   * has to grow `ENABLED_SERVICE_KEYS`, never this method (design.md, "Restore flow").
+   * currently-enabled set (`enabledServiceKeysFor`). `AccessoryInformation` has no subtype and
+   * is always enabled, so it is never a removal candidate. A side accessory's thermostat and
+   * the hub's connection sensor both survive; a synthetic extra service does not — exercised by
+   * a unit test, so a later change only has to grow `enabledServiceKeysFor`, never this method
+   * (design.md, "Restore flow").
    *
    * Returns whether any service was actually removed, so callers (F4) can persist the mutation
    * with `updatePlatformAccessories` only when there is something to persist.
    */
   private pruneServices(accessory: PlatformAccessory, role: Role): boolean {
     const accessoryInformationUuid = this.api.hap.Service.AccessoryInformation.UUID;
-    const enabled = ENABLED_SERVICE_KEYS[role];
+    const enabled = enabledServiceKeysFor(this.api.hap, role);
     let removedAny = false;
     for (const service of [...accessory.services]) {
       if (service.UUID === accessoryInformationUuid) continue;

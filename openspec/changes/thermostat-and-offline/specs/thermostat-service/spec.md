@@ -145,8 +145,12 @@ three values above are already its only ones.
 #### Scenario: Turning the side off reports Off
 
 - **WHEN** an observation reports the side no longer running
-- **THEN** the current state is off, and the previously reported non-off state is retained for
-  the next time the side runs
+- **THEN** the current state is off — which, since the sticky state is simply
+  `characteristic.value` and nothing else (design.md, "The sticky deadband, and where its state
+  lives"), overwrites whatever heat/cool state was reported before the side turned off. A
+  subsequent on cycle that begins inside the deadband is therefore governed by the seed clause
+  (the sign of the target/current difference), not by resurrecting the state from before the
+  side was off
 
 ### Requirement: Every read is served synchronously from the cached observation
 

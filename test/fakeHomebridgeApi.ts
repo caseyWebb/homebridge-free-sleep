@@ -106,10 +106,13 @@ export class FakeHomebridgeApi {
   readonly unregisterPlatformAccessoriesCalls: FakePlatformAccessory[][] = [];
 
   private readonly didFinishLaunchingListeners: DidFinishLaunchingListener[] = [];
+  private readonly shutdownListeners: DidFinishLaunchingListener[] = [];
 
   on(event: 'didFinishLaunching' | 'shutdown', listener: DidFinishLaunchingListener): this {
     if (event === 'didFinishLaunching') {
       this.didFinishLaunchingListeners.push(listener);
+    } else if (event === 'shutdown') {
+      this.shutdownListeners.push(listener);
     }
     return this;
   }
@@ -118,9 +121,22 @@ export class FakeHomebridgeApi {
     return this.didFinishLaunchingListeners.length;
   }
 
+  get shutdownListenerCount(): number {
+    return this.shutdownListeners.length;
+  }
+
   /** Fires every recorded `'didFinishLaunching'` listener and awaits any promise it returns. */
   async fireDidFinishLaunching(): Promise<void> {
     const results = this.didFinishLaunchingListeners.map((listener) => listener());
+    await Promise.all(results);
+  }
+
+  /** Fires every recorded `'shutdown'` listener and awaits any promise it returns — real
+   * Homebridge's own `'shutdown'` listeners are likewise typed `() => void`, but awaiting here
+   * lets a test observe a listener's async cleanup (e.g. `WriteQueue.stop()`'s in-flight
+   * rejections settling) without a side channel. */
+  async fireShutdown(): Promise<void> {
+    const results = this.shutdownListeners.map((listener) => listener());
     await Promise.all(results);
   }
 

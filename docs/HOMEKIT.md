@@ -102,6 +102,10 @@ write cannot roll the UI backwards.
 **`CurrentTemperature`**: leave the default `minStep` of 0.1; widen the range but do **not**
 clamp it to 55–110 °F. `currentTemperatureF` is derived from the measured level, which can go
 below −100 in a cold room, producing a genuine sub-55 °F reading we should not lie about.
+Shipped (`thermostat-and-offline`, #9): `{ minValue: -270, maxValue: 100 }` — the widest range
+HAP legally permits for this characteristic, so no reading the Pod can produce is ever clamped.
+`fToC(F_MIN)..fToC(F_MAX)+0.2` (the `TargetTemperature` range) was considered and rejected: it
+is an arbitrary bound that would still clamp, just less often.
 
 **`TemperatureDisplayUnits`**: the Apple Home app ignores it entirely and displays per the
 iOS device's region setting. Serve it from `accessory.context`, seeded once from
@@ -136,6 +140,48 @@ Our outages are *routine and short* (daily reboot). So:
 
 Bootstrap: poll once inside `didFinishLaunching` before wiring handlers. If it fails, fall
 back to `characteristic.value` — `PlatformAccessory` persists values across restarts.
+
+### Connection sensor: polarity, status semantics, and escalation (shipped, `thermostat-and-offline`, #9/#11)
+
+**Polarity — locked.** `ContactSensorState.CONTACT_DETECTED` while the Pod is reachable,
+`CONTACT_NOT_DETECTED` while it is not. The Home app renders these as "Closed"/"Open", so an
+outage reads as "Pod Connection — Open" and the natural automation trigger ("when Pod
+Connection opens") fires on going offline — the event people actually want a notification for.
+The inverse polarity was considered (arguably a clearer "closed" *state* reading) but makes the
+notification-worthy event a *close*, which reads backwards; flipping it after users have built
+automations on it would be breaking, so it is locked.
+
+**`StatusFault`** tracks reachability directly: `GENERAL_FAULT` while unreachable, `NO_FAULT`
+otherwise. **`StatusActive`** is `false` only until the plugin's first-ever successful
+observation of the Pod this launch, then stays `true` — **including through later outages**.
+A known-offline Pod is data the sensor is confidently reporting, not an absence of data, which
+is the same reasoning this doc already applies to the occupancy sensor's `StatusActive` (see
+"Occupancy" below), used here in the opposite direction: `StatusFault` carries the outage
+signal instead.
+
+**The connection sensor's own reads never escalate.** The `noResponseAfterMs` escalation
+(below) is implemented only on the per-side `Thermostat`'s five characteristics, which have no
+fault/status outlet of their own (`Thermostat` does not declare `StatusFault`/`StatusActive` —
+see point 3 above). The connection sensor *is* the outage's data channel, so degrading its own
+`ContactSensorState`/`StatusFault`/`StatusActive` is already the correct, permanent response to
+an outage of any length — escalating it to a throwing read as well would just make the one
+service meant to stay legible during an outage go dark too.
+
+**The escalation predicate is evaluated lazily at read time, with no timer:**
+
+```ts
+const since = connection.lastSuccessAt ?? platformStartedAt;
+const escalated = noResponseAfterMs > 0
+  && !connection.online
+  && timers.now() - since > noResponseAfterMs;
+```
+
+No timer is scheduled for it and nothing is cancelled on shutdown, because there is nothing to
+cancel: `connection.online` and `lastSuccessAt` are the snapshot's own fields, already updated
+by every poll outcome, so the predicate simply falls out of the current cached state on every
+read. The `?? platformStartedAt` clause is what makes a launch where the Pod was never reached
+escalate correctly, measured from process start rather than from a `lastSuccessAt` that stays
+`null` forever.
 
 ## Alarm ringing: a programmable switch, not a motion sensor
 
