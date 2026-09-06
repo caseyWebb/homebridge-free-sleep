@@ -11,10 +11,12 @@ const settingsFixture = loadFixture('settings.json') as Settings;
 const schedulesFixture = loadFixture('schedules.json') as Schedules;
 
 /**
- * A stable, quiescent baseline side — deliberately *not* the fixture's own values (which have
- * `isOn: true` / `secondsRemaining: 1200`), so that two calls to `withDeviceStatus` in the same
- * test differ *only* in the fields explicitly overridden, never in fields the fixture happens
- * to set that a test didn't mean to touch.
+ * A stable, quiescent baseline side — deliberately *not* whatever the fixture's own values
+ * happen to be, so that two calls to `withDeviceStatus` in the same test differ *only* in the
+ * fields explicitly overridden, never in fields the fixture happens to set that a test didn't
+ * mean to touch. See the writeQueue B1-regression fix: coupling a test's behaviour to an
+ * incidental fixture value (rather than an explicit, test-owned baseline like this one) breaks
+ * silently the moment the fixture is swapped for different real data.
  */
 const BASELINE_SIDE: SideStatus = {
   currentTemperatureLevel: 0,

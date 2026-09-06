@@ -18,16 +18,16 @@
   "waterLevel": "unknown",
   "isPriming": false,
   "settings": {
-    "v": 12,
-    "gainLeft": 3,
-    "gainRight": 4,
-    "ledBrightness": 60
+    "v": 1,
+    "gainLeft": 400,
+    "gainRight": 400,
+    "ledBrightness": 27
   },
-  "coverVersion": "Pod 5",
-  "hubVersion": "Pod 5",
+  "coverVersion": "Pod 3",
+  "hubVersion": "Pod 3",
   "freeSleep": {
     "version": "2.1.5",
     "branch": "main"
   },
-  "wifiStrength": 82
+  "wifiStrength": 60
 }

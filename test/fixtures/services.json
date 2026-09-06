@@ -1,51 +1,51 @@
 {
   "sentryLogging": {
-    "enabled": true
+    "enabled": false
   },
   "biometrics": {
     "enabled": true,
     "jobs": {
       "installation": {
         "name": "Biometrics installation",
-        "description": "Initial biometric sensor installation",
+        "message": "",
         "status": "healthy",
-        "message": "Installation completed successfully",
-        "timestamp": "2026-05-14T08:00:00.000Z"
+        "description": "Whether or not biometrics was installed successfully",
+        "timestamp": ""
       },
       "stream": {
         "name": "Biometrics stream",
-        "description": "Sensor data ingestion service",
+        "message": "",
         "status": "healthy",
-        "message": "Streaming data smoothly",
-        "timestamp": "2026-05-14T09:58:00.000Z"
+        "description": "Consumes the sensor data as a stream and calculates biometrics",
+        "timestamp": "2026-09-06T19:58:48.474326+00:00"
       },
       "analyzeSleepLeft": {
         "name": "Analyze sleep - left",
-        "description": "Analyzes sleep data for left side",
-        "status": "healthy",
-        "message": "Last run completed 15 minutes ago",
-        "timestamp": "2026-05-14T09:45:00.000Z"
+        "message": "",
+        "status": "not_started",
+        "description": "Analyzes sleep period",
+        "timestamp": ""
       },
       "analyzeSleepRight": {
         "name": "Analyze sleep - right",
-        "description": "Analyzes sleep data for right side",
-        "status": "healthy",
-        "message": "Next run scheduled soon",
-        "timestamp": "2026-05-14T09:48:00.000Z"
+        "message": "",
+        "status": "not_started",
+        "description": "Analyzes sleep period",
+        "timestamp": ""
       },
       "calibrateLeft": {
         "name": "Calibration job - Left",
-        "description": "Sensor calibration for left side",
-        "status": "healthy",
-        "message": "Calibrated this morning",
-        "timestamp": "2026-05-14T07:00:00.000Z"
+        "message": "",
+        "status": "started",
+        "description": "Calculates presence thresholds for cap sensor data",
+        "timestamp": "2026-09-06T09:36:41.884145+00:00"
       },
       "calibrateRight": {
         "name": "Calibration job - Right",
-        "description": "Sensor calibration for right side",
-        "status": "healthy",
-        "message": "Calibrated this morning",
-        "timestamp": "2026-05-14T07:00:00.000Z"
+        "message": "",
+        "status": "started",
+        "description": "Calculates presence thresholds for cap sensor data",
+        "timestamp": "2026-09-06T09:36:41.903914+00:00"
       }
     }
   }
