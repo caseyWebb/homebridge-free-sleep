@@ -215,6 +215,10 @@ so jitter is exactly zero. See design.md, "Timer, clock and randomness injection
 - [x] 10.3 Prove the guardrail actually guards: verify by temporarily making the snapshot read path
   trigger a device-status request that the budget assertion fails, then reverting — and record the
   observed failing count in a comment next to the assertion so a future reader knows the margin.
+  Honest caveat (per review): the committed test does not literally edit and revert
+  `snapshot.ts`'s read path — it stands up a separate `poisonedGet` function that calls the real
+  client directly and shows *that* trips the budget, which is a proxy for the real regression
+  rather than the regression itself.
 - [x] 10.4 Document the derivation next to the assertion, pointing at design.md's table, so that a
   later change to the fast-poll shape updates the number deliberately rather than by loosening the
   bound; verify by reading the test back and confirming the expected count (32) and each of the
