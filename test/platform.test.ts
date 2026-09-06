@@ -18,7 +18,16 @@ import {
   type Role,
 } from '../src/platform.js';
 import { PLATFORM_NAME, PLUGIN_NAME } from '../src/settings.js';
-import { SettingsSchema, type Settings } from '../src/pod/types.js';
+import {
+  DeviceStatusSchema,
+  SchedulesSchema,
+  ServicesSchema,
+  SettingsSchema,
+  type DeviceStatus,
+  type Schedules,
+  type Services as PodServices,
+  type Settings,
+} from '../src/pod/types.js';
 import {
   createFakeLogging,
   FakeHomebridgeApi,
@@ -34,29 +43,59 @@ const packageJson = JSON.parse(readFileSync(path.join(__dirname, '../package.jso
 };
 
 const fixtureSettings: Settings = SettingsSchema.parse(loadFixture('settings.json'));
+const fixtureDeviceStatus: DeviceStatus = DeviceStatusSchema.parse(loadFixture('deviceStatus.json'));
+const fixtureSchedules: Schedules = SchedulesSchema.parse(loadFixture('schedules.json'));
+const fixtureServices: PodServices = ServicesSchema.parse(loadFixture('services.json'));
 
 function baseConfig(overrides: Record<string, unknown> = {}): PlatformConfig {
   return { platform: PLATFORM_NAME, host: 'pod.local', ...overrides };
 }
 
-/** A PodClient stand-in that never settles — used with vitest fake timers only. */
+/**
+ * A `PodClient` stand-in every method of which never settles — used only with vitest fake
+ * timers, so both the settings-name-seeding budget and the poller's `bootstrapTimeoutMs`
+ * (which shares the same, vi-patched, default `TimerApi`) resolve under `vi.advanceTimersByTimeAsync`
+ * rather than hanging real time.
+ */
 function neverResolvingPodClient(): MinimalPodClient {
-  return { getSettings: () => new Promise<Settings>(() => {}) };
+  return {
+    getDeviceStatus: () => new Promise<DeviceStatus>(() => {}),
+    getSettings: () => new Promise<Settings>(() => {}),
+    getSchedules: () => new Promise<Schedules>(() => {}),
+    getServices: () => new Promise<PodServices>(() => {}),
+    postDeviceStatus: () => new Promise<void>(() => {}),
+    postSettings: () => new Promise<void>(() => {}),
+  };
 }
 
 function resolvingPodClient(settings: Settings = fixtureSettings): MinimalPodClient & { calls: number } {
   const client = {
     calls: 0,
+    getDeviceStatus: () => Promise.resolve(structuredClone(fixtureDeviceStatus)),
     getSettings: () => {
       client.calls += 1;
       return Promise.resolve(settings);
     },
+    getSchedules: () => Promise.resolve(structuredClone(fixtureSchedules)),
+    getServices: () => Promise.resolve(structuredClone(fixtureServices)),
+    postDeviceStatus: () => Promise.resolve(),
+    postSettings: () => Promise.resolve(),
   };
   return client;
 }
 
+/** Every method rejects, quickly — the poller's bootstrap settles fast rather than hanging out
+ * `bootstrapTimeoutMs` in tests that don't drive fake timers. */
 function rejectingPodClient(message = 'Pod unreachable'): MinimalPodClient {
-  return { getSettings: () => Promise.reject(new Error(message)) };
+  const reject = () => Promise.reject(new Error(message));
+  return {
+    getDeviceStatus: reject,
+    getSettings: reject,
+    getSchedules: reject,
+    getServices: reject,
+    postDeviceStatus: reject,
+    postSettings: reject,
+  };
 }
 
 /** Builds a `FreeSleepPlatform` factory closing over an injected fake `MinimalPodClient`. */
@@ -182,7 +221,7 @@ describe('configureAccessory', () => {
 });
 
 describe('fresh install, sides: both', () => {
-  it('registers exactly three accessories, named Pod Left/Pod Right/Pod, each with only AccessoryInformation', async () => {
+  it('registers exactly three accessories, named Pod Left/Pod Right/Pod, each with AccessoryInformation plus its role-enabled service', async () => {
     const { api } = await simulateRestart(factoryWithPodClient(rejectingPodClient()), baseConfig(), []);
 
     expect(api.registeredAccessories).toHaveLength(3);
@@ -193,7 +232,13 @@ describe('fresh install, sides: both', () => {
       const nonInfoServices = accessory.services.filter(
         (s) => s.UUID !== api.hap.Service.AccessoryInformation.UUID,
       );
-      expect(nonInfoServices).toHaveLength(0);
+      if (accessory.displayName === 'Pod') {
+        expect(nonInfoServices).toHaveLength(1);
+        expect(nonInfoServices[0]?.UUID).toBe(api.hap.Service.ContactSensor.UUID);
+      } else {
+        expect(nonInfoServices).toHaveLength(1);
+        expect(nonInfoServices[0]?.UUID).toBe(api.hap.Service.Thermostat.UUID);
+      }
     }
   });
 });
@@ -305,7 +350,7 @@ describe('sides filter', () => {
 // ---------------------------------------------------------------------------------------
 
 describe('needsSettings guard', () => {
-  it('with all accessories already cached, never calls the fake PodClient.getSettings', async () => {
+  it('with all accessories already cached, never performs an additional name-seeding getSettings call', async () => {
     const seedApi = new FakeHomebridgeApi();
     const previous = (['left', 'right', 'hub'] as const).map((role) =>
       existingAccessory(seedApi, 'pod.local', role),
@@ -314,7 +359,10 @@ describe('needsSettings guard', () => {
 
     await simulateRestart(factoryWithPodClient(client), baseConfig(), previous);
 
-    expect(client.calls).toBe(0);
+    // The poller's own `settings` endpoint class still polls once during bootstrap
+    // (independent of name seeding) — this asserts there is no *second*, name-seeding-specific
+    // call on top of that single bootstrap poll.
+    expect(client.calls).toBe(1);
   });
 });
 
@@ -597,6 +645,7 @@ describe('settings-read timeout aborts the underlying call (N9)', () => {
     try {
       let receivedSignal: AbortSignal | undefined;
       const client: MinimalPodClient = {
+        ...neverResolvingPodClient(),
         getSettings: (signal) => {
           receivedSignal = signal;
           return new Promise<Settings>(() => {});
