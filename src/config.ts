@@ -24,9 +24,10 @@
  * `pollIntervals`'s per-field names and defaults mirror what `poller-and-write-queue`'s
  * proposal.md already names as the keys it will read (`pollIntervalMs`, `fastPollIntervalMs`,
  * `fastPollDurationMs`, `slowPollIntervalMs`, `maxBackoffMs`, `writeDebounceMs`,
- * `writeMaxDebounceMs`, `alarmPollIntervalMs`) — every field there is an *override*: omitting
- * one means "use that change's own default", not a zod-supplied default, which is why the
- * object itself defaults to `{}` rather than each field defaulting individually.
+ * `writeMaxDebounceMs`, `alarmPollIntervalMs`, `bootstrapTimeoutMs`) — every field there is an
+ * *override*: omitting one means "use that change's own default", not a zod-supplied default,
+ * which is why the object itself defaults to `{}` rather than each field defaulting
+ * individually.
  *
  * Note: `writeSettleMs` is a *top-level* key, not nested under `pollIntervals` — corrected at
  * reconcile of `thermostat-and-offline` (design.md's "Consumed vs. reserved config keys"
@@ -45,11 +46,15 @@ export const PollIntervalsFieldsSchema = z
   .object({
     /** Base `deviceStatus`/`settings`/`schedules`/`services` poll interval. Default 30000. */
     pollIntervalMs: z.number().int().min(5000, { message: 'pollIntervalMs must be at least 5000ms' }).optional(),
-    /** Interval used while a `requestMode` fast-poll window is active. Default 5000. */
+    /**
+     * Interval used while a `requestMode` fast-poll window is active. Default 5000. Minimum
+     * 3000 matches `poller.ts`'s `HARD_FLOOR_MS` — the module floor no configured interval can
+     * go below.
+     */
     fastPollIntervalMs: z
       .number()
       .int()
-      .min(1000, { message: 'fastPollIntervalMs must be at least 1000ms' })
+      .min(3000, { message: 'fastPollIntervalMs must be at least 3000ms' })
       .optional(),
     /** How long a fast-poll window stays active after being requested. Default 90000. */
     fastPollDurationMs: z
@@ -65,19 +70,38 @@ export const PollIntervalsFieldsSchema = z
       .optional(),
     /** Exponential-backoff ceiling. Default 60000. */
     maxBackoffMs: z.number().int().min(1000, { message: 'maxBackoffMs must be at least 1000ms' }).optional(),
-    /** Write-queue per-lane debounce. Default 400. */
-    writeDebounceMs: z.number().int().min(0, { message: 'writeDebounceMs must be non-negative' }).optional(),
+    /**
+     * Write-queue per-lane debounce. Default 400. Minimum 100 matches `writeQueue.ts`'s own
+     * `Math.max(100, …)` floor on this value.
+     */
+    writeDebounceMs: z
+      .number()
+      .int()
+      .min(100, { message: 'writeDebounceMs must be at least 100ms' })
+      .optional(),
     /** Write-queue debounce ceiling. Default 2000. */
     writeMaxDebounceMs: z
       .number()
       .int()
       .min(0, { message: 'writeMaxDebounceMs must be non-negative' })
       .optional(),
-    /** Fast-poll interval around a predicted alarm window. Reserved for #16. Default 3000. */
+    /**
+     * Fast-poll interval around a predicted alarm window. Reserved for #16. Default 3000.
+     * Minimum 3000 matches `poller.ts`'s `HARD_FLOOR_MS`.
+     */
     alarmPollIntervalMs: z
       .number()
       .int()
-      .min(1000, { message: 'alarmPollIntervalMs must be at least 1000ms' })
+      .min(3000, { message: 'alarmPollIntervalMs must be at least 3000ms' })
+      .optional(),
+    /**
+     * Deadline for `PodPoller.bootstrap()` to resolve, whichever classes have and have not
+     * answered yet. Default 10000. Minimum 1000.
+     */
+    bootstrapTimeoutMs: z
+      .number()
+      .int()
+      .min(1000, { message: 'bootstrapTimeoutMs must be at least 1000ms' })
       .optional(),
   });
 
