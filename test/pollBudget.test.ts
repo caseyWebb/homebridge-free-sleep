@@ -18,9 +18,11 @@ function clientFor(pod: MockPod): PodClient {
 /**
  * Wires a poller + write queue exactly the way a future platform module will: the queue never
  * imports the poller (design.md, "Module dependency direction"); it is handed a
- * `requestFastPoll` callback that the caller implements in terms of `poller.requestMode`. A
- * fresh `write` mode replaces any still-active one, matching what a single always-on plugin
- * instance would do.
+ * `requestFastPoll(lane, untilMs)` callback that the caller implements in terms of the poller's
+ * public API. A `deviceStatus`-lane write gets a fresh `write` mode (replacing any still-active
+ * one, matching what a single always-on plugin instance would do); a `settings`-lane write gets
+ * a single confirming `refresh('settings')` instead — accelerating `deviceStatus` polling would
+ * confirm nothing a settings write actually changed (S2).
  */
 function wire(pod: MockPod, timers: ReturnType<typeof createTimerHarness>) {
   const snapshot = new SnapshotStore({ timers });
@@ -35,7 +37,11 @@ function wire(pod: MockPod, timers: ReturnType<typeof createTimerHarness>) {
     maxBackoffMs: 60_000,
   });
   let releaseWriteMode: (() => void) | null = null;
-  const requestFastPoll = (untilMs: number): void => {
+  const requestFastPoll = (lane: 'deviceStatus' | 'settings', untilMs: number): void => {
+    if (lane === 'settings') {
+      void poller.refresh('settings');
+      return;
+    }
     releaseWriteMode?.();
     releaseWriteMode = poller.requestMode('deviceStatus', { intervalMs: 5_000, untilMs, reason: 'write' });
   };
@@ -201,6 +207,54 @@ describe('integration: write -> overlay -> fast poll -> agreement -> outage -> r
       const connectionChanges = changes.filter((c) => c.field === 'connectionOnline');
       expect(connectionChanges.map((c) => c.current)).toEqual([false, true]); // down once, back up once
       expect(snapshot.get().connection.online).toBe(true);
+    } finally {
+      await pod.close();
+    }
+  }, 20_000);
+});
+
+// ---------------------------------------------------------------------------------------
+// S2 regression: settings-lane writes confirm by agreement, not by accelerating deviceStatus
+// ---------------------------------------------------------------------------------------
+
+describe('S2 regression: an awayMode write confirms via a settings re-read, never a deviceStatus fast-poll', () => {
+  it('retires its overlay by agreement well past the original settle window, with zero extra deviceStatus reads', async () => {
+    vi.useFakeTimers();
+    const pod = await startMockPod();
+    try {
+      const timers = createTimerHarness();
+      timers.random = () => 0.5;
+      const { snapshot, poller, queue } = wire(pod, timers);
+
+      await poller.bootstrap();
+      const deviceStatusReadsAtBootstrap = pod.requests.filter(
+        (r) => r.method === 'GET' && r.path === '/api/deviceStatus',
+      ).length;
+
+      const p = queue.submitSettings({ left: { awayMode: true } });
+      await advanceFakeTime(400, 50); // debounce flush -> dispatch settles
+      await p;
+      expect(snapshot.get().left.awayMode).toBe(true); // optimistic overlay live
+
+      // Past the original 15s writeSettleMs window: if this were still relying on the overlay's
+      // own expiry rather than a genuine settings-class confirmation, it would have reverted by
+      // now unless something re-read /api/settings and agreed.
+      await advanceFakeTime(20_000, 100);
+      expect(snapshot.get().left.awayMode).toBe(true); // no reversion — retired by agreement
+
+      const deviceStatusReadsAfter = pod.requests.filter(
+        (r) => r.method === 'GET' && r.path === '/api/deviceStatus',
+      ).length;
+      // The base deviceStatus cadence (30s) hasn't come due in this ~20.4s window either, so
+      // this equality also catches the regression: the old behaviour entered a 5s deviceStatus
+      // fast-poll mode for a settings write, which would have added several extra reads here.
+      expect(deviceStatusReadsAfter).toBe(deviceStatusReadsAtBootstrap);
+
+      const settingsReads = pod.requests.filter((r) => r.method === 'GET' && r.path === '/api/settings').length;
+      expect(settingsReads).toBeGreaterThan(1); // bootstrap's read, plus at least the confirming refresh
+
+      poller.stop();
+      queue.stop();
     } finally {
       await pod.close();
     }

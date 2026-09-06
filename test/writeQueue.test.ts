@@ -1,8 +1,8 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { PodClient } from '../src/pod/client.js';
-import { SnapshotStore } from '../src/pod/snapshot.js';
-import { WriteQueue, WriteQueueStoppedError, type SidePatch, type WriteQueueOptions } from '../src/pod/writeQueue.js';
+import { SnapshotStore, type Change } from '../src/pod/snapshot.js';
+import { WriteQueue, WriteQueueStoppedError, type FastPollLane, type SidePatch, type WriteQueueOptions } from '../src/pod/writeQueue.js';
 import type { DeviceStatus, DeviceStatusPatch, Schedules, Services, Settings } from '../src/pod/types.js';
 import { createFakePodClient, type FakePodClient } from './fakePodClient.js';
 import { createTimerHarness, realDelay, type TimerHarness } from './timerHarness.js';
@@ -23,7 +23,7 @@ interface Setup {
   timers: TimerHarness;
   snapshot: SnapshotStore;
   fake: FakePodClient;
-  fastPollRequests: number[];
+  fastPollRequests: Array<{ lane: FastPollLane; untilMs: number }>;
   queue: WriteQueue;
 }
 
@@ -38,11 +38,11 @@ function setup(options: Partial<Omit<WriteQueueOptions, 'client' | 'snapshot' | 
     schedules: schedulesFixture,
     services: servicesFixture,
   });
-  const fastPollRequests: number[] = [];
+  const fastPollRequests: Array<{ lane: FastPollLane; untilMs: number }> = [];
   const queue = new WriteQueue({
     client: fake.client,
     snapshot,
-    requestFastPoll: (untilMs) => fastPollRequests.push(untilMs),
+    requestFastPoll: (lane, untilMs) => fastPollRequests.push({ lane, untilMs }),
     timers,
     ...options,
   });
@@ -415,7 +415,7 @@ describe('write queue: fast poll on success only (9.5)', () => {
     await vi.advanceTimersByTimeAsync(400);
     await p;
     expect(fastPollRequests.length).toBe(1);
-    expect(fastPollRequests[0]).toBe(timers.now() + 90_000);
+    expect(fastPollRequests[0]).toEqual({ lane: 'deviceStatus', untilMs: timers.now() + 90_000 });
     queue.stop();
   });
 
@@ -454,6 +454,124 @@ describe('write queue: fast poll on success only (9.5)', () => {
     await vi.advanceTimersByTimeAsync(20_000); // long past the original settle window
     expect(received.length).toBe(0); // agreed entries never revert
     queue.stop();
+  });
+});
+
+describe('write queue: fast poll is lane-aware (S2 regression)', () => {
+  it('a left/right side-lane write requests the deviceStatus lane', async () => {
+    const { queue, fastPollRequests } = setup();
+    const p = queue.submitSide('left', { targetTemperatureF: 66 });
+    await vi.advanceTimersByTimeAsync(400);
+    await p;
+    expect(fastPollRequests).toHaveLength(1);
+    expect(fastPollRequests[0]!.lane).toBe('deviceStatus');
+    queue.stop();
+  });
+
+  it('a device-lane write requests the deviceStatus lane', async () => {
+    const { queue, fastPollRequests } = setup();
+    const p = queue.submitDeviceSettings({ ledBrightness: 40 });
+    await vi.advanceTimersByTimeAsync(400);
+    await p;
+    expect(fastPollRequests).toHaveLength(1);
+    expect(fastPollRequests[0]!.lane).toBe('deviceStatus');
+    queue.stop();
+  });
+
+  it('a settings-lane write requests the settings lane, not deviceStatus', async () => {
+    const { queue, fastPollRequests } = setup();
+    const p = queue.submitSettings({ left: { awayMode: true } });
+    await vi.advanceTimersByTimeAsync(400);
+    await p;
+    expect(fastPollRequests).toHaveLength(1);
+    expect(fastPollRequests[0]!.lane).toBe('settings');
+    queue.stop();
+  });
+});
+
+describe('write queue: per-batch overlay ownership (B1 regression)', () => {
+  it('a later same-side write cycle that omits isOn does not clear a still-live isOn overlay installed by an earlier cycle, and each keeps its own settle window', async () => {
+    // The fixture's left.isOn is already `true`, so the overlay must disagree with it (`false`)
+    // to stay observably live rather than retiring by agreement the instant it is installed.
+    expect(deviceStatusFixture.left.isOn).toBe(true);
+    const { queue, snapshot } = setup({ writeSettleMs: 15_000 });
+    const received: Change[] = [];
+    snapshot.subscribe((changes) => received.push(...changes));
+
+    // Cycle 1: isOn:false, fully flushed and settled.
+    const p1 = queue.submitSide('left', { isOn: false });
+    await vi.advanceTimersByTimeAsync(400);
+    await p1;
+    expect(snapshot.get().left.isOn).toBe(false);
+    received.length = 0; // drop the legitimate isOn change from cycle 1 itself
+
+    // 100ms later, per the reviewer's reproduction: a second, unrelated write to the same side.
+    await vi.advanceTimersByTimeAsync(100);
+    const p2 = queue.submitSide('left', { targetTemperatureF: 70 });
+    await vi.advanceTimersByTimeAsync(400);
+    await p2;
+
+    // Both overlays are live simultaneously — the second cycle never touched isOn's overlay.
+    expect(snapshot.get().left.isOn).toBe(false);
+    expect(snapshot.get().left.targetTemperatureF).toBe(70);
+    expect(received.some((c) => c.field === 'isOn')).toBe(false); // no spurious isOn event
+
+    // Independent windows: cycle 1 settled at ~t=400 (expires ~15400), cycle 2 settled at
+    // ~t=900 (expires ~15900). Advancing to just before cycle 1's own expiry must not affect
+    // cycle 2's still-live overlay, and cycle 1 must expire on its own schedule regardless of
+    // cycle 2 ever having touched the same side.
+    await vi.advanceTimersByTimeAsync(14_499); // total 14999ms since cycle 2 settled => t~=15399
+    expect(snapshot.get().left.isOn).toBe(false);
+    expect(snapshot.get().left.targetTemperatureF).toBe(70);
+
+    await vi.advanceTimersByTimeAsync(2); // past cycle 1's own expiry, still short of cycle 2's
+    expect(snapshot.get().left.isOn).toBe(deviceStatusFixture.left.isOn); // reverted to raw (true)
+    expect(snapshot.get().left.targetTemperatureF).toBe(70); // cycle 2 unaffected
+    queue.stop();
+  });
+});
+
+describe('write queue: a failed dispatch never clears a newer pending cycle\'s overlay (S1 regression)', () => {
+  it('a targetTemperatureF write that fails while a newer one for the same side is still pending leaves the newer overlay live', async () => {
+    // Real timers only — see the note on the 8.2 describe block above: this needs the mock's
+    // real 'hang' fault and the client's own real timeout to actually elapse.
+    vi.useRealTimers();
+    const pod = await startMockPod();
+    try {
+      const timers = createTimerHarness();
+      const snapshot = new SnapshotStore({ timers });
+      const queue = new WriteQueue({ client: clientFor(pod, 100), snapshot, requestFastPoll: () => {}, timers });
+
+      // 'hang' covers the client's own single retry too (see the 9.1 test above), so cycle A
+      // genuinely fails rather than eventually succeeding late.
+      pod.fault('POST /api/deviceStatus', { kind: 'hang', times: 2 });
+      const pA = queue.submitSide('left', { targetTemperatureF: 70 });
+      pA.catch(() => undefined);
+      await realDelay(450); // cycle A's debounce flushes and its (hanging) dispatch begins
+
+      // Cycle B starts fresh — cycle A already flushed (rt.pending is null) — while A is still
+      // in flight.
+      const pB = queue.submitSide('left', { targetTemperatureF: 75 });
+      expect(snapshot.get().left.targetTemperatureF).toBe(75);
+
+      let rejectedA: unknown;
+      try {
+        await pA;
+      } catch (error) {
+        rejectedA = error;
+      }
+      expect(rejectedA).toBeTruthy(); // cycle A's dispatch failed
+
+      // Cycle B's overlay must have survived cycle A's failure-driven cleanup.
+      expect(snapshot.get().left.targetTemperatureF).toBe(75);
+
+      await realDelay(500); // cycle B's own debounce flushes and dispatches
+      await pB;
+      expect(snapshot.get().left.targetTemperatureF).toBe(75);
+      queue.stop();
+    } finally {
+      await pod.close();
+    }
   });
 });
 

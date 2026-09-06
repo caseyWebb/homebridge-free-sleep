@@ -8,9 +8,20 @@
  * on the snapshot at submission (not dispatch) so the cached view never goes stale while a
  * write is queued, re-based to the settle time on success, and cleared immediately on failure.
  *
+ * Each write cycle (one lane's accumulating patch, from its first submission through its
+ * dispatch settling) owns its overlay handles in a Map private to that cycle — never a
+ * queue-wide table keyed only by side+field. Two write cycles for the same lane can be live at
+ * once (one still dispatching while the next is already accumulating, or already dispatching
+ * behind the mutex), each installing overlays for the same field; keying ownership by cycle
+ * rather than by field is what keeps a later cycle's install, rebase, or clear from ever
+ * touching an earlier cycle's still-live overlay for that same field.
+ *
  * Imports `client.ts`, `snapshot.ts`, `errors.ts` and `types.ts` only — never `poller.ts`
- * (design.md, "Module dependency direction"). Requesting the post-write fast cadence goes
- * through the injected `requestFastPoll` callback instead.
+ * (design.md, "Module dependency direction"). Requesting the post-write confirmation goes
+ * through the injected `requestFastPoll(lane, untilMs)` callback instead — `lane` distinguishes
+ * a `deviceStatus`-endpoint write (wired to `poller.requestMode('deviceStatus', …)`, the extended
+ * fast-poll window) from a `settings`-endpoint write (wired to `poller.refresh('settings')`, a
+ * single confirming read — a settings write has no reason to accelerate `deviceStatus` polling).
  */
 
 import type { PodClient } from './client.ts';
@@ -36,11 +47,19 @@ export type DevicePatch = Partial<{ v: number; gainLeft: number; gainRight: numb
 
 type LaneId = 'left' | 'right' | 'device' | 'settings';
 
+/**
+ * Which confirmation path a successful dispatch needs. `left`/`right`/`device` all write
+ * through `POST /api/deviceStatus`, confirmed by accelerating the poller's `deviceStatus` class;
+ * `settings` writes through `POST /api/settings` and is confirmed by a single re-read of that
+ * class instead — accelerating `deviceStatus` would buy it nothing.
+ */
+export type FastPollLane = 'deviceStatus' | 'settings';
+
 export interface WriteQueueOptions {
   client: PodClient;
   snapshot: SnapshotStore;
-  /** Called with `now() + fastPollDurationMs` after a successful dispatch, on success only. */
-  requestFastPoll: (untilMs: number) => void;
+  /** Called on success only, naming which class's confirmation the dispatch needs. */
+  requestFastPoll: (lane: FastPollLane, untilMs: number) => void;
   timers?: TimerApi;
   logger?: Logger;
   /** Trailing-edge debounce per lane. Default 400, enforced minimum 100. */
@@ -63,6 +82,14 @@ interface LaneRuntime<P> {
   waiters: Waiter[];
   debounceTimer: TimerHandle | null;
   maxWaitTimer: TimerHandle | null;
+  /**
+   * The overlay handles *this write cycle* has installed, keyed by `${side}:${field}` — replaced
+   * with a fresh, empty `Map` each time a new cycle starts accumulating (see `submit`). Reading
+   * and writing this table only ever touches the current cycle's own installs, which is what
+   * keeps a later cycle's overlay sync from clearing an earlier, still-settling cycle's handle
+   * for the same field (see the module doc above).
+   */
+  overlayOwnership: Map<string, OverlayHandle>;
 }
 
 interface MutexTask {
@@ -71,12 +98,6 @@ interface MutexTask {
 }
 
 type SideOverlayField = 'targetTemperatureF' | 'isOn' | 'isAlarmVibrating' | 'awayMode';
-
-interface OverlayFieldRef {
-  key: string;
-  side: Side;
-  field: SideOverlayField;
-}
 
 /**
  * The four-case reduction (design.md, "The isOn/secondsRemaining reduction, and why it is not
@@ -102,7 +123,7 @@ function isSideLane(lane: LaneId): lane is Side {
 export class WriteQueue {
   private readonly client: PodClient;
   private readonly snapshot: SnapshotStore;
-  private readonly requestFastPoll: (untilMs: number) => void;
+  private readonly requestFastPoll: (lane: FastPollLane, untilMs: number) => void;
   private readonly timers: TimerApi;
   private readonly logger: Logger;
 
@@ -116,7 +137,13 @@ export class WriteQueue {
   private readonly device: LaneRuntime<DevicePatch> = emptyLane();
   private readonly settingsLane: LaneRuntime<SettingsPatch> = emptyLane();
 
-  private readonly ownedOverlayHandles = new Map<string, OverlayHandle>();
+  /**
+   * Every write cycle's `overlayOwnership` map, from the moment it starts accumulating until its
+   * dispatch settles — including cycles still sitting in `mutexQueue` behind another lane's
+   * dispatch. `stop()` walks this set to clear every overlay still live anywhere in the queue,
+   * regardless of which cycle (pending, queued, or in-flight) installed it.
+   */
+  private readonly liveOverlayBatches = new Set<Map<string, OverlayHandle>>();
 
   private readonly mutexQueue: MutexTask[] = [];
   private mutexBusy = false;
@@ -142,7 +169,9 @@ export class WriteQueue {
 
   submitSide(side: Side, patch: SidePatch): Promise<void> {
     const rt = side === 'left' ? this.left : this.right;
-    return this.submit(side, rt, patch, () => this.syncSideOverlays(side, reduceDurationFields(rt.pending ?? {})));
+    return this.submit(side, rt, patch, () =>
+      this.syncSideOverlays(side, reduceDurationFields(rt.pending ?? {}), rt.overlayOwnership),
+    );
   }
 
   submitDeviceSettings(patch: DevicePatch): Promise<void> {
@@ -152,7 +181,9 @@ export class WriteQueue {
   }
 
   submitSettings(patch: SettingsPatch): Promise<void> {
-    return this.submit('settings', this.settingsLane, patch, () => this.syncAwayModeOverlays(this.settingsLane.pending ?? {}));
+    return this.submit('settings', this.settingsLane, patch, () =>
+      this.syncAwayModeOverlays(this.settingsLane.pending ?? {}, this.settingsLane.overlayOwnership),
+    );
   }
 
   private submit<P extends object>(
@@ -167,6 +198,10 @@ export class WriteQueue {
     return new Promise<void>((resolve, reject) => {
       if (rt.pending === null) {
         rt.pending = { ...patch };
+        // A new write cycle starts here — its own overlay-ownership table, tracked separately
+        // from any still-settling earlier cycle for this lane (module doc above).
+        rt.overlayOwnership = new Map();
+        this.liveOverlayBatches.add(rt.overlayOwnership);
         rt.maxWaitTimer = this.timers.setTimeout(() => this.flush(lane, rt), this.writeMaxDebounceMs);
       } else {
         Object.assign(rt.pending, patch);
@@ -182,24 +217,36 @@ export class WriteQueue {
   // Overlay install at submission (pod-write-queue spec, "…applied on submission…")
   // -----------------------------------------------------------------------------------
 
-  private syncSideOverlays(side: Side, reduced: SidePatch): void {
-    this.applyOrClearOverlay(side, 'targetTemperatureF', reduced.targetTemperatureF);
-    this.applyOrClearOverlay(side, 'isOn', reduced.isOn);
-    this.applyOrClearOverlay(side, 'isAlarmVibrating', reduced.isAlarmVibrating);
+  private syncSideOverlays(side: Side, reduced: SidePatch, ownership: Map<string, OverlayHandle>): void {
+    this.applyOrClearOverlay(ownership, side, 'targetTemperatureF', reduced.targetTemperatureF);
+    this.applyOrClearOverlay(ownership, side, 'isOn', reduced.isOn);
+    this.applyOrClearOverlay(ownership, side, 'isAlarmVibrating', reduced.isAlarmVibrating);
   }
 
-  private syncAwayModeOverlays(patch: SettingsPatch): void {
-    this.applyOrClearOverlay('left', 'awayMode', patch.left?.awayMode);
-    this.applyOrClearOverlay('right', 'awayMode', patch.right?.awayMode);
+  private syncAwayModeOverlays(patch: SettingsPatch, ownership: Map<string, OverlayHandle>): void {
+    this.applyOrClearOverlay(ownership, 'left', 'awayMode', patch.left?.awayMode);
+    this.applyOrClearOverlay(ownership, 'right', 'awayMode', patch.right?.awayMode);
   }
 
-  private applyOrClearOverlay(side: Side, field: SideOverlayField, value: number | boolean | undefined): void {
+  /**
+   * Installs or clears one field's overlay against `ownership` — the *current write cycle's own*
+   * table, never a queue-wide one. Clearing here (the field is absent from this cycle's reduced
+   * patch) only ever finds and clears a handle this same cycle previously installed; it can
+   * never reach into a different cycle's entry for the same field, because that entry lives in a
+   * different `Map` object entirely.
+   */
+  private applyOrClearOverlay(
+    ownership: Map<string, OverlayHandle>,
+    side: Side,
+    field: SideOverlayField,
+    value: number | boolean | undefined,
+  ): void {
     const key = `${side}:${field}`;
     if (value === undefined) {
-      const existing = this.ownedOverlayHandles.get(key);
+      const existing = ownership.get(key);
       if (existing) {
         this.snapshot.clearOverlay(existing);
-        this.ownedOverlayHandles.delete(key);
+        ownership.delete(key);
       }
       return;
     }
@@ -207,38 +254,33 @@ export class WriteQueue {
       field === 'targetTemperatureF'
         ? this.snapshot.setOverlay(side, field, value as number, this.writeSettleMs)
         : this.snapshot.setOverlay(side, field, value as boolean, this.writeSettleMs);
-    this.ownedOverlayHandles.set(key, handle);
-  }
-
-  private clearOwnedOverlaysFor(keys: readonly string[]): void {
-    for (const key of keys) {
-      const handle = this.ownedOverlayHandles.get(key);
-      if (handle) {
-        this.snapshot.clearOverlay(handle);
-        this.ownedOverlayHandles.delete(key);
-      }
-    }
+    ownership.set(key, handle);
   }
 
   /**
-   * Re-installs each overlay entry this dispatch owns with the *same* value but a fresh
+   * Re-installs every overlay entry this write cycle owns with the *same* value but a fresh
    * `writeSettleMs` window measured from now (dispatch-settle time) — pod-write-queue spec,
    * "The settle window starts when the write lands". Reading the value back off the current
    * effective snapshot is safe: nothing else can have changed it between submission and this
    * dispatch settling, since this queue is the only writer of these overlay entries.
    */
-  private rebaseOwnedOverlaysFor(keys: readonly OverlayFieldRef[]): void {
-    for (const { key, side, field } of keys) {
-      const handle = this.ownedOverlayHandles.get(key);
-      if (!handle) continue;
-      const value = this.snapshot.get()[side][field];
+  private rebaseOwnership(ownership: Map<string, OverlayHandle>): void {
+    for (const [key, handle] of ownership) {
+      const value = this.snapshot.get()[handle.side][handle.field];
       if (value === undefined) continue;
       const refreshed =
-        field === 'targetTemperatureF'
-          ? this.snapshot.setOverlay(side, field, value as number, this.writeSettleMs)
-          : this.snapshot.setOverlay(side, field, value as boolean, this.writeSettleMs);
-      this.ownedOverlayHandles.set(key, refreshed);
+        handle.field === 'targetTemperatureF'
+          ? this.snapshot.setOverlay(handle.side, handle.field, value as number, this.writeSettleMs)
+          : this.snapshot.setOverlay(handle.side, handle.field, value as boolean, this.writeSettleMs);
+      ownership.set(key, refreshed);
     }
+  }
+
+  private clearOwnership(ownership: Map<string, OverlayHandle>): void {
+    for (const handle of ownership.values()) {
+      this.snapshot.clearOverlay(handle);
+    }
+    ownership.clear();
   }
 
   // -----------------------------------------------------------------------------------
@@ -249,6 +291,7 @@ export class WriteQueue {
     if (rt.pending === null) return;
     const patch = rt.pending;
     const waiters = rt.waiters;
+    const ownership = rt.overlayOwnership;
     rt.pending = null;
     rt.waiters = [];
     if (rt.debounceTimer !== null) {
@@ -259,39 +302,19 @@ export class WriteQueue {
       this.timers.clearTimeout(rt.maxWaitTimer);
       rt.maxWaitTimer = null;
     }
-    this.enqueueDispatch(lane, patch, waiters);
+    this.enqueueDispatch(lane, patch, waiters, ownership);
   }
 
-  private enqueueDispatch(lane: LaneId, patch: object, waiters: Waiter[]): void {
+  private enqueueDispatch(lane: LaneId, patch: object, waiters: Waiter[], ownership: Map<string, OverlayHandle>): void {
     const task: MutexTask = {
-      run: () => this.dispatch(lane, patch, waiters),
+      run: () => this.dispatch(lane, patch, waiters, ownership),
       abandon: () => waiters.forEach((w) => w.reject(new WriteQueueStoppedError())),
     };
     this.mutexQueue.push(task);
     this.pumpMutex();
   }
 
-  private overlayKeysFor(lane: LaneId, patch: object): OverlayFieldRef[] {
-    if (isSideLane(lane)) {
-      const p = patch as SidePatch;
-      const out: OverlayFieldRef[] = [];
-      if (p.targetTemperatureF !== undefined) out.push({ key: `${lane}:targetTemperatureF`, side: lane, field: 'targetTemperatureF' });
-      if (p.isOn !== undefined) out.push({ key: `${lane}:isOn`, side: lane, field: 'isOn' });
-      if (p.isAlarmVibrating !== undefined) out.push({ key: `${lane}:isAlarmVibrating`, side: lane, field: 'isAlarmVibrating' });
-      return out;
-    }
-    if (lane === 'settings') {
-      const p = patch as SettingsPatch;
-      const out: OverlayFieldRef[] = [];
-      if (p.left?.awayMode !== undefined) out.push({ key: 'left:awayMode', side: 'left', field: 'awayMode' });
-      if (p.right?.awayMode !== undefined) out.push({ key: 'right:awayMode', side: 'right', field: 'awayMode' });
-      return out;
-    }
-    return [];
-  }
-
-  private async dispatch(lane: LaneId, patch: object, waiters: Waiter[]): Promise<void> {
-    const overlayKeys = this.overlayKeysFor(lane, patch);
+  private async dispatch(lane: LaneId, patch: object, waiters: Waiter[], ownership: Map<string, OverlayHandle>): Promise<void> {
     let body: object;
     if (isSideLane(lane)) {
       const reduced = reduceDurationFields(patch as SidePatch);
@@ -310,15 +333,18 @@ export class WriteQueue {
         await this.client.postDeviceStatus(body as DeviceStatusPatch);
       }
       if (!this.stopped) {
-        this.rebaseOwnedOverlaysFor(overlayKeys);
-        this.requestFastPoll(this.timers.now() + this.fastPollDurationMs);
+        this.rebaseOwnership(ownership);
+        const fastPollLane: FastPollLane = lane === 'settings' ? 'settings' : 'deviceStatus';
+        this.requestFastPoll(fastPollLane, this.timers.now() + this.fastPollDurationMs);
       }
       waiters.forEach((w) => w.resolve());
     } catch (error) {
       if (!this.stopped) {
-        this.clearOwnedOverlaysFor(overlayKeys.map((k) => k.key));
+        this.clearOwnership(ownership);
       }
       waiters.forEach((w) => w.reject(error));
+    } finally {
+      this.liveOverlayBatches.delete(ownership);
     }
   }
 
@@ -389,13 +415,15 @@ export class WriteQueue {
     }
     const queued = this.mutexQueue.splice(0, this.mutexQueue.length);
     for (const task of queued) task.abandon();
-    for (const handle of this.ownedOverlayHandles.values()) {
-      this.snapshot.clearOverlay(handle);
+    // Clears every write cycle's overlays — pending, queued behind the mutex, or in-flight alike
+    // — since `liveOverlayBatches` holds all of them regardless of which stage they're at.
+    for (const ownership of this.liveOverlayBatches) {
+      this.clearOwnership(ownership);
     }
-    this.ownedOverlayHandles.clear();
+    this.liveOverlayBatches.clear();
   }
 }
 
 function emptyLane<P>(): LaneRuntime<P> {
-  return { pending: null, waiters: [], debounceTimer: null, maxWaitTimer: null };
+  return { pending: null, waiters: [], debounceTimer: null, maxWaitTimer: null, overlayOwnership: new Map() };
 }
