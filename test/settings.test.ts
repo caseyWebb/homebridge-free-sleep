@@ -4,7 +4,7 @@ import { PLATFORM_NAME, PLUGIN_NAME } from '../src/settings.js';
 
 describe('settings', () => {
   it('PLUGIN_NAME matches the name Homebridge resolves the plugin by', () => {
-    expect(PLUGIN_NAME).toBe('homebridge-free-sleep');
+    expect(PLUGIN_NAME).toBe('@caseywebb/homebridge-free-sleep');
   });
 
   it('PLATFORM_NAME matches the pluginAlias/platform key', () => {

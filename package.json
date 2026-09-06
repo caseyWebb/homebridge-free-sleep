@@ -1,5 +1,8 @@
 {
-  "name": "homebridge-free-sleep",
+  "name": "@caseywebb/homebridge-free-sleep",
+  "publishConfig": {
+    "access": "public"
+  },
   "displayName": "Free Sleep",
   "version": "0.0.0",
   "description": "Control an Eight Sleep Pod running free-sleep from Apple Home, locally and without the Eight Sleep cloud.",
