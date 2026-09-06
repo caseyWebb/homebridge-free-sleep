@@ -137,8 +137,12 @@ sensor starts flapping.
 #### Scenario: The session runs offline and deterministically
 
 - **WHEN** the test is run with no network access and no Pod on the network
-- **THEN** it passes, and it completes in milliseconds of real time because every interval,
-  timeout and expiry is driven by controlled time
+- **THEN** it passes deterministically, but takes tens of seconds of real wall-clock time rather
+  than milliseconds — the mock Pod is reached over real HTTP, not simulated, and `PodClient`'s
+  own retry backoff on a failed request is real, un-injected `setTimeout` time that no virtual
+  clock accelerates (design.md, "The integration test: real HTTP, virtual clock"); only the
+  poller's and write queue's own intervals, timeouts and expiries above that layer are driven by
+  controlled time
 
 ## REMOVED Requirements
 
