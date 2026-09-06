@@ -37,16 +37,20 @@
     "test:watch": "vitest",
     "lint": "eslint .",
     "typecheck": "tsc --noEmit",
+    "smoke": "node --experimental-strip-types scripts/smoke.ts",
     "prepublishOnly": "npm run build"
+  },
+  "dependencies": {
+    "zod": "^4.5.4"
   },
   "devDependencies": {
     "@eslint/js": "^10.0.1",
     "@homebridge/hap-nodejs": "^2.2.3",
+    "@types/node": "^22.10.0",
     "eslint": "^10.10.0",
     "homebridge": "^2.4.0",
     "typescript": "^5.9.0",
     "typescript-eslint": "^8.69.0",
-    "vitest": "^3.2.0",
-    "zod": "^4.5.4"
+    "vitest": "^3.2.0"
   }
 }
