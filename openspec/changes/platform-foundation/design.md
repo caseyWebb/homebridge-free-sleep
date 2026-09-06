@@ -182,7 +182,7 @@ free of a second timeout constant to tune.
 | `host` | *(required, none)* | **Yes** — gates startup, seeds identity. |
 | `sides` | `'both'` | **Yes** — selects which accessories exist. |
 | `pollIntervals` | `{}` (per-endpoint override object, all fields optional) | Reserved — `poller-and-write-queue` (#8) reads it. |
-| `writeSettleMs` | `500` | Reserved — docs/HOMEKIT.md's anti-jitter window; `thermostat-and-offline` (#9) reads it. |
+| `writeSettleMs` | `15000` | Reserved — the write queue's optimistic-overlay window; `poller-and-write-queue` (#10) owns it. (Corrected at reconcile of `thermostat-and-offline`, which reads only `noResponseAfterMs`; the original `500` conflated this with docs/HOMEKIT.md's anti-jitter window, which needs no config key in M2.) |
 | `noResponseAfterMs` | `600000` (10 min) | Reserved — docs/HOMEKIT.md's No-Response escalation; `thermostat-and-offline` (#11) reads it. |
 | `occupancySource` | `'none'` | Reserved — `'none' \| 'presence' \| 'vitals'`; #19 reads it. |
 | `waterLowSensorType` | `'contact'` | Reserved — `'contact' \| 'leak'`; #20 reads it. |
