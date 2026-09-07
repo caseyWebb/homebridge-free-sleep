@@ -24,14 +24,14 @@ function readConfigSchemaJson(): {
   return JSON.parse(text);
 }
 
-// `keepAlive` moved out of this list at `keep-alive` (#12) — it is consumed starting with this
-// change, not merely reserved (config spec's MODIFIED requirement, "Reserved keys are fully
-// defaulted..."). Its own defaulting/validation is covered by the dedicated describe block below.
+// `keepAlive` moved out of this list at `keep-alive` (#12), and `occupancySource` at `occupancy`
+// (#19) — both are consumed starting with their own change, not merely reserved (config spec's
+// MODIFIED requirement, "Reserved keys are fully defaulted..."). Their own defaulting/validation
+// is covered by their own dedicated describe blocks below.
 const RESERVED_KEYS = [
   'pollIntervals',
   'writeSettleMs',
   'noResponseAfterMs',
-  'occupancySource',
   'waterLowSensorType',
   'awayModeWritePolicy',
 ] as const;
@@ -144,7 +144,7 @@ describe('FreeSleepConfigSchema — sides', () => {
 });
 
 describe('FreeSleepConfigSchema — reserved keys', () => {
-  it('fully defaults all six reserved keys when omitted', () => {
+  it('fully defaults all five reserved keys when omitted', () => {
     const result = FreeSleepConfigSchema.safeParse({ host: 'pod.local' });
     expect(result.success).toBe(true);
     if (!result.success) return;
@@ -154,7 +154,6 @@ describe('FreeSleepConfigSchema — reserved keys', () => {
     expect(result.data.pollIntervals).toEqual({});
     expect(result.data.writeSettleMs).toBe(15000);
     expect(result.data.noResponseAfterMs).toBe(600000);
-    expect(result.data.occupancySource).toBe('none');
     expect(result.data.waterLowSensorType).toBe('contact');
     expect(result.data.awayModeWritePolicy).toBe('mirror');
   });
@@ -162,7 +161,6 @@ describe('FreeSleepConfigSchema — reserved keys', () => {
   it.each([
     ['writeSettleMs', -1],
     ['noResponseAfterMs', -1],
-    ['occupancySource', 'weather'],
     ['waterLowSensorType', 'moisture'],
     ['awayModeWritePolicy', 'ignore'],
   ] as const)('rejects an invalid %s value, naming that key', (key, value) => {
@@ -176,7 +174,6 @@ describe('FreeSleepConfigSchema — reserved keys', () => {
   it.each([
     ['writeSettleMs', 30000, 30000],
     ['noResponseAfterMs', 0, 0],
-    ['occupancySource', 'presence', 'presence'],
     ['waterLowSensorType', 'leak', 'leak'],
     ['awayModeWritePolicy', 'block', 'block'],
   ] as const)('parses a valid non-default %s value unchanged', (key, value, expected) => {
@@ -247,6 +244,37 @@ describe('FreeSleepConfigSchema — reserved keys', () => {
       });
       expect(result.success).toBe(false);
     });
+  });
+});
+
+// occupancy (#19): occupancySource is consumed starting with this change, not merely reserved
+// (config spec's MODIFIED requirement, "`occupancySource` is preserved and now acted on"). The
+// schema shape itself (`z.enum(['none', 'presence', 'vitals']).default('none')`) is unchanged —
+// these tests confirm that shape still holds, now under its own describe block rather than the
+// generic "reserved keys" one above.
+describe('FreeSleepConfigSchema — occupancySource (consumed, #19)', () => {
+  it("defaults to 'none' when omitted", () => {
+    const result = FreeSleepConfigSchema.safeParse({ host: 'pod.local' });
+    expect(result.success).toBe(true);
+    if (result.success) {
+      expect(result.data.occupancySource).toBe('none');
+    }
+  });
+
+  it('rejects an invalid value, naming the key', () => {
+    const result = FreeSleepConfigSchema.safeParse({ host: 'pod.local', occupancySource: 'weather' });
+    expect(result.success).toBe(false);
+    if (!result.success) {
+      expect(result.error.issues.some((issue) => issue.path.join('.') === 'occupancySource')).toBe(true);
+    }
+  });
+
+  it.each(['none', 'presence', 'vitals'] as const)('parses %s unchanged', (value) => {
+    const result = FreeSleepConfigSchema.safeParse({ host: 'pod.local', occupancySource: value });
+    expect(result.success).toBe(true);
+    if (result.success) {
+      expect(result.data.occupancySource).toBe(value);
+    }
   });
 });
 

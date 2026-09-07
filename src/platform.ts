@@ -34,12 +34,14 @@ import type {
   AlarmRequest,
   DeviceStatus,
   DeviceStatusPatch,
+  PresenceData,
   Schedules,
   ServerStatus,
   Services as PodServices,
   Settings,
   SettingsPatch,
   Side,
+  VitalsResponse,
 } from './pod/types.ts';
 import { AwayModeGuard } from './pod/awayModeGuard.ts';
 import { DEFAULT_TIMEOUT_MS, PodClient, RETRY_BASE_DELAY_MS, RETRY_JITTER_MS } from './pod/client.ts';
@@ -49,6 +51,7 @@ import { defaultTimerApi, SnapshotStore, type Change, type TimerApi } from './po
 import { WriteQueue } from './pod/writeQueue.ts';
 import { CONNECTION_SUBTYPE, ConnectionService } from './services/connection.ts';
 import { LED_SUBTYPE, LedService } from './services/led.ts';
+import { isOccupancyChange, OCCUPANCY_SUBTYPE, OccupancySensorService } from './services/occupancy.ts';
 import { PRIME_SUBTYPE, PrimeService } from './services/prime.ts';
 import { SERVER_FAULT_SUBTYPE, ServerFaultService } from './services/serverFault.ts';
 import { TEST_ALARM_LEFT_SUBTYPE, TEST_ALARM_RIGHT_SUBTYPE, TestAlarmService } from './services/testAlarm.ts';
@@ -95,6 +98,17 @@ export interface MinimalPodClient {
    * debounced/merged field the write queue's lane model fits.
    */
   postAlarm(request: AlarmRequest, signal?: AbortSignal): Promise<void>;
+  /**
+   * Occupancy change (#19). Optional — only called by `PodPoller`'s `presence`/`vitals` classes,
+   * which are themselves only ever enabled when `occupancySource` names them (default `'none'`
+   * never enables either), so every existing fake `MinimalPodClient` that predates this change
+   * and omits these two methods keeps working unchanged.
+   */
+  getPresence?(signal?: AbortSignal): Promise<PresenceData>;
+  getVitals?(
+    query?: { side?: Side; startTime?: string; endTime?: string },
+    signal?: AbortSignal,
+  ): Promise<VitalsResponse>;
 }
 
 /**
@@ -150,14 +164,17 @@ interface WantedAccessory {
 
 /**
  * The currently-enabled non-`AccessoryInformation` services, per role, as
- * `${Service.UUID}:${subtype}` compound keys — side accessories enable the thermostat subtype;
- * the hub enables the connection sensor and the water-low sensor unconditionally, plus whichever
- * of the prime switch, LED lightbulb, test-alarm switch, and server-fault sensor `config`
- * currently enables (`hub-accessory`, tasks.md 9.1). Computed from `hap` (and, for the hub, from
- * `config`) rather than a module-level constant, since the UUIDs come from `api.hap.Service.*`,
- * never a direct `@homebridge/hap-nodejs` import (docs/HOMEKIT.md). `pruneServices` below reads
- * this and never needs to change shape itself as more services are added (design.md, "Restore
- * flow").
+ * `${Service.UUID}:${subtype}` compound keys — side accessories enable the thermostat subtype
+ * and, when `occupancySource` is not `'none'`, the occupancy subtype too; the hub enables the
+ * connection sensor and the water-low sensor unconditionally, plus whichever of the prime
+ * switch, LED lightbulb, test-alarm switch, and server-fault sensor `config` currently enables
+ * (`hub-accessory`, tasks.md 9.1; occupancy change, #19, design.md's "`occupancySource: 'none'`
+ * publishes no `OccupancySensor` at all"). Computed from `hap` and `config` rather than a
+ * module-level constant, since the UUIDs come from `api.hap.Service.*`, never a direct
+ * `@homebridge/hap-nodejs` import (docs/HOMEKIT.md). `pruneServices` below reads this and never
+ * needs to change shape itself as more services are added (design.md, "Restore flow") —
+ * switching between two non-`'none'` `occupancySource` values does not change this set at all,
+ * only what the already-published service's own internal source-selection logic reads.
  */
 function enabledServiceKeysFor(hap: HAP, role: Role, config: FreeSleepConfig): ReadonlySet<string> {
   if (role === 'hub') {
@@ -176,7 +193,11 @@ function enabledServiceKeysFor(hap: HAP, role: Role, config: FreeSleepConfig): R
     if (config.serverFaultSensor) keys.push(`${hap.Service.ContactSensor.UUID}:${SERVER_FAULT_SUBTYPE}`);
     return new Set(keys);
   }
-  return new Set([`${hap.Service.Thermostat.UUID}:${THERMOSTAT_SUBTYPE}`]);
+  const keys = [`${hap.Service.Thermostat.UUID}:${THERMOSTAT_SUBTYPE}`];
+  if (config.occupancySource !== 'none') {
+    keys.push(`${hap.Service.OccupancySensor.UUID}:${OCCUPANCY_SUBTYPE}`);
+  }
+  return new Set(keys);
 }
 
 export class FreeSleepPlatform implements DynamicPlatformPlugin {
@@ -214,6 +235,8 @@ export class FreeSleepPlatform implements DynamicPlatformPlugin {
   private unsubscribeSnapshot: (() => void) | undefined;
 
   private readonly thermostats = new Map<Side, ThermostatService>();
+  /** Occupancy change (#19). Populated only when `config.occupancySource !== 'none'`. */
+  private readonly occupancySensors = new Map<Side, OccupancySensorService>();
   private connectionService: ConnectionService | undefined;
   private waterLowService: WaterLowService | undefined;
   private primeService: PrimeService | undefined;
@@ -280,6 +303,9 @@ export class FreeSleepPlatform implements DynamicPlatformPlugin {
       ...(pollOptions.maxBackoffMs !== undefined ? { maxBackoffMs: pollOptions.maxBackoffMs } : {}),
       ...(pollOptions.bootstrapTimeoutMs !== undefined ? { bootstrapTimeoutMs: pollOptions.bootstrapTimeoutMs } : {}),
       serverFaultSensorEnabled: parsed.data.serverFaultSensor,
+      // Occupancy change (#19): a plain value, following the same "poller doesn't import
+      // config.ts" discipline every existing option already follows (design.md).
+      occupancySource: parsed.data.occupancySource,
     });
     this.poller = poller;
 
@@ -372,9 +398,21 @@ export class FreeSleepPlatform implements DynamicPlatformPlugin {
   private handleSnapshotChanges(changes: readonly Change[]): void {
     for (const change of changes) {
       try {
+        // Three independent `if`s, deliberately not chained as `else if`: `isThermostatChange`
+        // and `isOccupancyChange` share the same (imprecise, but harmless in isolation) type
+        // predicate shape `Change & { scope: 'side'; side: Side }` — chaining them would make
+        // TypeScript's negative narrowing of the first collapse the second's operand to `never`,
+        // since neither predicate's *type* discriminates on which side-scope field actually
+        // matched, only its runtime check does. At most one of the three ever matches a given
+        // change in practice (design.md's routing table), so this is behaviorally identical to
+        // an if/else-if chain.
         if (isThermostatChange(change)) {
           this.thermostats.get(change.side)?.refresh();
-        } else if (change.scope === 'device' && change.field === 'connectionOnline') {
+        }
+        if (isOccupancyChange(change)) {
+          this.occupancySensors.get(change.side)?.refresh();
+        }
+        if (change.scope === 'device' && change.field === 'connectionOnline') {
           this.connectionService?.refresh();
         } else if (change.scope === 'device' && change.field === 'waterLevelState') {
           this.waterLowService?.refresh();
@@ -391,11 +429,23 @@ export class FreeSleepPlatform implements DynamicPlatformPlugin {
           this.ledService?.refresh();
         }
         // isAlarmVibrating, awayMode: no published service watches these fields yet — ignored,
-        // without error (design.md's routing table; #13/#16/#19).
+        // without error (design.md's routing table; #13/#16/#19/#20).
       } catch (error) {
         this.log.warn(`FreeSleep: a service failed to handle a snapshot change: ${describeError(error)}`);
       }
     }
+  }
+
+  /**
+   * N5: the platform's single source of truth for the configured occupancy source — used
+   * identically by `constructServicesFor` (deciding whether to construct an
+   * `OccupancySensorService`) and `pruneServices` (deciding whether to prune one), which
+   * previously each derived `this.config?.occupancySource ?? 'none'` independently. Both call
+   * sites now read through here so the two can never disagree about what is currently
+   * configured.
+   */
+  private occupancySource(): FreeSleepConfig['occupancySource'] {
+    return this.config?.occupancySource ?? 'none';
   }
 
   private serviceContextFor(accessory: PlatformAccessory): ServiceContext | undefined {
@@ -432,6 +482,17 @@ export class FreeSleepPlatform implements DynamicPlatformPlugin {
       if (ctx.config.serverFaultSensor) this.serverFaultService = new ServerFaultService(ctx);
     } else {
       this.thermostats.set(role, new ThermostatService(ctx, role, this.platformStartedAt));
+      // Occupancy change (#19): constructed alongside the thermostat only when a source is
+      // configured — `'none'` (the default) leaves `occupancySensors` empty for this side, and
+      // `enabledServiceKeysFor` above already excludes the subtype so restore never carries one
+      // to prune in the first place.
+      //
+      // N5: reads the same `this.occupancySource()` helper `pruneServices` below uses, rather
+      // than each site independently re-deriving `config?.occupancySource ?? 'none'` — so the
+      // two can never observe a different value from each other.
+      if (this.occupancySource() !== 'none') {
+        this.occupancySensors.set(role, new OccupancySensorService(ctx, role));
+      }
     }
   }
 

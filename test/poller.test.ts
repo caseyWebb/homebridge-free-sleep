@@ -574,6 +574,247 @@ describe('poller: per-class enabled predicate (S4 regression)', () => {
   });
 });
 
+// ---------------------------------------------------------------------------------------
+// Occupancy change (#19): presence/vitals endpoint classes (tasks.md 4.2, 4.3, 4.4)
+// ---------------------------------------------------------------------------------------
+
+describe('poller: presence/vitals endpoint classes (4.2, 4.3)', () => {
+  function setupOccupancy(occupancySource: 'none' | 'presence' | 'vitals', biometricsEnabled = true) {
+    const timers = createTimerHarness();
+    const snapshot = new SnapshotStore({ timers });
+    const services = {
+      ...servicesFixture,
+      biometrics: { ...servicesFixture.biometrics, enabled: biometricsEnabled },
+    };
+    const fake = createFakePodClient({
+      deviceStatus: deviceStatusFixture,
+      settings: settingsFixture,
+      schedules: schedulesFixture,
+      services,
+      presence: loadFixture('metricsPresence.json') as never,
+      vitals: loadFixture('metricsVitals.json') as never,
+    });
+    const poller = new PodPoller({
+      client: fake.client,
+      snapshot,
+      timers,
+      pollIntervalMs: 5000,
+      slowPollIntervalMs: 60_000,
+      occupancySource,
+    });
+    return { timers, snapshot, fake, poller };
+  }
+
+  it('neither presence nor vitals polls when occupancySource is "none"', async () => {
+    const { fake, poller } = setupOccupancy('none');
+    await poller.bootstrap();
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(fake.presence.calls).toBe(0);
+    expect(fake.vitals.calls).toBe(0);
+    poller.stop();
+  });
+
+  // `services` is not yet observed at the exact instant bootstrap computes which classes are
+  // enabled (bootstrap's own `enabledClasses` filter runs before any class — including
+  // `services` itself — has fired), so `presence`/`vitals` are correctly skipped on the very
+  // first bootstrap even with biometrics enabled in the fixture; they poll for the first time
+  // one interval later, once `services`'s own bootstrap observation has landed (design.md,
+  // "'services' is polled on the slow tier, so biometrics.enabled may be unknown for up to that
+  // long after a fresh launch").
+
+  it('only the configured source polls: presence, starting the tick after services first observes', async () => {
+    const { fake, poller } = setupOccupancy('presence');
+    await poller.bootstrap();
+    expect(fake.presence.calls).toBe(0);
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(fake.presence.calls).toBe(1);
+    expect(fake.vitals.calls).toBe(0);
+    poller.stop();
+  });
+
+  it('only the configured source polls: vitals, with startTime exactly now - 180000 and no endTime (S3)', async () => {
+    const { fake, poller, timers } = setupOccupancy('vitals');
+    await poller.bootstrap();
+    expect(fake.vitals.calls).toBe(0);
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(fake.vitals.calls).toBe(1);
+    expect(fake.presence.calls).toBe(0);
+    const query = fake.vitalsQueries[0]!;
+    const now = timers.now();
+    expect(query.startTime).toBe(new Date(now - 180_000).toISOString());
+    // S3: endTime is deliberately never sent — it is optional upstream, and omitting it lets
+    // the Pod default the upper bound to its own clock rather than this plugin's, which removes
+    // the Pod-clock-ahead skew failure (a plugin clock running fast would otherwise name a
+    // moment the Pod still considers future, silently excluding recently-inserted rows).
+    expect(query.endTime).toBeUndefined();
+    expect(query.side).toBeUndefined();
+    poller.stop();
+  });
+
+  it('presence does not poll when biometrics is not enabled', async () => {
+    const { fake, poller } = setupOccupancy('presence', false);
+    await poller.bootstrap();
+    expect(fake.presence.calls).toBe(0);
+    poller.stop();
+  });
+
+  it('presence does not poll before any services observation has landed', async () => {
+    const timers = createTimerHarness();
+    const snapshot = new SnapshotStore({ timers });
+    const fake = createFakePodClient({
+      deviceStatus: deviceStatusFixture,
+      settings: settingsFixture,
+      schedules: schedulesFixture,
+      services: servicesFixture,
+      presence: loadFixture('metricsPresence.json') as never,
+    });
+    // Queue an error so 'services' never successfully observes before presence's own bootstrap
+    // check runs — both fire in the same bootstrap race, so this proves the "not yet observed
+    // treated as false" default, not merely "usually observed by then".
+    fake.services.queueError(new Error('boom'));
+    const poller = new PodPoller({
+      client: fake.client,
+      snapshot,
+      timers,
+      pollIntervalMs: 5000,
+      slowPollIntervalMs: 60_000,
+      occupancySource: 'presence',
+    });
+    await poller.bootstrap();
+    expect(snapshot.get().documents.services).toBeUndefined();
+    expect(fake.presence.calls).toBe(0);
+    poller.stop();
+  });
+
+  it('biometrics turning off stops polling and turning back on resumes it, no restart required (4.4)', async () => {
+    // slowPollIntervalMs raised well past this test's window so `services`'s own scheduled poll
+    // (which would otherwise re-observe the fixture's fixed `enabled: true` and clobber the
+    // manual observeServices(false) below) never fires during it — isolating the assertion to
+    // the presence class's own `enabled` re-evaluation, not a race between two classes' polls
+    // landing on the same tick.
+    const timers = createTimerHarness();
+    const snapshot = new SnapshotStore({ timers });
+    const fake = createFakePodClient({
+      deviceStatus: deviceStatusFixture,
+      settings: settingsFixture,
+      schedules: schedulesFixture,
+      services: servicesFixture,
+      presence: loadFixture('metricsPresence.json') as never,
+    });
+    const poller = new PodPoller({
+      client: fake.client,
+      snapshot,
+      timers,
+      pollIntervalMs: 5000,
+      slowPollIntervalMs: 300_000,
+      occupancySource: 'presence',
+    });
+    timers.random = () => 0.5;
+    await poller.bootstrap();
+    expect(fake.presence.calls).toBe(0); // services not yet observed at the bootstrap instant
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(fake.presence.calls).toBe(1);
+
+    snapshot.observeServices({
+      ...servicesFixture,
+      biometrics: { ...servicesFixture.biometrics, enabled: false },
+    });
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(fake.presence.calls).toBe(1); // stayed off — schedule kept running, request skipped
+
+    snapshot.observeServices({
+      ...servicesFixture,
+      biometrics: { ...servicesFixture.biometrics, enabled: true },
+    });
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(fake.presence.calls).toBe(2); // resumed on its own schedule, no external kick
+    poller.stop();
+  });
+
+  it('observePresence/observeVitals land in the snapshot from a real poll', async () => {
+    const { fake, poller, snapshot } = setupOccupancy('presence');
+    await poller.bootstrap();
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(snapshot.get().left.presencePresent).toBe(false);
+    expect(snapshot.get().right.presencePresent).toBe(false);
+    poller.stop();
+    void fake;
+  });
+
+  // -------------------------------------------------------------------------------------
+  // S4 regression: a client missing getPresence/getVitals is never polled for that class,
+  // even when occupancySource and biometrics.enabled would otherwise turn it on.
+  // -------------------------------------------------------------------------------------
+
+  describe('S4: a client without getPresence/getVitals never polls that class', () => {
+    /** A `MinimalPodClient` (`../src/pod/poller.ts`) that only implements the five required
+     * methods — `getPresence`/`getVitals` are entirely absent, not merely stubbed, exercising
+     * the `typeof === 'function'` check itself rather than a method that happens to be present
+     * but unused. */
+    function reducedClient(fake: ReturnType<typeof createFakePodClient>) {
+      return {
+        getDeviceStatus: fake.client.getDeviceStatus.bind(fake.client),
+        getSettings: fake.client.getSettings.bind(fake.client),
+        getSchedules: fake.client.getSchedules.bind(fake.client),
+        getServices: fake.client.getServices.bind(fake.client),
+        getServerStatus: fake.client.getServerStatus.bind(fake.client),
+      };
+    }
+
+    it('occupancySource "presence" with a client lacking getPresence never fires the presence class', async () => {
+      const timers = createTimerHarness();
+      const snapshot = new SnapshotStore({ timers });
+      const services = { ...servicesFixture, biometrics: { ...servicesFixture.biometrics, enabled: true } };
+      const fake = createFakePodClient({
+        deviceStatus: deviceStatusFixture,
+        settings: settingsFixture,
+        schedules: schedulesFixture,
+        services,
+      });
+      const poller = new PodPoller({
+        client: reducedClient(fake),
+        snapshot,
+        timers,
+        pollIntervalMs: 5000,
+        slowPollIntervalMs: 60_000,
+        occupancySource: 'presence',
+      });
+      await poller.bootstrap();
+      await vi.advanceTimersByTimeAsync(120_000);
+      expect(fake.presence.calls).toBe(0);
+      // The rest of the poller carries on unaffected — a missing occupancy method must not take
+      // down anything else.
+      expect(fake.deviceStatus.calls).toBeGreaterThan(1);
+      poller.stop();
+    });
+
+    it('occupancySource "vitals" with a client lacking getVitals never fires the vitals class', async () => {
+      const timers = createTimerHarness();
+      const snapshot = new SnapshotStore({ timers });
+      const services = { ...servicesFixture, biometrics: { ...servicesFixture.biometrics, enabled: true } };
+      const fake = createFakePodClient({
+        deviceStatus: deviceStatusFixture,
+        settings: settingsFixture,
+        schedules: schedulesFixture,
+        services,
+      });
+      const poller = new PodPoller({
+        client: reducedClient(fake),
+        snapshot,
+        timers,
+        pollIntervalMs: 5000,
+        slowPollIntervalMs: 60_000,
+        occupancySource: 'vitals',
+      });
+      await poller.bootstrap();
+      await vi.advanceTimersByTimeAsync(120_000);
+      expect(fake.vitals.calls).toBe(0);
+      expect(fake.deviceStatus.calls).toBeGreaterThan(1);
+      poller.stop();
+    });
+  });
+});
+
 describe('poller: nothing escapes the injected clock (6.7)', () => {
   it('a TimerApi whose now() never advances and whose setTimeout never fires produces no poll, backoff, or mode expiry, ever', async () => {
     const frozenTimers: TimerApi = {

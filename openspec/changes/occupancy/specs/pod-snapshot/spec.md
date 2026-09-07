@@ -28,12 +28,16 @@ every other observed document.
 - **WHEN** a presence observation reports both sides' current flags
 - **THEN** both sides' presence flags update from that single observation
 
-### Requirement: A side's presence trust flag requires an observed change from this launch's baseline
+### Requirement: A side's presence trust flag requires an observed, present change from this launch's baseline
 
 The snapshot SHALL record, per side, the `lastUpdatedAt` value from its first-ever presence
 observation this launch as that side's baseline. The side's presence trust flag SHALL become
-true the first time a later observation reports a `lastUpdatedAt` different from that baseline,
-and SHALL remain true afterward regardless of what any subsequent observation reports.
+true the first time a later observation reports both a `lastUpdatedAt` different from that
+baseline *and* a `present` value of `true`, and SHALL remain true afterward regardless of what
+any subsequent observation reports. A differing `lastUpdatedAt` alone, without `present: true`,
+SHALL NOT set the trust flag — the Pod's daily reboot re-initialises presence state to a fresh
+`lastUpdatedAt` with `present: false`, so a `lastUpdatedAt` change by itself carries no
+information about a real transition, only about a restart.
 
 #### Scenario: The baseline alone does not set the trust flag
 
@@ -41,11 +45,19 @@ and SHALL remain true afterward regardless of what any subsequent observation re
   observation this launch, however many times
 - **THEN** that side's presence trust flag is false
 
-#### Scenario: A differing observation sets the trust flag, permanently
+#### Scenario: A differing observation without present: true does not set the trust flag
 
-- **WHEN** a side's observed `lastUpdatedAt` differs from its baseline at least once
+- **WHEN** a side's observed `lastUpdatedAt` differs from its baseline, but the observation
+  reports `present: false` (the shape of a Pod reboot's reset default, which always reports
+  `present: false` under a fresh `lastUpdatedAt`)
+- **THEN** that side's presence trust flag remains false, however many such observations occur
+
+#### Scenario: A differing observation with present: true sets the trust flag, permanently
+
+- **WHEN** a side's observed `lastUpdatedAt` differs from its baseline and the observation
+  reports `present: true`
 - **THEN** that side's presence trust flag becomes true, and a later observation matching the
-  original baseline does not clear it
+  original baseline, or reporting `present: false`, does not clear it
 
 ### Requirement: A side's vitals trust flag requires only one ever-successful observation with a row
 

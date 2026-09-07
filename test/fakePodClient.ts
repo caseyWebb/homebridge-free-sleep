@@ -17,11 +17,13 @@ import type {
   AlarmRequest,
   DeviceStatus,
   DeviceStatusPatch,
+  PresenceData,
   Schedules,
   ServerStatus,
   Services,
   Settings,
   SettingsPatch,
+  VitalsResponse,
 } from '../src/pod/types.ts';
 
 type Outcome<T> =
@@ -104,12 +106,18 @@ export interface FakePodClient {
   /** hub-accessory: only populated with a fallback when `fixtures.serverStatus` is provided —
    * every pre-existing caller of `createFakePodClient` never calls `getServerStatus` at all. */
   serverStatus: FakeEndpoint<ServerStatus>;
+  /** Occupancy change (#19). */
+  presence: FakeEndpoint<PresenceData>;
+  /** Occupancy change (#19). */
+  vitals: FakeEndpoint<VitalsResponse>;
   postDeviceStatusCalls: DeviceStatusPatch[];
   postSettingsCalls: SettingsPatch[];
   postAlarmCalls: AlarmRequest[];
   postDeviceStatusOutcome: { kind: 'success' } | { kind: 'error'; error: unknown };
   postSettingsOutcome: { kind: 'success' } | { kind: 'error'; error: unknown };
   postAlarmOutcome: { kind: 'success' } | { kind: 'error'; error: unknown };
+  /** Every `getVitals` call's query, recorded in order (occupancy change, #19). */
+  vitalsQueries: Array<{ side?: string; startTime?: string; endTime?: string }>;
 }
 
 export interface FakePodClientFixtures {
@@ -120,6 +128,10 @@ export interface FakePodClientFixtures {
   /** hub-accessory: optional — omitted by every pre-existing caller, which never exercises the
    * `serverStatus` endpoint class. */
   serverStatus?: ServerStatus;
+  /** Occupancy change (#19). Optional — most tests don't exercise these classes. */
+  presence?: PresenceData;
+  /** Occupancy change (#19). Optional — most tests don't exercise these classes. */
+  vitals?: VitalsResponse;
 }
 
 export function createFakePodClient(fixtures: FakePodClientFixtures): FakePodClient {
@@ -128,15 +140,20 @@ export function createFakePodClient(fixtures: FakePodClientFixtures): FakePodCli
   const schedules = new FakeEndpoint<Schedules>();
   const services = new FakeEndpoint<Services>();
   const serverStatus = new FakeEndpoint<ServerStatus>();
+  const presence = new FakeEndpoint<PresenceData>();
+  const vitals = new FakeEndpoint<VitalsResponse>();
   deviceStatus.setFallback(fixtures.deviceStatus);
   settings.setFallback(fixtures.settings);
   schedules.setFallback(fixtures.schedules);
   services.setFallback(fixtures.services);
   if (fixtures.serverStatus) serverStatus.setFallback(fixtures.serverStatus);
+  if (fixtures.presence !== undefined) presence.setFallback(fixtures.presence);
+  if (fixtures.vitals !== undefined) vitals.setFallback(fixtures.vitals);
 
   const postDeviceStatusCalls: DeviceStatusPatch[] = [];
   const postSettingsCalls: SettingsPatch[] = [];
   const postAlarmCalls: AlarmRequest[] = [];
+  const vitalsQueries: Array<{ side?: string; startTime?: string; endTime?: string }> = [];
   const state: FakePodClient = {
     client: undefined as unknown as PodClient,
     deviceStatus,
@@ -144,12 +161,15 @@ export function createFakePodClient(fixtures: FakePodClientFixtures): FakePodCli
     schedules,
     services,
     serverStatus,
+    presence,
+    vitals,
     postDeviceStatusCalls,
     postSettingsCalls,
     postAlarmCalls,
     postDeviceStatusOutcome: { kind: 'success' },
     postSettingsOutcome: { kind: 'success' },
     postAlarmOutcome: { kind: 'success' },
+    vitalsQueries,
   };
 
   const client = {
@@ -158,6 +178,11 @@ export function createFakePodClient(fixtures: FakePodClientFixtures): FakePodCli
     getSchedules: (signal?: AbortSignal) => schedules.run(signal),
     getServices: (signal?: AbortSignal) => services.run(signal),
     getServerStatus: (signal?: AbortSignal) => serverStatus.run(signal),
+    getPresence: (signal?: AbortSignal) => presence.run(signal),
+    getVitals: (query?: { side?: string; startTime?: string; endTime?: string }, signal?: AbortSignal) => {
+      vitalsQueries.push(query ?? {});
+      return vitals.run(signal);
+    },
     postDeviceStatus: async (patch: DeviceStatusPatch) => {
       postDeviceStatusCalls.push(patch);
       if (state.postDeviceStatusOutcome.kind === 'error') throw state.postDeviceStatusOutcome.error;

@@ -4,10 +4,12 @@ import {
   AlarmRequestSchema,
   DeviceStatusPatchSchema,
   DeviceStatusSchema,
+  PresenceSchema,
   SchedulesSchema,
   ServerStatusSchema,
   SettingsPatchSchema,
   SettingsSchema,
+  VitalsResponseSchema,
   interpretWaterLevel,
 } from '../src/pod/types.js';
 import { loadFixture } from './loadFixture.js';
@@ -300,6 +302,61 @@ describe("DeviceStatusPatchSchema's isPriming field, standalone (hub-accessory, 
     if (result.success) {
       expect(result.data).toEqual({ isPriming: true });
     }
+  });
+});
+
+// ---------------------------------------------------------------------------------------
+// occupancy: PresenceSchema / VitalsResponseSchema fixtures
+// ---------------------------------------------------------------------------------------
+
+/**
+ * Occupancy change (#19), task 2.3: both new fixtures parse through their vendored read
+ * schemas with no error, and a fixture edited to violate the schema fails naming the offending
+ * property (pod-test-double spec, "Every fixture parses through the vendored wire types").
+ */
+describe('presence and vitals fixtures parse through their vendored read schemas', () => {
+  it('metricsPresence.json parses through PresenceSchema', () => {
+    const result = PresenceSchema.parse(loadFixture('metricsPresence.json'));
+    expect(result.left?.present).toBe(false);
+    expect(result.right?.present).toBe(false);
+  });
+
+  it('metricsVitals.json parses through VitalsResponseSchema, preserving snake_case fields and row order', () => {
+    const result = VitalsResponseSchema.parse(loadFixture('metricsVitals.json'));
+    expect(result).toHaveLength(2);
+    // Not sorted with left first — the real capture's own order (design.md's Context).
+    expect(result[0]!.side).toBe('right');
+    expect(result[1]!.side).toBe('left');
+    expect(result[0]!.hrv).toBe(0);
+    expect(result[0]!.breathing_rate).toBe(0);
+  });
+
+  it('rejects a presence fixture with a non-boolean present, naming the offending property', () => {
+    const broken = loadFixture('metricsPresence.json') as { left: { present: unknown } };
+    broken.left.present = 'yes';
+    let caught: unknown;
+    try {
+      PresenceSchema.parse(broken);
+    } catch (error) {
+      caught = error;
+    }
+    expect(caught).toBeDefined();
+    expect(String(caught)).toContain('present');
+  });
+
+  it('a null heart_rate/hrv/breathing_rate parses cleanly, not coerced or rejected', () => {
+    const rows = loadFixture('metricsVitals.json') as Array<{
+      heart_rate: number | null;
+      hrv: number | null;
+      breathing_rate: number | null;
+    }>;
+    rows[0]!.heart_rate = null;
+    rows[0]!.hrv = null;
+    rows[0]!.breathing_rate = null;
+    const result = VitalsResponseSchema.parse(rows);
+    expect(result[0]!.heart_rate).toBeNull();
+    expect(result[0]!.hrv).toBeNull();
+    expect(result[0]!.breathing_rate).toBeNull();
   });
 });
 

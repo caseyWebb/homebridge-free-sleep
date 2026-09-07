@@ -2,7 +2,8 @@
  * `PodPoller` — decides when the plugin talks to the Pod at all (pod-poller spec).
  *
  * One self-rescheduling poll per endpoint class (`deviceStatus`, `settings`, `schedules`,
- * `services`), never two in flight for a class at once, ±10% jitter, exponential backoff to a
+ * `services`, and — occupancy change, #19 — `presence`/`vitals`), never two in flight for a
+ * class at once, ±10% jitter, exponential backoff to a
  * configurable cap with snap-back on the first success, a deadline-bounded bootstrap, and a
  * stacking poll-mode API (`requestMode`) that expresses fast-poll-after-write and
  * fast-poll-while-priming today with no new mechanism needed for the alarm window later
@@ -33,15 +34,50 @@ import {
   type TimerApi,
   type TimerHandle,
 } from './snapshot.ts';
-import type { DeviceStatus, Schedules, ServerStatus, Services, Settings } from './types.ts';
+import type { DeviceStatus, PresenceData, Schedules, ServerStatus, Services, Settings, VitalsResponse } from './types.ts';
 
-export type EndpointClassId = 'deviceStatus' | 'settings' | 'schedules' | 'services' | 'serverStatus';
+export type EndpointClassId =
+  | 'deviceStatus'
+  | 'settings'
+  | 'schedules'
+  | 'services'
+  | 'serverStatus'
+  | 'presence'
+  | 'vitals';
+
+/**
+ * S4 (occupancy code review): the subset of `PodClient`'s surface `PodPoller` actually calls.
+ * `getDeviceStatus`/`getSettings`/`getSchedules`/`getServices`/`getServerStatus` are required —
+ * every poller needs all five, `occupancySource`/`serverFaultSensorEnabled` or not (the
+ * `serverStatus` class's own `enabled` predicate only gates whether it *fires*, not whether the
+ * method exists — unlike `presence`/`vitals` below). `getPresence`/`getVitals` are typed
+ * *optional*: they are only ever called from behind an `enabled` predicate that itself checks
+ * `typeof === 'function'` at runtime (see the `presence`/`vitals` class registrations below), so
+ * a client that doesn't implement them — an older client version, or a deliberately reduced test
+ * double — is simply never polled for either class instead of throwing a "not a function"
+ * `TypeError` out of `runPoll`. Keeping these two optional here (rather than requiring the full
+ * `PodClient`) is what makes that runtime check meaningful instead of redundant with the type
+ * system.
+ */
+export type MinimalPodClient = Pick<
+  PodClient,
+  'getDeviceStatus' | 'getSettings' | 'getSchedules' | 'getServices' | 'getServerStatus'
+> &
+  Partial<Pick<PodClient, 'getPresence' | 'getVitals'>>;
+
+/**
+ * The vitals class's query window (occupancy change, #19; design.md's "One combined vitals
+ * query per poll, windowed to the 'recent' threshold itself") — issue #8's own "~3 min",
+ * roughly 3x the 60s insertion cadence upstream writes at, tolerant of one or two missed
+ * insertions. A fixed internal constant, not a config field (proposal.md's Non-Goals).
+ */
+const VITALS_OCCUPIED_WINDOW_MS = 180_000;
 
 /** The alarm window (#16) needs 3s; config must never be able to request that as a *base*. */
 const HARD_FLOOR_MS = 3000;
 
 export interface PollerOptions {
-  client: PodClient;
+  client: MinimalPodClient;
   snapshot: SnapshotStore;
   timers?: TimerApi;
   logger?: Logger;
@@ -64,21 +100,28 @@ export interface PollerOptions {
    * `true`.
    */
   serverFaultSensorEnabled?: boolean;
+  /**
+   * Which occupancy source, if any, is configured (occupancy change, #19). Default `'none'` —
+   * a plain value, following the same "poller doesn't import config.ts" discipline every
+   * existing option already follows (design.md).
+   */
+  occupancySource?: 'none' | 'presence' | 'vitals';
 }
 
 interface EndpointClassSpec<T> {
   id: EndpointClassId;
   baseIntervalMs: number;
-  read: (client: PodClient, signal: AbortSignal) => Promise<T>;
+  read: (client: MinimalPodClient, signal: AbortSignal) => Promise<T>;
   apply: (snapshot: SnapshotStore, value: T) => void;
   recordFailure?: (snapshot: SnapshotStore, kind: ErrorKind) => void;
   /**
-   * Extension point for #19 (design.md, "The poller is a registry of endpoint-class
+   * Extension point named for #19 (design.md, "The poller is a registry of endpoint-class
    * descriptors"): evaluated against the current snapshot before each poll of this class. A
    * class with no `enabled` is always enabled. A disabled class skips the actual request but
    * keeps its schedule running — the next scheduled tick re-evaluates the predicate, so the
    * class polls again on its own as soon as it flips back to enabled, with no external kick
-   * needed. None of the four shipped classes uses this today.
+   * needed. The `presence`/`vitals` classes below are its first real consumers, each gated on
+   * both the configured `occupancySource` and the last-observed `services.biometrics.enabled`.
    */
   enabled?: (snapshot: EffectiveSnapshot) => boolean;
 }
@@ -123,7 +166,7 @@ function clamp(value: number, lo: number, hi: number): number {
 }
 
 export class PodPoller {
-  private readonly client: PodClient;
+  private readonly client: MinimalPodClient;
   private readonly snapshot: SnapshotStore;
   private readonly timers: TimerApi;
   private readonly logger: Logger;
@@ -133,6 +176,7 @@ export class PodPoller {
   private readonly fastPollIntervalMs: number;
   private readonly maxBackoffMs: number;
   private readonly bootstrapTimeoutMs: number;
+  private readonly occupancySource: 'none' | 'presence' | 'vitals';
 
   private readonly classes = new Map<EndpointClassId, ClassRuntime>();
   private primingRelease: (() => void) | null = null;
@@ -150,6 +194,7 @@ export class PodPoller {
     this.fastPollIntervalMs = options.fastPollIntervalMs ?? 5000;
     this.maxBackoffMs = options.maxBackoffMs ?? 60_000;
     this.bootstrapTimeoutMs = options.bootstrapTimeoutMs ?? 10_000;
+    this.occupancySource = options.occupancySource ?? 'none';
 
     this.registerClass({
       id: 'deviceStatus',
@@ -191,6 +236,71 @@ export class PodPoller {
       // restarting the plugin" — moot for a config value that can't change without a restart
       // today, but keeps this class consistent with every other use of `enabled`).
       enabled: () => serverFaultSensorEnabled,
+    });
+
+    // Occupancy change (#19): both registered unconditionally, mirroring the four classes
+    // above — the `enabled` predicate decides whether either actually fires (design.md, "The
+    // poller is a registry of endpoint-class descriptors"). Neither defines `recordFailure`:
+    // matching `settings`/`schedules`/`services`, a failed poll simply leaves the last-known
+    // observation in place (pod-snapshot's general "a failure does not erase known state" rule).
+    this.registerClass({
+      id: 'presence',
+      baseIntervalMs: 30_000,
+      read: (client, signal) => {
+        // Guarded by this class's own `enabled` predicate below (which checks the same
+        // `typeof === 'function'` condition), so this only ever fires when `getPresence`
+        // genuinely exists — this defensive throw exists purely as a second line of defence
+        // against `enabled` and `read` ever drifting out of sync (S4).
+        if (typeof client.getPresence !== 'function') {
+          throw new Error('poller: "presence" class fired without a getPresence method on the client');
+        }
+        return client.getPresence(signal);
+      },
+      apply: (snapshot, value) => snapshot.observePresence(value as PresenceData),
+      // S4: also requires the client to actually implement `getPresence` — a `MinimalPodClient`
+      // that omits it (see that type's own doc comment) must never be polled for this class,
+      // rather than throwing a "not a function" `TypeError` out of `runPoll`.
+      enabled: (snapshot) =>
+        typeof this.client.getPresence === 'function' &&
+        this.occupancySource === 'presence' &&
+        snapshot.documents.services?.biometrics.enabled === true,
+    });
+    this.registerClass({
+      id: 'vitals',
+      baseIntervalMs: 60_000,
+      read: (client, signal) => {
+        // `new globalThis.Date(...)` rather than the bare `Date` identifier this file's own
+        // ESLint rule forbids (no-restricted-globals) — a property access on `globalThis` is
+        // the accepted escape hatch (mirrors `defaultTimerApi`'s own `globalThis.Date.now()` in
+        // `snapshot.ts`), used here only to format `this.timers.now()`'s already-injected
+        // epoch-ms value as ISO 8601, not to read the clock itself.
+        //
+        // S3: `endTime` is deliberately omitted — it is optional upstream (pod-client spec,
+        // "Vitals reads accept optional filters"), and this plugin's own clock is not
+        // guaranteed to agree with the Pod's. If this plugin's clock runs even slightly ahead
+        // of the Pod's, an explicit `endTime` sent as "now" by this clock names a moment the
+        // Pod itself considers still in the future, and rows genuinely inserted since the
+        // Pod's own "now" would be silently excluded from the window. Sending only `startTime`
+        // and letting the Pod default the upper bound to its own current time removes that skew
+        // entirely.
+        //
+        // Guarded by this class's own `enabled` predicate below (S4) — this defensive throw is
+        // a second line of defence against `enabled` and `read` ever drifting out of sync.
+        if (typeof client.getVitals !== 'function') {
+          throw new Error('poller: "vitals" class fired without a getVitals method on the client');
+        }
+        return client.getVitals(
+          { startTime: new globalThis.Date(this.timers.now() - VITALS_OCCUPIED_WINDOW_MS).toISOString() },
+          signal,
+        );
+      },
+      apply: (snapshot, value) => snapshot.observeVitals(value as VitalsResponse),
+      // S4: also requires the client to actually implement `getVitals` — see the `presence`
+      // class registration above for the full rationale.
+      enabled: (snapshot) =>
+        typeof this.client.getVitals === 'function' &&
+        this.occupancySource === 'vitals' &&
+        snapshot.documents.services?.biometrics.enabled === true,
     });
   }
 

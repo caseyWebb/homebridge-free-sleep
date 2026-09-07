@@ -154,7 +154,14 @@ export const FreeSleepConfigSchema = z.object({
     .min(0, { message: 'noResponseAfterMs must be non-negative' })
     .default(600000),
 
-  /** Reserved — see module doc. */
+  /**
+   * Consumed starting with the `occupancy` change (#19): `'none'` (the default) publishes no
+   * `OccupancySensor` on either side accessory — behavior is unchanged for every install that
+   * has not set this key. `'presence'`/`'vitals'` publish one per enabled side, driven by
+   * `GET /api/metrics/presence`/`GET /api/metrics/vitals` respectively, gated on the last-
+   * observed `services.biometrics.enabled` (`src/pod/poller.ts`). See `docs/HOMEKIT.md`'s
+   * "Occupancy" section for each source's `StatusActive` trust caveat.
+   */
   occupancySource: z
     .enum(['none', 'presence', 'vitals'], {
       message: "occupancySource must be one of 'none', 'presence', or 'vitals'",

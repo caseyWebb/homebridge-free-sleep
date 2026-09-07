@@ -11,6 +11,14 @@ curl -s http://<pod-ip>:3000/api/schedules    | jq . > test/fixtures/schedules.j
 curl -s http://<pod-ip>:3000/api/services     | jq . > test/fixtures/services.json
 ```
 
+Issue #19 (the `occupancy` change) added two more real captures from the same unit, same
+free-sleep version, taken 2026-09-06 — read-only, no writes performed to obtain them:
+
+```sh
+curl -s http://<pod-ip>:3000/api/metrics/presence | jq . > test/fixtures/metricsPresence.json
+curl -s http://<pod-ip>:3000/api/metrics/vitals   | jq . > test/fixtures/metricsVitals.json
+```
+
 | File | Status | Date | Notes |
 |---|---|---|---|
 | `deviceStatus.json` | captured, **edited** | 2026-09-06 | The raw capture had `isPriming: true` (the unit was mid-prime at capture time); this file flips it to `false` so the canonical fixture represents the common idle state. Every other field is the real capture, byte-for-byte. Raw, unedited capture preserved as `deviceStatus.priming.json`. |
@@ -21,6 +29,8 @@ curl -s http://<pod-ip>:3000/api/services     | jq . > test/fixtures/services.js
 | `settings.json` | captured, **scrubbed** | 2026-09-06 | Real capture; `id` replaced with `"00000000-0000-0000-0000-000000000000"` (see Scrubbing below). Names are the real unit's literal defaults, `"Left"`/`"Right"`. |
 | `schedules.json` | captured, verbatim | 2026-09-06 | Real capture — every day, both sides, has an empty `temperatures` map and `power`/`alarm` disabled (`enabled: false`), the Pod's out-of-the-box default schedule. |
 | `services.json` | captured, verbatim | 2026-09-06 | Real capture. |
+| `metricsPresence.json` | captured, verbatim | 2026-09-06 | Real capture, `GET /api/metrics/presence` (Pod 3, free-sleep 2.1.5). Both sides read `present: false` with an identical `lastUpdatedAt` — consistent with a capture taken shortly after a restart, before any real presence transition had occurred (the "unknown, not empty" default state `openspec/changes/occupancy/design.md` describes). |
+| `metricsVitals.json` | captured, verbatim | 2026-09-06 | Real capture, `GET /api/metrics/vitals` (Pod 3, free-sleep 2.1.5). Two rows, one per side, **not** sorted with left first — the capture is preserved in the order the endpoint actually returned it. Both rows carry `hrv: 0`/`breathing_rate: 0`, empirically confirming this file's own "HRV and breathing rate are explicitly unvalidated" note (the write-side bounds `heart_rate` 30-90/`hrv` 0-200/`breathing_rate` 5-30 are never applied to what `GET /vitals` returns). |
 
 The synthetic-derivation note from ADR-0001 no longer applies to the four primary fixtures
 (`deviceStatus.json`, `settings.json`, `schedules.json`, `services.json`) — they are real
