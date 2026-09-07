@@ -9,7 +9,9 @@ import { SnapshotStore } from '../../src/pod/snapshot.js';
 import { DeviceStatusSchema, SchedulesSchema, ServicesSchema, SettingsSchema } from '../../src/pod/types.js';
 import { WriteQueue, type FastPollLane } from '../../src/pod/writeQueue.js';
 import { PRIME_SUBTYPE, PrimeService } from '../../src/services/prime.js';
+import { CONFIGURED_NAME } from '../../src/services/serviceName.js';
 import type { ServiceContext } from '../../src/services/types.js';
+import { captureCharacteristicWarnings } from './configuredNameHelpers.js';
 import { createFakePodClient, type FakePodClient } from '../fakePodClient.js';
 import { FakeHomebridgeApi, FakePlatformAccessory, createFakeLogging } from '../fakeHomebridgeApi.js';
 import { loadFixture } from '../loadFixture.js';
@@ -306,5 +308,36 @@ describe('stop() clears the pending revert timer', () => {
 
     service.stop();
     expect(s.timers.pendingCount()).toBe(before);
+  });
+});
+
+// ---------------------------------------------------------------------------------------
+// ConfiguredName seeding (release-polish tasks.md 2.8)
+// ---------------------------------------------------------------------------------------
+
+describe('ConfiguredName seeding (2.8)', () => {
+  it('seeds ConfiguredName to "Prime" on first construction', () => {
+    const s = setup();
+    new PrimeService(s.ctx);
+    const service = s.accessory.getServiceById(s.api.hap.Service.Switch, PRIME_SUBTYPE)!;
+    expect(service.getCharacteristic(Characteristic.ConfiguredName).value).toBe(CONFIGURED_NAME.prime);
+  });
+
+  it('leaves an existing ConfiguredName (e.g. a controller rename) untouched on reconstruction', () => {
+    const s = setup();
+    new PrimeService(s.ctx);
+    const service = s.accessory.getServiceById(s.api.hap.Service.Switch, PRIME_SUBTYPE)!;
+    service.getCharacteristic(Characteristic.ConfiguredName).updateValue('Bedroom Prime');
+
+    new PrimeService(s.ctx); // simulates a restart against the same accessory
+
+    expect(service.getCharacteristic(Characteristic.ConfiguredName).value).toBe('Bedroom Prime');
+  });
+
+  it('adds ConfiguredName without emitting a characteristic-warning event', () => {
+    const s = setup();
+    const warnings = captureCharacteristicWarnings(s.accessory);
+    new PrimeService(s.ctx);
+    expect(warnings).toHaveLength(0);
   });
 });

@@ -29,6 +29,7 @@
 
 import type { Characteristic, HAP, Service } from 'homebridge';
 
+import { CONFIGURED_NAME, seedConfiguredName } from './serviceName.ts';
 import type { ServiceContext } from './types.ts';
 
 export const LED_SUBTYPE = 'led';
@@ -59,6 +60,7 @@ export class LedService {
 
     const existing = accessory.getServiceById(hap.Service.Lightbulb, LED_SUBTYPE);
     this.service = existing ?? accessory.addService(new hap.Service.Lightbulb(POD_LED_NAME, LED_SUBTYPE));
+    seedConfiguredName(this.service, hap, CONFIGURED_NAME.led);
 
     this.wireReadsAndWrites();
 

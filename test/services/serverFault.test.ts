@@ -16,7 +16,9 @@ import {
 } from '../../src/pod/types.js';
 import { WriteQueue } from '../../src/pod/writeQueue.js';
 import { SERVER_FAULT_SUBTYPE, ServerFaultService } from '../../src/services/serverFault.js';
+import { CONFIGURED_NAME } from '../../src/services/serviceName.js';
 import type { ServiceContext } from '../../src/services/types.js';
+import { captureCharacteristicWarnings } from './configuredNameHelpers.js';
 import { createFakePodClient } from '../fakePodClient.js';
 import { FakeHomebridgeApi, FakePlatformAccessory, createFakeLogging } from '../fakeHomebridgeApi.js';
 import { loadFixture } from '../loadFixture.js';
@@ -199,5 +201,39 @@ describe('StatusActive', () => {
     expect(handlers.get(UUID.statusActive)!({} as never, undefined)).toBe(true);
     ctx.snapshot.recordServerStatusFailure('network');
     expect(handlers.get(UUID.statusActive)!({} as never, undefined)).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------------------------
+// ConfiguredName seeding (release-polish tasks.md 2.10)
+// ---------------------------------------------------------------------------------------
+
+describe('ConfiguredName seeding (2.10)', () => {
+  it('seeds ConfiguredName to "Server Fault" on first construction', () => {
+    const s = setup();
+    const ctx = contextFor(s);
+    new ServerFaultService(ctx);
+    const service = s.accessory.getServiceById(s.api.hap.Service.ContactSensor, SERVER_FAULT_SUBTYPE)!;
+    expect(service.getCharacteristic(Characteristic.ConfiguredName).value).toBe(CONFIGURED_NAME.serverFault);
+  });
+
+  it('leaves an existing ConfiguredName (e.g. a controller rename) untouched on reconstruction', () => {
+    const s = setup();
+    const ctx = contextFor(s);
+    new ServerFaultService(ctx);
+    const service = s.accessory.getServiceById(s.api.hap.Service.ContactSensor, SERVER_FAULT_SUBTYPE)!;
+    service.getCharacteristic(Characteristic.ConfiguredName).updateValue('Bedroom Server Fault');
+
+    new ServerFaultService(ctx); // simulates a restart against the same accessory
+
+    expect(service.getCharacteristic(Characteristic.ConfiguredName).value).toBe('Bedroom Server Fault');
+  });
+
+  it('adds ConfiguredName without emitting a characteristic-warning event', () => {
+    const s = setup();
+    const ctx = contextFor(s);
+    const warnings = captureCharacteristicWarnings(s.accessory);
+    new ServerFaultService(ctx);
+    expect(warnings).toHaveLength(0);
   });
 });

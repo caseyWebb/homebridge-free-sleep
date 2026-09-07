@@ -14,8 +14,10 @@ import { AwayModeGuard } from '../../src/pod/awayModeGuard.js';
 import { SnapshotStore } from '../../src/pod/snapshot.js';
 import { DeviceStatusSchema, SchedulesSchema, SettingsSchema, type DeviceStatus, type Schedules, type Settings } from '../../src/pod/types.js';
 import { WriteQueue, type FastPollLane } from '../../src/pod/writeQueue.js';
+import { CONFIGURED_NAME } from '../../src/services/serviceName.js';
 import { isSkipAlarmChange, isSkipAlarmOn, SKIP_ALARM_SUBTYPE, SkipAlarmService } from '../../src/services/skipAlarm.js';
 import type { ServiceContext } from '../../src/services/types.js';
+import { captureCharacteristicWarnings } from './configuredNameHelpers.js';
 import { createFakePodClient, type FakePodClient } from '../fakePodClient.js';
 import { FakeHomebridgeApi, FakePlatformAccessory, createFakeLogging } from '../fakeHomebridgeApi.js';
 import { loadFixture } from '../loadFixture.js';
@@ -607,5 +609,36 @@ describe('stop() clears pending timers and rejects an unsubmitted write', () => 
     service.stop();
     await vi.advanceTimersByTimeAsync(3_600_000 + 1); // past what would have been the expiry instant
     expect(spy).not.toHaveBeenCalled(); // the timer never fires — it was cleared by stop()
+  });
+});
+
+// ---------------------------------------------------------------------------------------
+// ConfiguredName seeding (release-polish tasks.md 2.5)
+// ---------------------------------------------------------------------------------------
+
+describe('ConfiguredName seeding (2.5)', () => {
+  it('seeds ConfiguredName to "Skip Next Alarm" on first construction', () => {
+    const { ctx, api } = setup();
+    build(ctx, 'left');
+    const service = ctx.accessory.getServiceById(api.hap.Service.Switch, SKIP_ALARM_SUBTYPE)!;
+    expect(service.getCharacteristic(Characteristic.ConfiguredName).value).toBe(CONFIGURED_NAME.skipNextAlarm);
+  });
+
+  it('leaves an existing ConfiguredName (e.g. a controller rename) untouched on reconstruction', () => {
+    const { ctx, api } = setup();
+    build(ctx, 'left');
+    const service = ctx.accessory.getServiceById(api.hap.Service.Switch, SKIP_ALARM_SUBTYPE)!;
+    service.getCharacteristic(Characteristic.ConfiguredName).updateValue('Bedroom Skip Next Alarm');
+
+    build(ctx, 'left'); // simulates a restart against the same accessory
+
+    expect(service.getCharacteristic(Characteristic.ConfiguredName).value).toBe('Bedroom Skip Next Alarm');
+  });
+
+  it('adds ConfiguredName without emitting a characteristic-warning event', () => {
+    const { ctx, accessory } = setup();
+    const warnings = captureCharacteristicWarnings(accessory);
+    build(ctx, 'left');
+    expect(warnings).toHaveLength(0);
   });
 });

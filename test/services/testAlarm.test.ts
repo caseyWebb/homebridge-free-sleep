@@ -15,6 +15,7 @@ import {
   type Side,
 } from '../../src/pod/types.js';
 import { WriteQueue } from '../../src/pod/writeQueue.js';
+import { TEST_ALARM_CONFIGURED_NAME } from '../../src/services/serviceName.js';
 import {
   TEST_ALARM_LEFT_SUBTYPE,
   TEST_ALARM_RIGHT_SUBTYPE,
@@ -22,6 +23,7 @@ import {
   TestAlarmService,
 } from '../../src/services/testAlarm.js';
 import type { ServiceContext } from '../../src/services/types.js';
+import { captureCharacteristicWarnings } from './configuredNameHelpers.js';
 import { createFakePodClient } from '../fakePodClient.js';
 import { FakeHomebridgeApi, FakePlatformAccessory, createFakeLogging } from '../fakeHomebridgeApi.js';
 import { loadFixture } from '../loadFixture.js';
@@ -262,5 +264,43 @@ describe.each(SIDES)('stop() clears the %s switch\'s pending self-reset timer', 
 
     service.stop();
     expect(s.timers.pendingCount()).toBe(before);
+  });
+});
+
+// ---------------------------------------------------------------------------------------
+// ConfiguredName seeding (release-polish tasks.md 2.11)
+// ---------------------------------------------------------------------------------------
+
+describe('ConfiguredName seeding (2.11)', () => {
+  it('seeds "Test Alarm Left" / "Test Alarm Right" on first construction — distinct labels on the same hub accessory', () => {
+    const s = setup();
+    new TestAlarmService(s.ctx, 'left');
+    new TestAlarmService(s.ctx, 'right');
+    const left = s.accessory.getServiceById(s.api.hap.Service.Switch, TEST_ALARM_LEFT_SUBTYPE)!;
+    const right = s.accessory.getServiceById(s.api.hap.Service.Switch, TEST_ALARM_RIGHT_SUBTYPE)!;
+    expect(left.getCharacteristic(Characteristic.ConfiguredName).value).toBe(TEST_ALARM_CONFIGURED_NAME.left);
+    expect(right.getCharacteristic(Characteristic.ConfiguredName).value).toBe(TEST_ALARM_CONFIGURED_NAME.right);
+    expect(left.getCharacteristic(Characteristic.ConfiguredName).value).not.toBe(
+      right.getCharacteristic(Characteristic.ConfiguredName).value,
+    );
+  });
+
+  it('leaves an existing ConfiguredName (e.g. a controller rename) untouched on reconstruction', () => {
+    const s = setup();
+    new TestAlarmService(s.ctx, 'left');
+    const service = s.accessory.getServiceById(s.api.hap.Service.Switch, TEST_ALARM_LEFT_SUBTYPE)!;
+    service.getCharacteristic(Characteristic.ConfiguredName).updateValue('Bedroom Test Alarm');
+
+    new TestAlarmService(s.ctx, 'left'); // simulates a restart against the same accessory
+
+    expect(service.getCharacteristic(Characteristic.ConfiguredName).value).toBe('Bedroom Test Alarm');
+  });
+
+  it('adds ConfiguredName without emitting a characteristic-warning event', () => {
+    const s = setup();
+    const warnings = captureCharacteristicWarnings(s.accessory);
+    new TestAlarmService(s.ctx, 'left');
+    new TestAlarmService(s.ctx, 'right');
+    expect(warnings).toHaveLength(0);
   });
 });

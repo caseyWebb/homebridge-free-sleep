@@ -18,6 +18,7 @@ import type { Service } from 'homebridge';
 import { AwayModeBlockedError } from '../pod/awayModeGuard.ts';
 import type { Change, TimerHandle } from '../pod/snapshot.ts';
 import type { Side } from '../pod/types.ts';
+import { CONFIGURED_NAME, seedConfiguredName } from './serviceName.ts';
 import type { ServiceContext } from './types.ts';
 
 export const ALARM_PRESS_SUBTYPE = 'alarm-press';
@@ -84,6 +85,7 @@ export class AlarmService {
     this.pressService =
       existingPress ??
       accessory.addService(new hap.Service.StatelessProgrammableSwitch(`${accessory.displayName} Alarm`, ALARM_PRESS_SUBTYPE));
+    seedConfiguredName(this.pressService, hap, CONFIGURED_NAME.alarm);
     // Every setProps call happens before any value is set and before the accessory is
     // registered (mirrors ThermostatService's own construction-ordering discipline). HAP
     // explicitly exempts ProgrammableSwitchEvent from the setProps revalidation path (docs/
@@ -97,6 +99,7 @@ export class AlarmService {
     const existingDismiss = accessory.getServiceById(hap.Service.Switch, ALARM_DISMISS_SUBTYPE);
     this.dismissService =
       existingDismiss ?? accessory.addService(new hap.Service.Switch('Dismiss Alarm', ALARM_DISMISS_SUBTYPE));
+    seedConfiguredName(this.dismissService, hap, CONFIGURED_NAME.dismissAlarm);
 
     this.wireDismiss();
 

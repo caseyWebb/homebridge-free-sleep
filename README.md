@@ -14,38 +14,77 @@ your account credentials. That is exactly what free-sleep exists to avoid, and i
 work at all on a Pod that has been firewalled off from the internet — which is the
 recommended free-sleep setup. This plugin talks only to your Pod, on your LAN.
 
-## Status: v0.1.0 (MVP)
+## Status: 0.3.0 published, M1–M4 complete — M5 (release) in progress
 
-This is a first, minimal release: **each side of the bed as a HomeKit thermostat** (Off/Auto,
-55–110°F) driven from a live cache of the Pod's status. The hub accessory carries a **"Pod
-Connection" contact sensor** that reports reachability and handles the Pod's daily reboot
-gracefully (last-known values served through the outage; the sensor flags it; nothing throws
-"No Response" for a routine restart), a **"Pod Water Low" sensor** (always published; see
-`waterLowSensorType` below), and four opt-in services — **"Pod Prime"** (a switch), **"Pod
-LED"** (a lightbulb), **"Pod Test Alarm"** (a momentary switch), and **"Pod Server Fault"** (a
-sensor) — each disabled by default and gated by its own config key (see Config keys below).
-Implemented and tested against **free-sleep v2.1.5**.
+The full feature set is implemented and shipped to npm. Every side of the bed is a HomeKit
+**Thermostat** (Off/Auto, 55–110°F) driven from a live cache of the Pod's status, plus:
 
-Each side also carries an alarm-press event (fires "When … is pressed" in the Home app's
-automation picker) and a "Dismiss Alarm" switch, backed by a scheduler that briefly polls the
-Pod faster around each predicted alarm instant so the short-lived vibration event is not missed
-(`alarmEvents`, on by default — see Config keys below), plus an "Away Mode" switch and a "Skip
-Next Alarm" switch (`awayModeSwitch`/`skipAlarmSwitch`, both on by default). See
-[docs/ROADMAP.md](docs/ROADMAP.md)
-for what's still planned (milestone M4) and why some things are deliberately non-goals.
+- **Alarm events** — a per-side "Alarm" event (fires "When … is pressed" in the Home app's
+  automation picker) and a "Dismiss Alarm" switch, backed by a scheduler that briefly polls the
+  Pod faster around each predicted alarm instant so the short-lived vibration event is not missed
+  (`alarmEvents`, on by default).
+- **Away Mode** and **Skip Next Alarm** switches per side (`awayModeSwitch`/`skipAlarmSwitch`,
+  both on by default), debounced and rate-limited against the Pod's expensive settings write.
+- **Occupancy sensor** per side, opt-in via `occupancySource: 'presence' | 'vitals'` (default
+  `'none'` — zero extra polling until you opt in), with proof-of-life `StatusActive` semantics so
+  a dead detection stream can never masquerade as "Not Occupied".
+- **Hub accessory**: a "Pod Connection" contact sensor that reports reachability and handles the
+  Pod's daily reboot gracefully (last-known values served through the outage; nothing throws "No
+  Response" for a routine restart), an always-published "Water Level" sensor (contact or leak
+  style, `waterLowSensorType`), and four opt-in extras each gated by its own config key —
+  "Prime" (a switch), "LED" (a lightbulb), per-side "Test Alarm" switches, and a "Server Fault"
+  sensor.
+- **(Unreleased)** Every HAP service on every accessory now carries its own distinct tile label
+  in the Home app instead of a shared accessory-name fallback — see the ConfiguredName section
+  of [docs/HOMEKIT.md](docs/HOMEKIT.md) and the `[Unreleased]` entry in
+  [CHANGELOG.md](CHANGELOG.md).
+
+Implemented and tested against **free-sleep v2.1.5**. See
+[docs/ROADMAP.md](docs/ROADMAP.md) for the milestone history and what remains for M5, and
+[CHANGELOG.md](CHANGELOG.md) for what changed in each release.
 
 ### Honesty caveat — read this before installing
 
-This plugin has been extensively tested against a behavioral mock of the Pod's API and
-against real API responses captured from a physical Pod 3, and it has been smoke-verified
-read-only against real hardware (reachability, status shape, and latency all confirmed live).
+This plugin has been extensively tested against a behavioral mock of the Pod's API and against
+real API responses captured from a physical Pod 3. Core thermostat control has been paired and
+verified end-to-end against a real Home app (the archived `thermostat-and-offline` change,
+[#9](https://github.com/caseyWebb/homebridge-free-sleep/issues/9)/[#11](https://github.com/caseyWebb/homebridge-free-sleep/issues/11)).
 
-**It has not yet been verified end-to-end with a paired Apple Home app.** That verification —
-pairing the plugin, controlling a real bed from the Home app, and confirming behavior across
-an actual daily reboot — is tracked in
-[#9](https://github.com/caseyWebb/homebridge-free-sleep/issues/9) (thermostat service) and
-[#11](https://github.com/caseyWebb/homebridge-free-sleep/issues/11) (offline handling).
-Consider this release **pre-release / use-at-your-own-risk** until those close.
+**Everything shipped since then is implemented and covered by the test suite, but the specific
+real-hardware confirmations below are still open** — tracked in
+[#36](https://github.com/caseyWebb/homebridge-free-sleep/issues/36):
+
+- **Offline handling**: a free-sleep restart on the Pod flips the connection sensor exactly
+  twice; the same across the Pod's real daily reboot; whether a long (>10 min) outage's "No
+  Response" escalation recovers promptly on reconnection or latches until the Home app is
+  force-quit (this decides whether `noResponseAfterMs` should default to `0`); whether
+  `StatusFault`/`StatusActive` surface anywhere in the Home app or only in Eve-class clients.
+- **Slider drag**: a full-range (55→110°F) continuous drag on the real device never visibly
+  snaps back mid-drag or after release (CI proves this against a mock with a virtual clock; this
+  is the real-world confirmation).
+- **Occupancy**: presence/vitals transitions flip the sensor within the expected window and
+  `StatusActive` latches correctly on first real detection; the sensor stays inactive-but-quiet
+  when biometrics is disabled on the Pod.
+- **Hub extras**: a real prime cycle tracks and self-corrects on the tile; LED brightness slider
+  feel (~5s settle is expected); each per-side Test Alarm fires only its own side; water-low
+  reads correctly against the actual tank state; the server-fault sensor stays quiet in normal
+  operation.
+- **Alarm timing**: a real scheduled alarm produces a single press within ~3s of vibration start
+  and Dismiss stops it; the documented DST caveat (our skipped-wall-clock resolution differs from
+  `moment-timezone`'s by one hour for an alarm scheduled inside the transition hour — pinned by
+  regression tests, at most one shifted prediction per transition).
+- **Settings switches**: Away Mode toggled from the Home app agrees with the Pod's own UI, and
+  with `awayModeTurnsSideOff` the side actually powers down first; Skip Next Alarm suppresses a
+  real alarm and drops back to off afterward, and is refused in the dead window between a fired
+  alarm and the following noon.
+- **Service ConfiguredName** (unreleased, #49): every tile shows a distinct label rather than
+  the accessory-name fallback, and a Home-app rename survives a plugin restart — traced through
+  the installed HAP-NodeJS/Homebridge source, but confirmation on a real paired install is a
+  post-merge follow-up, not a blocker.
+
+None of the above are known bugs — they are real-hardware confirmations of behavior already
+covered by the automated test suite against a behavioral mock. Treat the plugin as **stable but
+not yet fully hardware-confirmed** until #36 closes.
 
 ## Requirements
 
@@ -63,8 +102,18 @@ Consider this release **pre-release / use-at-your-own-risk** until those close.
 npm install -g @caseywebb/homebridge-free-sleep
 ```
 
-Or, once published, search for "Free Sleep" in the Homebridge UI's plugin search and install
-from there.
+Or, from the Homebridge UI's **Plugins** search box, type the exact scoped package name:
+
+```
+@caseywebb/homebridge-free-sleep
+```
+
+The UI matches a scoped package name (`@scope/homebridge-*`) directly against the npm registry,
+bypassing its own search index entirely — so this works immediately after publish. Generic
+terms like "free sleep" or "eight sleep" will **not** find it yet: that is npm's own
+search-index lag catching up to a new package (typically hours, no fixed SLA), not something a
+`keywords`/metadata change can fix. If you've already typed a generic term with no luck, try
+the exact name above instead of waiting.
 
 ## Configuration
 
@@ -121,8 +170,8 @@ Minimal config — everything but `host` is optional:
 | `skipAlarmSwitch` | boolean | `true` | Publishes a per-side "Skip Next Alarm" switch. Turning it on computes that side's next scheduled alarm occurrence (the alarm scheduled for the current *sleep day* — the calendar day, in the side's time zone, that began 12 hours ago — applied to today's date if it's before noon, otherwise tomorrow's, plus 2 minutes) and writes `scheduleOverrides.alarm.expiresAt` so free-sleep's own recurring alarm job skips it; turning it off clears the override. Self-clears (reads back off) once the computed time passes, with no write, and also proactively pushes to HomeKit at that exact instant, or when a poll observes the override changed by some other means (e.g. free-sleep's own web UI) — neither push needs a read. Writes are debounced locally (at least 2s) and rate-limited to at most one settings write per side per 10s window, same as Away Mode. Turning the switch on between an alarm ringing and the following noon — a "dead window" where the noon rule would otherwise target that already-elapsed alarm — is refused instead of writing an override that would skip nothing. |
 | `awayModeTurnsSideOff` | boolean | `false` | When `awayModeSwitch` is enabled, turning a side's Away Mode switch on first turns that side off (confirmed), then enables away mode, as two sequenced writes — the reverse order would let the Pod's own both-sides mirroring turn the *other* side off too, which enabling away mode alone should not do. Turning Away Mode off never touches power, regardless of this setting. If the power-off pre-step is refused because the partner side is already away (`awayModeWritePolicy: 'block'`), the toggle still proceeds straight to the `awayMode: true` write — the Pod applies a settings write to both sides whenever either is away anyway, so aborting here would make Away Mode itself unreachable while the partner stays away. Separately, under the default `'mirror'` policy: enabling Away Mode with the partner side already away also turns the partner's side off, an unavoidable side effect of the Pod's own both-sides mirroring (`awayModeWritePolicy` above) — not something this option can prevent. |
 
-Reserved keys are validated now (a typo fails loudly) so a future release can start reading
-them without a config migration, but they currently have no effect.
+Every key above is live and consumed — none are placeholders. An unrecognized top-level key
+(almost always a typo) is logged as a warning rather than silently ignored.
 
 ## Security
 
@@ -136,6 +185,7 @@ plugin does not change that — do not expose port 3000 to the internet.
 - [docs/HOMEKIT.md](docs/HOMEKIT.md) — HAP service/characteristic modeling decisions and the
   HomeKit-side gotchas they work around.
 - [docs/ROADMAP.md](docs/ROADMAP.md) — milestones, what's not built yet, and non-goals.
+- [CHANGELOG.md](CHANGELOG.md) — what changed in each release.
 - `openspec/` — spec-driven change proposals. `openspec list` to see what is in flight.
 
 ## Licence

@@ -36,6 +36,7 @@ import type { Service } from 'homebridge';
 
 import type { TimerHandle } from '../pod/snapshot.ts';
 import type { AlarmRequest, Side } from '../pod/types.ts';
+import { seedConfiguredName, TEST_ALARM_CONFIGURED_NAME } from './serviceName.ts';
 import type { ServiceContext } from './types.ts';
 
 /** Per-side subtypes — distinct HAP services, each independently restorable/prunable. */
@@ -88,6 +89,7 @@ export class TestAlarmService {
 
     const existing = accessory.getServiceById(hap.Service.Switch, subtype);
     this.service = existing ?? accessory.addService(new hap.Service.Switch(TEST_ALARM_NAMES[side], subtype));
+    seedConfiguredName(this.service, hap, TEST_ALARM_CONFIGURED_NAME[side]);
 
     this.wireWrites();
   }

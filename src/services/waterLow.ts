@@ -14,6 +14,7 @@
 
 import type { Characteristic, Service, WithUUID } from 'homebridge';
 
+import { CONFIGURED_NAME, seedConfiguredName } from './serviceName.ts';
 import type { ServiceContext } from './types.ts';
 
 export const WATER_LOW_SUBTYPE = 'waterLow';
@@ -48,6 +49,7 @@ export class WaterLowService {
     const ServiceCtor = this.sensorType === 'leak' ? hap.Service.LeakSensor : hap.Service.ContactSensor;
     const existing = accessory.getServiceById(ServiceCtor, WATER_LOW_SUBTYPE);
     this.service = existing ?? accessory.addService(new ServiceCtor(POD_WATER_LOW_NAME, WATER_LOW_SUBTYPE));
+    seedConfiguredName(this.service, hap, CONFIGURED_NAME.waterLevel);
 
     ensureCharacteristic(this.service, hap.Characteristic.StatusFault);
 

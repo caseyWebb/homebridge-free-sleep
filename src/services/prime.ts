@@ -27,6 +27,7 @@
 import type { Service } from 'homebridge';
 
 import type { TimerHandle } from '../pod/snapshot.ts';
+import { CONFIGURED_NAME, seedConfiguredName } from './serviceName.ts';
 import type { ServiceContext } from './types.ts';
 
 export const PRIME_SUBTYPE = 'prime';
@@ -85,6 +86,7 @@ export class PrimeService {
 
     const existing = accessory.getServiceById(hap.Service.Switch, PRIME_SUBTYPE);
     this.service = existing ?? accessory.addService(new hap.Service.Switch(POD_PRIME_NAME, PRIME_SUBTYPE));
+    seedConfiguredName(this.service, hap, CONFIGURED_NAME.prime);
 
     this.wireReadsAndWrites();
 

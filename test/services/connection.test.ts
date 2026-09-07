@@ -9,8 +9,10 @@ import { SnapshotStore } from '../../src/pod/snapshot.js';
 import { DeviceStatusSchema, SchedulesSchema, ServicesSchema, SettingsSchema } from '../../src/pod/types.js';
 import { WriteQueue, type FastPollLane } from '../../src/pod/writeQueue.js';
 import { CONNECTION_SUBTYPE, ConnectionService } from '../../src/services/connection.js';
-import type { ServiceContext } from '../../src/services/types.js';
+import { CONFIGURED_NAME } from '../../src/services/serviceName.js';
 import { ThermostatService } from '../../src/services/thermostat.js';
+import type { ServiceContext } from '../../src/services/types.js';
+import { captureCharacteristicWarnings } from './configuredNameHelpers.js';
 import { createFakePodClient } from '../fakePodClient.js';
 import { FakeHomebridgeApi, FakePlatformAccessory, createFakeLogging } from '../fakeHomebridgeApi.js';
 import { loadFixture } from '../loadFixture.js';
@@ -245,5 +247,39 @@ describe('no timer owned by the connection sensor (6.5)', () => {
     // The snapshot's own overlay timers are unrelated to this service; ConnectionService itself
     // never calls `timers.setTimeout`, so the pending count is unchanged by anything it did.
     expect(s.timers.pendingCount()).toBe(before);
+  });
+});
+
+// ---------------------------------------------------------------------------------------
+// ConfiguredName seeding (release-polish tasks.md 2.6)
+// ---------------------------------------------------------------------------------------
+
+describe('ConfiguredName seeding (2.6)', () => {
+  it('seeds ConfiguredName to "Pod Connection" on first construction', () => {
+    const s = setup();
+    const ctx = contextFor(s);
+    new ConnectionService(ctx);
+    const service = s.accessory.getServiceById(s.api.hap.Service.ContactSensor, CONNECTION_SUBTYPE)!;
+    expect(service.getCharacteristic(Characteristic.ConfiguredName).value).toBe(CONFIGURED_NAME.podConnection);
+  });
+
+  it('leaves an existing ConfiguredName (e.g. a controller rename) untouched on reconstruction', () => {
+    const s = setup();
+    const ctx = contextFor(s);
+    new ConnectionService(ctx);
+    const service = s.accessory.getServiceById(s.api.hap.Service.ContactSensor, CONNECTION_SUBTYPE)!;
+    service.getCharacteristic(Characteristic.ConfiguredName).updateValue('Bedroom Pod Connection');
+
+    new ConnectionService(ctx); // simulates a restart against the same accessory
+
+    expect(service.getCharacteristic(Characteristic.ConfiguredName).value).toBe('Bedroom Pod Connection');
+  });
+
+  it('adds ConfiguredName without emitting a characteristic-warning event', () => {
+    const s = setup();
+    const ctx = contextFor(s);
+    const warnings = captureCharacteristicWarnings(s.accessory);
+    new ConnectionService(ctx);
+    expect(warnings).toHaveLength(0);
   });
 });

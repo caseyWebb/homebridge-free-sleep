@@ -15,6 +15,7 @@
 
 import type { Characteristic, Service, WithUUID } from 'homebridge';
 
+import { CONFIGURED_NAME, seedConfiguredName } from './serviceName.ts';
 import type { ServiceContext } from './types.ts';
 
 export const SERVER_FAULT_SUBTYPE = 'serverFault';
@@ -40,6 +41,7 @@ export class ServerFaultService {
     const existing = accessory.getServiceById(hap.Service.ContactSensor, SERVER_FAULT_SUBTYPE);
     this.service =
       existing ?? accessory.addService(new hap.Service.ContactSensor(POD_SERVER_FAULT_NAME, SERVER_FAULT_SUBTYPE));
+    seedConfiguredName(this.service, hap, CONFIGURED_NAME.serverFault);
 
     ensureCharacteristic(this.service, hap.Characteristic.StatusFault);
     ensureCharacteristic(this.service, hap.Characteristic.StatusActive);

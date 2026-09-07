@@ -8,7 +8,9 @@ import { SnapshotStore } from '../../src/pod/snapshot.js';
 import { DeviceStatusSchema, SchedulesSchema, ServicesSchema, SettingsSchema } from '../../src/pod/types.js';
 import { WriteQueue, type FastPollLane } from '../../src/pod/writeQueue.js';
 import { isOccupancyChange, OCCUPANCY_SUBTYPE, OccupancySensorService } from '../../src/services/occupancy.js';
+import { CONFIGURED_NAME } from '../../src/services/serviceName.js';
 import type { ServiceContext } from '../../src/services/types.js';
+import { captureCharacteristicWarnings } from './configuredNameHelpers.js';
 import { createFakePodClient } from '../fakePodClient.js';
 import { FakeHomebridgeApi, FakePlatformAccessory, createFakeLogging } from '../fakeHomebridgeApi.js';
 import { loadFixture } from '../loadFixture.js';
@@ -271,5 +273,39 @@ describe('isOccupancyChange', () => {
       isOccupancyChange({ scope: 'side', field: 'targetTemperatureF', side: 'left', previous: 60, current: 65 }),
     ).toBe(false);
     expect(isOccupancyChange({ scope: 'device', field: 'connectionOnline', previous: false, current: true })).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------------------
+// ConfiguredName seeding (release-polish tasks.md 2.3)
+// ---------------------------------------------------------------------------------------
+
+describe('ConfiguredName seeding (2.3)', () => {
+  it('seeds ConfiguredName to "Occupancy" on first construction', () => {
+    const s = setup();
+    const ctx = contextFor(s);
+    new OccupancySensorService(ctx, 'left');
+    const service = s.accessory.getServiceById(s.api.hap.Service.OccupancySensor, OCCUPANCY_SUBTYPE)!;
+    expect(service.getCharacteristic(Characteristic.ConfiguredName).value).toBe(CONFIGURED_NAME.occupancy);
+  });
+
+  it('leaves an existing ConfiguredName (e.g. a controller rename) untouched on reconstruction', () => {
+    const s = setup();
+    const ctx = contextFor(s);
+    new OccupancySensorService(ctx, 'left');
+    const service = s.accessory.getServiceById(s.api.hap.Service.OccupancySensor, OCCUPANCY_SUBTYPE)!;
+    service.getCharacteristic(Characteristic.ConfiguredName).updateValue('Bedroom Occupancy');
+
+    new OccupancySensorService(ctx, 'left'); // simulates a restart against the same accessory
+
+    expect(service.getCharacteristic(Characteristic.ConfiguredName).value).toBe('Bedroom Occupancy');
+  });
+
+  it('adds ConfiguredName without emitting a characteristic-warning event', () => {
+    const s = setup();
+    const ctx = contextFor(s);
+    const warnings = captureCharacteristicWarnings(s.accessory);
+    new OccupancySensorService(ctx, 'left');
+    expect(warnings).toHaveLength(0);
   });
 });

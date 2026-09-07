@@ -393,3 +393,89 @@ through `api.matter`.
 `setProps` after publish does **not** bump the HAP configuration number (there is an explicit
 TODO in `Characteristic.ts` about it), so always call it during accessory construction, never
 conditionally later.
+
+## Service `ConfiguredName` (`release-polish`, #49)
+
+**The problem.** iOS ≥16 ignores each service's `Name` characteristic for its tile label on a
+bridged, multi-service accessory and instead derives the label from the accessory's own display
+name — so every tile under a side accessory (thermostat, alarm press, dismiss, occupancy, away
+mode, skip alarm) showed that side's single accessory name, and every hub tile showed "Pod",
+indistinguishable from one another, even though every service already passed a distinct `Name`
+constructor argument. `ConfiguredName` is the characteristic the Home app actually reads for a
+per-tile label, and — verified against the installed `@homebridge/hap-nodejs@2.2.2`
+(`node_modules/@homebridge/hap-nodejs/dist/lib/definitions/ServiceDefinitions.js`) — none of the
+seven HAP service types this plugin uses (`Thermostat`, `Switch`, `Lightbulb`, `ContactSensor`,
+`LeakSensor`, `OccupancySensor`, `StatelessProgrammableSwitch`) declare it as required or
+optional, so it must be added explicitly via HAP's optional-characteristic mechanism.
+
+**Seed-once, never-overwrite, via `testCharacteristic` — not `accessory.context`.** Every
+service adds `ConfiguredName` and sets it to a fixed default label exactly once, immediately
+after `addService`/`getServiceById`, gated on `service.testCharacteristic(ConfiguredName)`:
+
+```ts
+if (!this.service.testCharacteristic(hap.Characteristic.ConfiguredName)) {
+  this.service.addOptionalCharacteristic(hap.Characteristic.ConfiguredName);
+  this.service.setCharacteristic(hap.Characteristic.ConfiguredName, label);
+}
+```
+
+Unlike `TemperatureDisplayUnits` (seeded via `accessory.context`, above), `ConfiguredName` is
+never read by this plugin's own code, so it never needs an `onGet` — left with no `onGet`,
+HAP-NodeJS answers a read with whatever the characteristic's own `.value` holds, and that value
+round-trips through Homebridge's `cachedAccessories` file for free via hap-nodejs's own
+`Service.serialize`/`deserialize` (no plugin-side bookkeeping needed). So `testCharacteristic`
+already tells the whole story: `false` means this service has never carried `ConfiguredName`
+before (first-ever construction, or an upgrade from a pre-#49 plugin version) — add and seed it.
+`true` means it is already present, whether still at its seeded default or renamed by a
+controller (the Home app) — leave it alone, on every later construction, forever. This is the
+same principle `openspec/specs/platform/spec.md`'s "Display names are seeded once… and never
+rewritten" already applies at the accessory level, extended to the service level.
+
+`addOptionalCharacteristic` matters, not just `getCharacteristic`: calling `getCharacteristic`
+for a characteristic type a service class doesn't declare falls back to adding it anyway, but
+also emits a `characteristic-warning` ("not in required or optional characteristic section…
+Adding anyway") — the exact log spam this change avoids by registering the characteristic as
+optional first.
+
+**Short labels, no accessory-name prefix (tech-lead resolution, overriding the original
+per-accessory-prefixed design).** Apple's own service-naming guidance and the Home app's
+per-accessory tile scoping make a prefixed label like "Casey Away Mode" redundant and
+Siri-hostile — uniqueness matters within an accessory, not globally. Every service's
+`ConfiguredName` default is a short, standalone label:
+
+| Service | Accessory | `ConfiguredName` |
+|---|---|---|
+| Thermostat | side | "Thermostat" |
+| Alarm press (`StatelessProgrammableSwitch`) | side | "Alarm" |
+| Dismiss Alarm (`Switch`) | side | "Dismiss Alarm" |
+| Occupancy (`OccupancySensor`) | side | "Occupancy" |
+| Away Mode (`Switch`) | side | "Away Mode" |
+| Skip Next Alarm (`Switch`) | side | "Skip Next Alarm" |
+| Pod Connection (`ContactSensor`) | hub | "Pod Connection" |
+| LED (`Lightbulb`) | hub | "LED" |
+| Prime (`Switch`) | hub | "Prime" |
+| Water Level (`ContactSensor`/`LeakSensor`) | hub | "Water Level" |
+| Server Fault (`ContactSensor`) | hub | "Server Fault" |
+| Test Alarm Left/Right (`Switch` × 2) | hub | "Test Alarm Left" / "Test Alarm Right" |
+
+Test Alarm is the one pair that keeps its `Left`/`Right` suffix — it is the only case where two
+services sharing this convention's short label would collide on the *same* accessory (the hub
+carries both). The pre-existing `Name` characteristic values are unchanged by any of this
+(design's own non-goal — nothing reads `Name` for tile-label purposes, so changing it would add
+diff with zero user-visible effect). `src/services/serviceName.ts` is the one shared module
+these labels and the seeding helper (`seedConfiguredName`) live in; each service still calls it
+from its own constructor, matching how `setProps` is already handled per-service rather than
+centrally.
+
+**Migration.** Adding `ConfiguredName` to every service bumps the HAP configuration number on
+the very next update to an already-paired install — expected, one-time, and self-healing: every
+already-paired controller picks up "accessory database changed, re-fetch it" the same way it
+would for any other plugin update that adds a characteristic. Before this change, a tile
+"rename" in the Home app for these service types had no HAP characteristic to write to at all
+(none of them carried `ConfiguredName`), so there is no prior plugin-visible customization state
+to lose — from this change forward, a rename does write `ConfiguredName`, and the
+`testCharacteristic` guard above is what keeps the next restart's seed step from overwriting it.
+**Needs confirmation on a real paired device**: that the Home app actually re-fetches and shows
+the new distinct labels promptly, and that a rename survives a restart in practice, not just per
+the HAP spec traced through source — flagged as a post-merge follow-up on Casey's paired
+install, not a blocker.

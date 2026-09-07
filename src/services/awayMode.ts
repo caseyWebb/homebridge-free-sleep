@@ -45,6 +45,7 @@ import type { Service } from 'homebridge';
 import { AwayModeBlockedError } from '../pod/awayModeGuard.ts';
 import type { Change, TimerHandle } from '../pod/snapshot.ts';
 import type { Side } from '../pod/types.ts';
+import { CONFIGURED_NAME, seedConfiguredName } from './serviceName.ts';
 import type { ServiceContext } from './types.ts';
 
 export const AWAY_MODE_SUBTYPE = 'awayMode';
@@ -112,6 +113,7 @@ export class AwayModeService {
 
     const existing = accessory.getServiceById(hap.Service.Switch, AWAY_MODE_SUBTYPE);
     this.service = existing ?? accessory.addService(new hap.Service.Switch(AWAY_MODE_NAMES[side], AWAY_MODE_SUBTYPE));
+    seedConfiguredName(this.service, hap, CONFIGURED_NAME.awayMode);
 
     this.wireReadsAndWrites();
 

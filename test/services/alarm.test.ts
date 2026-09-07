@@ -19,7 +19,9 @@ import { SnapshotStore, type Change } from '../../src/pod/snapshot.js';
 import { DeviceStatusSchema, type DeviceStatus, type Settings } from '../../src/pod/types.js';
 import { WriteQueue, type FastPollLane } from '../../src/pod/writeQueue.js';
 import { ALARM_DISMISS_SUBTYPE, ALARM_PRESS_SUBTYPE, AlarmService, isAlarmChange } from '../../src/services/alarm.js';
+import { CONFIGURED_NAME } from '../../src/services/serviceName.js';
 import type { ServiceContext } from '../../src/services/types.js';
+import { captureCharacteristicWarnings } from './configuredNameHelpers.js';
 import { createFakePodClient, type FakePodClient } from '../fakePodClient.js';
 import { FakeHomebridgeApi, FakePlatformAccessory, createFakeLogging } from '../fakeHomebridgeApi.js';
 import { loadFixture } from '../loadFixture.js';
@@ -615,5 +617,41 @@ describe('both alarm services are constructed together, sharing one watched fiel
     new AlarmService(ctx, 'left', 0);
     expect(accessory.services.filter((s) => s.UUID === api.hap.Service.StatelessProgrammableSwitch.UUID)).toHaveLength(1);
     expect(accessory.services.filter((s) => s.UUID === api.hap.Service.Switch.UUID)).toHaveLength(1);
+  });
+});
+
+// ---------------------------------------------------------------------------------------
+// ConfiguredName seeding (release-polish tasks.md 2.2)
+// ---------------------------------------------------------------------------------------
+
+describe('ConfiguredName seeding (2.2)', () => {
+  it('seeds the press switch to "Alarm" and the dismiss switch to "Dismiss Alarm" on first construction', () => {
+    const { ctx, accessory, api } = setup();
+    new AlarmService(ctx, 'left', 0);
+    const press = accessory.services.find((s) => s.UUID === api.hap.Service.StatelessProgrammableSwitch.UUID)!;
+    const dismiss = accessory.getServiceById(api.hap.Service.Switch, ALARM_DISMISS_SUBTYPE)!;
+    expect(press.getCharacteristic(Characteristic.ConfiguredName).value).toBe(CONFIGURED_NAME.alarm);
+    expect(dismiss.getCharacteristic(Characteristic.ConfiguredName).value).toBe(CONFIGURED_NAME.dismissAlarm);
+  });
+
+  it('leaves an existing ConfiguredName (e.g. a controller rename) untouched on reconstruction, for both services', () => {
+    const { ctx, accessory, api } = setup();
+    new AlarmService(ctx, 'left', 0);
+    const press = accessory.getServiceById(api.hap.Service.StatelessProgrammableSwitch, ALARM_PRESS_SUBTYPE)!;
+    const dismiss = accessory.getServiceById(api.hap.Service.Switch, ALARM_DISMISS_SUBTYPE)!;
+    press.getCharacteristic(Characteristic.ConfiguredName).updateValue('Bedroom Alarm');
+    dismiss.getCharacteristic(Characteristic.ConfiguredName).updateValue('Bedroom Dismiss');
+
+    new AlarmService(ctx, 'left', 0); // simulates a restart against the same accessory
+
+    expect(press.getCharacteristic(Characteristic.ConfiguredName).value).toBe('Bedroom Alarm');
+    expect(dismiss.getCharacteristic(Characteristic.ConfiguredName).value).toBe('Bedroom Dismiss');
+  });
+
+  it('adds ConfiguredName to both services without emitting a characteristic-warning event', () => {
+    const { ctx, accessory } = setup();
+    const warnings = captureCharacteristicWarnings(accessory);
+    new AlarmService(ctx, 'left', 0);
+    expect(warnings).toHaveLength(0);
   });
 });

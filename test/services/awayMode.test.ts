@@ -15,7 +15,9 @@ import { SnapshotStore } from '../../src/pod/snapshot.js';
 import { DeviceStatusSchema, SettingsSchema, type DeviceStatus, type Settings } from '../../src/pod/types.js';
 import { WriteQueue } from '../../src/pod/writeQueue.js';
 import { AWAY_MODE_SUBTYPE, AwayModeService, isAwayModeChange } from '../../src/services/awayMode.js';
+import { CONFIGURED_NAME } from '../../src/services/serviceName.js';
 import type { ServiceContext } from '../../src/services/types.js';
+import { captureCharacteristicWarnings } from './configuredNameHelpers.js';
 import { createFakePodClient, type FakePodClient } from '../fakePodClient.js';
 import { FakeHomebridgeApi, FakePlatformAccessory, createFakeLogging } from '../fakeHomebridgeApi.js';
 import { loadFixture } from '../loadFixture.js';
@@ -431,5 +433,36 @@ describe('stop() clears pending timers and rejects an unsubmitted write', () => 
     service.stop();
     await expect(pending).rejects.toThrow();
     expect(timers.pendingCount()).toBe(before);
+  });
+});
+
+// ---------------------------------------------------------------------------------------
+// ConfiguredName seeding (release-polish tasks.md 2.4)
+// ---------------------------------------------------------------------------------------
+
+describe('ConfiguredName seeding (2.4)', () => {
+  it('seeds ConfiguredName to "Away Mode" on first construction', () => {
+    const { ctx, accessory, api } = setup();
+    new AwayModeService(ctx, 'left', 0);
+    const service = accessory.getServiceById(api.hap.Service.Switch, AWAY_MODE_SUBTYPE)!;
+    expect(service.getCharacteristic(Characteristic.ConfiguredName).value).toBe(CONFIGURED_NAME.awayMode);
+  });
+
+  it('leaves an existing ConfiguredName (e.g. a controller rename) untouched on reconstruction', () => {
+    const { ctx, accessory, api } = setup();
+    new AwayModeService(ctx, 'left', 0);
+    const service = accessory.getServiceById(api.hap.Service.Switch, AWAY_MODE_SUBTYPE)!;
+    service.getCharacteristic(Characteristic.ConfiguredName).updateValue('Bedroom Away Mode');
+
+    new AwayModeService(ctx, 'left', 0); // simulates a restart against the same accessory
+
+    expect(service.getCharacteristic(Characteristic.ConfiguredName).value).toBe('Bedroom Away Mode');
+  });
+
+  it('adds ConfiguredName without emitting a characteristic-warning event', () => {
+    const { ctx, accessory } = setup();
+    const warnings = captureCharacteristicWarnings(accessory);
+    new AwayModeService(ctx, 'left', 0);
+    expect(warnings).toHaveLength(0);
   });
 });
