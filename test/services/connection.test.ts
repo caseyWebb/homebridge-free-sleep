@@ -3,6 +3,7 @@ import type { CharacteristicGetHandler } from '@homebridge/hap-nodejs';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { FreeSleepConfigSchema, type FreeSleepConfig } from '../../src/config.js';
+import { AwayModeGuard } from '../../src/pod/awayModeGuard.js';
 import { SnapshotStore } from '../../src/pod/snapshot.js';
 import { DeviceStatusSchema, SchedulesSchema, ServicesSchema, SettingsSchema } from '../../src/pod/types.js';
 import { WriteQueue, type FastPollLane } from '../../src/pod/writeQueue.js';
@@ -48,10 +49,12 @@ function contextFor(setupResult: Setup, config: Record<string, unknown> = {}): S
     services: servicesFixture,
   });
   const fastPollRequests: Array<{ lane: FastPollLane; untilMs: number }> = [];
+  const awayModeGuard = new AwayModeGuard({ snapshot: setupResult.snapshot, policy: 'mirror' });
   const writeQueue = new WriteQueue({
     client: fake.client,
     snapshot: setupResult.snapshot,
     requestFastPoll: (lane, untilMs) => fastPollRequests.push({ lane, untilMs }),
+    awayModeGuard,
     timers: setupResult.timers,
   });
   return {
@@ -62,6 +65,7 @@ function contextFor(setupResult: Setup, config: Record<string, unknown> = {}): S
     accessory: setupResult.accessory as any,
     snapshot: setupResult.snapshot,
     writeQueue,
+    awayModeGuard,
     timers: setupResult.timers,
     config: baseConfig(config),
   };

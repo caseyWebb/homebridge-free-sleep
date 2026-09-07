@@ -16,10 +16,16 @@
 
 import type { Characteristic, Service } from 'homebridge';
 
+import { AwayModeBlockedError } from '../pod/awayModeGuard.ts';
 import { cToF, fToC, TARGET_TEMP_PROPS } from '../pod/temperature.ts';
 import type { Change, EffectiveSideStatus } from '../pod/snapshot.ts';
 import type { Side } from '../pod/types.ts';
 import type { ServiceContext } from './types.ts';
+
+/** How long after a `block`-refused write to correct any characteristic value HAP applied
+ * optimistically ahead of the throw (design.md, "The tile-revert mechanism" — the same pattern
+ * the alarm-dismiss `Switch`'s "accept then quietly revert" already uses). */
+const AWAY_MODE_BLOCKED_REVERT_DELAY_MS = 500;
 
 export const THERMOSTAT_SUBTYPE = 'thermostat';
 
@@ -228,6 +234,11 @@ export class ThermostatService {
       try {
         await this.ctx.writeQueue.submitSide(this.side, { isOn });
       } catch (error) {
+        if (error instanceof AwayModeBlockedError) {
+          this.ctx.log.debug(`FreeSleep: ${this.side} power write refused by the away-mode guard: ${describeError(error)}`);
+          this.scheduleAwayModeRevert();
+          throw new hap.HapStatusError(hap.HAPStatus.NOT_ALLOWED_IN_CURRENT_STATE);
+        }
         this.ctx.log.debug(`FreeSleep: ${this.side} power write failed: ${describeError(error)}`);
         throw new hap.HapStatusError(hap.HAPStatus.SERVICE_COMMUNICATION_FAILURE);
       }
@@ -243,6 +254,11 @@ export class ThermostatService {
       try {
         await this.ctx.writeQueue.submitSide(this.side, { targetTemperatureF: targetF });
       } catch (error) {
+        if (error instanceof AwayModeBlockedError) {
+          this.ctx.log.debug(`FreeSleep: ${this.side} setpoint write refused by the away-mode guard: ${describeError(error)}`);
+          this.scheduleAwayModeRevert();
+          throw new hap.HapStatusError(hap.HAPStatus.NOT_ALLOWED_IN_CURRENT_STATE);
+        }
         this.ctx.log.debug(`FreeSleep: ${this.side} setpoint write failed: ${describeError(error)}`);
         throw new hap.HapStatusError(hap.HAPStatus.SERVICE_COMMUNICATION_FAILURE);
       }
@@ -259,6 +275,21 @@ export class ThermostatService {
       context.displayUnits = value as number;
       this.ctx.api.updatePlatformAccessories([this.ctx.accessory]);
     });
+  }
+
+  /**
+   * Corrects a characteristic value HAP applied optimistically ahead of a `block`-refused write
+   * (design.md, "The tile-revert mechanism"). The mode/temperature shadow (`context.publishedIsOn`
+   * / `context.publishedF`) was already claimed to the *rejected* value before the write was
+   * submitted (`wireWrites`'s "claim into the shadow" comments), so by the time this fires the
+   * shadow disagrees with the cached snapshot (which a `block` refusal never touches) — `refresh`
+   * ordinarily suppresses a push when the shadow already agrees with what it's about to push, but
+   * here it doesn't, so it pushes the reversion exactly like any other genuinely divergent
+   * observation. Scheduled via the shared injected `TimerApi`, not a bare `setTimeout` (design.md;
+   * `src/services/types.ts`'s module doc) — deterministic under a test's fake/manual timers.
+   */
+  private scheduleAwayModeRevert(): void {
+    this.ctx.timers.setTimeout(() => this.refresh(), AWAY_MODE_BLOCKED_REVERT_DELAY_MS);
   }
 
   // ---------------------------------------------------------------------------------------

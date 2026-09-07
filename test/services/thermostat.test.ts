@@ -3,6 +3,7 @@ import type { CharacteristicGetHandler, CharacteristicSetHandler } from '@homebr
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { FreeSleepConfigSchema, type FreeSleepConfig } from '../../src/config.js';
+import { AwayModeGuard } from '../../src/pod/awayModeGuard.js';
 import { SnapshotStore } from '../../src/pod/snapshot.js';
 import { cToF, F_MAX, F_MIN, fToC } from '../../src/pod/temperature.js';
 import { DeviceStatusSchema, type DeviceStatus, type Settings } from '../../src/pod/types.js';
@@ -53,13 +54,19 @@ function setup(options: { config?: Record<string, unknown>; observe?: boolean } 
     services: servicesFixture as any,
   });
   const fastPollRequests: Array<{ lane: FastPollLane; untilMs: number }> = [];
+  const config = baseConfig(options.config);
+  // Built from the same config key `platform.ts` reads (`awayModeWritePolicy`) and the same
+  // shared `snapshot` — matching real wiring, so a test can flip the policy or seed away mode
+  // via `options.config`/`snapshot.observeSettings` and see `writeQueue`'s own dispatch-time
+  // guard react exactly as it would in production.
+  const awayModeGuard = new AwayModeGuard({ snapshot, policy: config.awayModeWritePolicy });
   const writeQueue = new WriteQueue({
     client: fake.client,
     snapshot,
     requestFastPoll: (lane, untilMs) => fastPollRequests.push({ lane, untilMs }),
+    awayModeGuard,
     timers,
   });
-  const config = baseConfig(options.config);
   const ctx: ServiceContext = {
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     api: api.asApi() as any,
@@ -68,6 +75,7 @@ function setup(options: { config?: Record<string, unknown>; observe?: boolean } 
     accessory: accessory as any,
     snapshot,
     writeQueue,
+    awayModeGuard,
     timers,
     config,
   };
@@ -444,6 +452,58 @@ describe('write failure surfaces as SERVICE_COMMUNICATION_FAILURE (4.2)', () => 
     const assertion = expect(pending).rejects.toMatchObject({ hapStatus: hap.HAPStatus.SERVICE_COMMUNICATION_FAILURE });
     await vi.advanceTimersByTimeAsync(400);
     await assertion;
+  });
+});
+
+describe('away-mode block maps to NOT_ALLOWED_IN_CURRENT_STATE and reverts the tile (3.2, 3.3)', () => {
+  it("a mode write blocked by the away-mode guard throws NOT_ALLOWED_IN_CURRENT_STATE, distinct from SERVICE_COMMUNICATION_FAILURE, and the Pod receives nothing", async () => {
+    const { ctx, fake } = setup({ config: { awayModeWritePolicy: 'block' } });
+    const hap = ctx.api.hap;
+    ctx.snapshot.observeSettings({ ...structuredClone(settingsFixture), right: { ...settingsFixture.right, awayMode: true } });
+    const { setHandlers } = build(ctx, 'left');
+
+    const pending = setHandlers.get(UUID.targetState)!(hap.Characteristic.TargetHeatingCoolingState.AUTO, {} as never, undefined);
+    const assertion = expect(pending).rejects.toMatchObject({ hapStatus: hap.HAPStatus.NOT_ALLOWED_IN_CURRENT_STATE });
+    await vi.advanceTimersByTimeAsync(400);
+    await assertion;
+    expect(fake.postDeviceStatusCalls).toHaveLength(0);
+  });
+
+  it('a setpoint write blocked by the away-mode guard throws the same distinct status', async () => {
+    const { ctx, fake } = setup({ config: { awayModeWritePolicy: 'block' } });
+    const hap = ctx.api.hap;
+    ctx.snapshot.observeSettings({ ...structuredClone(settingsFixture), right: { ...settingsFixture.right, awayMode: true } });
+    const { setHandlers } = build(ctx, 'left');
+
+    const pending = setHandlers.get(UUID.targetTemp)!(fToC(70), {} as never, undefined);
+    const assertion = expect(pending).rejects.toMatchObject({ hapStatus: hap.HAPStatus.NOT_ALLOWED_IN_CURRENT_STATE });
+    await vi.advanceTimersByTimeAsync(400);
+    await assertion;
+    expect(fake.postDeviceStatusCalls).toHaveLength(0);
+  });
+
+  it('~500ms after a blocked setpoint write, the characteristic is corrected back to the cached snapshot value', async () => {
+    const { ctx, fake } = setup({ config: { awayModeWritePolicy: 'block' } });
+    const hap = ctx.api.hap;
+    ctx.snapshot.observeSettings({ ...structuredClone(settingsFixture), right: { ...settingsFixture.right, awayMode: true } });
+    const { setHandlers } = build(ctx, 'left');
+    const svc = ctx.accessory.getServiceById(hap.Service.Thermostat, THERMOSTAT_SUBTYPE)!;
+    const spy = vi.spyOn(svc.getCharacteristic(hap.Characteristic.TargetTemperature), 'updateValue');
+    // Deliberately no `ctx.snapshot.subscribe(() => service.refresh())` here (contrast with
+    // "failed-write revert (5.4)" above) — isolating this test to *only* the explicit
+    // `scheduleAwayModeRevert` timer this change adds (task 3.3), not the platform-level
+    // snapshot-subscription revert `handleSnapshotChanges` provides in real wiring.
+
+    const pending = setHandlers.get(UUID.targetTemp)!(fToC(70), {} as never, undefined);
+    const assertion = expect(pending).rejects.toMatchObject({ hapStatus: hap.HAPStatus.NOT_ALLOWED_IN_CURRENT_STATE });
+    await vi.advanceTimersByTimeAsync(400); // debounce flush -> dispatch -> guard blocks
+    await assertion;
+    expect(spy).not.toHaveBeenCalled(); // not yet — nothing has called refresh() at this point
+
+    await vi.advanceTimersByTimeAsync(500); // the scheduled corrective refresh fires
+    expect(spy).toHaveBeenCalledTimes(1);
+    expect(spy).toHaveBeenCalledWith(fToC(deviceStatusFixture.left.targetTemperatureF));
+    void fake;
   });
 });
 

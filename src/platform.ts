@@ -7,10 +7,10 @@
  * stable UUID/SerialNumber derivation from the *configured* host, `configureAccessory`
  * restore with prune-on-restore, unregistering the unused side when `sides !== 'both'`,
  * one-time display-name seeding from `GET /api/settings`, the bail-without-host startup
- * guard, and — new in this change — constructing and owning the snapshot store, poller and
- * write queue for the whole platform's lifetime, bootstrapping before any HAP handler is
- * registered, routing snapshot change events to the services that publish them, and stopping
- * everything on Homebridge shutdown (design.md, "Platform wiring").
+ * guard, and constructing and owning the snapshot store, poller, write queue and (as of the
+ * away-mode-guard change) away-mode guard for the whole platform's lifetime, bootstrapping
+ * before any HAP handler is registered, routing snapshot change events to the services that
+ * publish them, and stopping everything on Homebridge shutdown (design.md, "Platform wiring").
  *
  * Per docs/HOMEKIT.md's Homebridge 2.x API notes: HAP **types** come from `homebridge`;
  * runtime enums/classes always come from `api.hap`, never a direct `@homebridge/hap-nodejs`
@@ -38,6 +38,7 @@ import type {
   SettingsPatch,
   Side,
 } from './pod/types.ts';
+import { AwayModeGuard } from './pod/awayModeGuard.ts';
 import { DEFAULT_TIMEOUT_MS, PodClient, RETRY_BASE_DELAY_MS, RETRY_JITTER_MS } from './pod/client.ts';
 import { PodPoller } from './pod/poller.ts';
 import { defaultTimerApi, SnapshotStore, type Change, type TimerApi } from './pod/snapshot.ts';
@@ -168,6 +169,9 @@ export class FreeSleepPlatform implements DynamicPlatformPlugin {
   private readonly snapshot: SnapshotStore | undefined;
   private readonly poller: PodPoller | undefined;
   private readonly writeQueue: WriteQueue | undefined;
+  /** Consulted by `writeQueue` itself on every side-lane dispatch (away-mode-guard change,
+   * tech-lead resolution 2) — also threaded through `ServiceContext` (see `serviceContextFor`). */
+  private readonly awayModeGuard: AwayModeGuard | undefined;
   private unsubscribeSnapshot: (() => void) | undefined;
 
   private readonly thermostats = new Map<Side, ThermostatService>();
@@ -229,6 +233,13 @@ export class FreeSleepPlatform implements DynamicPlatformPlugin {
     });
     this.poller = poller;
 
+    // One `AwayModeGuard` per launch, sharing the same snapshot — consulted by `writeQueue`
+    // itself on every side-lane dispatch, regardless of which service originates the write
+    // (away-mode-guard change, tech-lead resolution 2: enforcement lives inside `WriteQueue`,
+    // not in a front-door wrapper a caller could forget to use).
+    const awayModeGuard = new AwayModeGuard({ snapshot, policy: parsed.data.awayModeWritePolicy });
+    this.awayModeGuard = awayModeGuard;
+
     const fastPollIntervalMs = pollOptions.fastPollIntervalMs ?? DEFAULT_FAST_POLL_INTERVAL_MS;
     const writeQueue = new WriteQueue({
       client: client as unknown as PodClient,
@@ -243,6 +254,7 @@ export class FreeSleepPlatform implements DynamicPlatformPlugin {
           void poller.refresh('settings');
         }
       },
+      awayModeGuard,
       timers: this.timers,
       ...(pollOptions.writeDebounceMs !== undefined ? { writeDebounceMs: pollOptions.writeDebounceMs } : {}),
       ...(pollOptions.writeMaxDebounceMs !== undefined ? { writeMaxDebounceMs: pollOptions.writeMaxDebounceMs } : {}),
@@ -295,13 +307,14 @@ export class FreeSleepPlatform implements DynamicPlatformPlugin {
   }
 
   private serviceContextFor(accessory: PlatformAccessory): ServiceContext | undefined {
-    if (!this.config || !this.snapshot || !this.writeQueue) return undefined;
+    if (!this.config || !this.snapshot || !this.writeQueue || !this.awayModeGuard) return undefined;
     return {
       api: this.api,
       log: this.log,
       accessory,
       snapshot: this.snapshot,
       writeQueue: this.writeQueue,
+      awayModeGuard: this.awayModeGuard,
       timers: this.timers,
       config: this.config,
     };

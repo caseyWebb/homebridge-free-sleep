@@ -112,7 +112,7 @@
         "default": true
       },
       "awayModeWritePolicy": {
-        "title": "Away-mode write policy (reserved, no effect yet)",
+        "title": "Away-mode write policy — governs a write to either side while one side has away mode on: mirror the change to the other side's cached state, or block the write",
         "type": "string",
         "default": "mirror",
         "oneOf": [
