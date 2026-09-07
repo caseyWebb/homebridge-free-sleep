@@ -41,6 +41,20 @@ configuration currently enables. No accessory SHALL carry a service outside that
   water-level sensors on the second — with no accessory unregistered, since the hub itself
   still has enabled services
 
+#### Scenario: Fresh install with occupancy configured publishes the sensor per side
+
+- **WHEN** the platform starts with `host` configured, `sides: 'both'`, `occupancySource` set
+  to `'presence'` or `'vitals'`, and no accessories in the Homebridge cache
+- **THEN** exactly three accessories are registered; each side accessory has
+  `AccessoryInformation`, one thermostat, and one occupancy sensor; and the hub has
+  `AccessoryInformation`, one contact sensor, and one water-level sensor
+
+#### Scenario: Fresh install with occupancy off publishes no occupancy sensor
+
+- **WHEN** the platform starts with `occupancySource: 'none'` (the default)
+- **THEN** neither side accessory carries an occupancy sensor, and every other aspect of the
+  three-accessory topology is unchanged from before this capability existed
+
 ### Requirement: Restoring from the accessory cache never duplicates, and prunes what is no longer enabled
 
 On every launch, the platform SHALL reconcile the Homebridge accessory cache against the
@@ -63,6 +77,27 @@ accessory itself or its `AccessoryInformation` service.
   enabled set for that accessory
 - **THEN** that service is removed from the accessory during restore, and the accessory's
   `AccessoryInformation` service and its other still-enabled services are unaffected
+
+#### Scenario: Enabling occupancy on restart adds the service without duplicating others
+
+- **WHEN** the platform previously ran with `occupancySource: 'none'` and is restarted with
+  `occupancySource: 'presence'`
+- **THEN** each enabled side accessory gains exactly one occupancy sensor, and its existing
+  thermostat is unaffected and not duplicated
+
+#### Scenario: Disabling occupancy on restart prunes the service
+
+- **WHEN** the platform previously ran with a non-`'none'` `occupancySource` and is restarted
+  with `occupancySource: 'none'`
+- **THEN** the occupancy sensor is removed from every side accessory that carried it, and that
+  accessory's `AccessoryInformation` and thermostat are unaffected
+
+#### Scenario: Switching between non-none sources changes neither the accessory nor its service count
+
+- **WHEN** the platform previously ran with `occupancySource: 'presence'` and is restarted with
+  `occupancySource: 'vitals'`
+- **THEN** the same occupancy sensor service is reused on each side accessory — it is neither
+  removed nor duplicated — and only what drives its reported value changes
 
 #### Scenario: Disabling a hub service in config prunes it without touching the hub accessory
 

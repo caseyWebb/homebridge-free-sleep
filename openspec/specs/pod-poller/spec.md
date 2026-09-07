@@ -16,9 +16,13 @@ many accessories, services, or characteristics depend on the data. Consumers SHA
 values from the cached snapshot rather than by requesting a read.
 
 The endpoint classes polled by this capability SHALL be the device status, the settings, the
-schedules, and the services endpoints. The set of classes SHALL be extensible by describing a
-new class — its endpoint, its base interval, and the condition under which it is enabled —
-without altering the scheduling, jitter, backoff, or in-flight machinery.
+schedules, the services, and the subsystem-health endpoints. The subsystem-health class SHALL
+be enabled only while the server-fault sensor is configured on; while disabled, its schedule
+SHALL continue to run but SHALL issue no request, exactly as this capability's existing
+enabled-predicate extension point already allows for any class. The set of classes SHALL
+remain extensible by describing a new class — its endpoint, its base interval, and the
+condition under which it is enabled — without altering the scheduling, jitter, backoff, or
+in-flight machinery.
 
 #### Scenario: Many consumers, one request
 
@@ -32,11 +36,23 @@ without altering the scheduling, jitter, backoff, or in-flight machinery.
 - **THEN** each is requested on its own cadence, and neither's timing is affected by the
   other's
 
+#### Scenario: The subsystem-health class polls only while its sensor is enabled
+
+- **WHEN** the server-fault sensor is disabled and a polling period for the subsystem-health
+  class elapses
+- **THEN** no subsystem-health request is issued, and the class's own schedule continues
+  running so that enabling the sensor later resumes polling without restarting the plugin
+
+#### Scenario: Enabling the server-fault sensor resumes subsystem-health polling
+
+- **WHEN** the server-fault sensor is enabled at startup
+- **THEN** the subsystem-health class is polled on its own cadence from that launch onward
+
 ### Requirement: Poll intervals are configurable within enforced bounds
 
 The base interval SHALL be approximately 30 seconds for the device-status class and
-approximately 5 minutes for the settings, schedules and services classes. Both SHALL be
-configurable.
+approximately 5 minutes for the settings, schedules, services, and subsystem-health classes.
+Both the fast and slow base intervals SHALL be configurable.
 
 A configured device-status interval below 5 seconds SHALL be rejected and replaced with the
 5 second minimum, and a configured slow-class interval below 60 seconds SHALL likewise be
@@ -53,6 +69,12 @@ SHALL ever be shorter than a hard floor of 3 seconds.
 
 - **WHEN** any mechanism requests an interval below 3 seconds
 - **THEN** the effective interval is 3 seconds
+
+#### Scenario: The subsystem-health class shares the slow-class interval configuration
+
+- **WHEN** the slow-class base interval is configured to a non-default value
+- **THEN** the subsystem-health class, like settings, schedules, and services, polls at that
+  configured interval when its sensor is enabled
 
 ### Requirement: Every interval carries jitter from an injected randomness source
 
@@ -303,3 +325,56 @@ the in-flight suppression fails loudly rather than silently overloading the hard
 
 - **WHEN** the snapshot read path is changed so that each read triggers a device-status request
 - **THEN** the session exceeds the budget and the test fails
+
+### Requirement: Presence and vitals are polled only for the configured occupancy source, and only once biometrics is confirmed enabled
+
+The poller SHALL support a presence endpoint class, polled at approximately 30 seconds, and a
+vitals endpoint class, polled at approximately 60 seconds. Each SHALL be enabled only while
+both of the following hold: the configured occupancy source names that class's endpoint, and
+the most recently observed services document reports biometrics as enabled. Before any services
+document has been observed, biometrics SHALL be treated as not enabled.
+
+Neither class SHALL be polled when the configured occupancy source names neither of them, or
+names the other one.
+
+#### Scenario: Neither class polls when occupancy is off
+
+- **WHEN** the occupancy source is configured as none
+- **THEN** neither the presence class nor the vitals class ever issues a request
+
+#### Scenario: Only the configured source's class polls
+
+- **WHEN** the occupancy source is configured as presence, and biometrics is confirmed enabled
+- **THEN** the presence class polls on its own schedule and the vitals class never polls
+
+#### Scenario: Biometrics must be confirmed, not merely unknown
+
+- **WHEN** the occupancy source names a class, and no services document has yet been
+  successfully observed
+- **THEN** that class does not poll, until a services observation confirms biometrics enabled
+
+#### Scenario: Biometrics turning off stops polling and turning it back on resumes it
+
+- **WHEN** a previously-enabled class's occupancy source is unchanged, and a later services
+  observation reports biometrics no longer enabled, and a still later one reports it enabled
+  again
+- **THEN** the class stops polling after the first change and resumes polling on its own
+  schedule after the second, with no restart required
+
+### Requirement: The vitals poll requests a single, fixed, recent window covering both sides
+
+Each poll of the vitals class SHALL request a bounded, recent time window ending at the time of
+the request, without restricting the request to one side, so that one request serves the
+occupancy computation for both sides.
+
+#### Scenario: One request serves both sides
+
+- **WHEN** the vitals class polls
+- **THEN** exactly one request is made, and its response is used to derive both sides' vitals-
+  based occupancy
+
+#### Scenario: The requested window is bounded and recent
+
+- **WHEN** the vitals class's request is inspected
+- **THEN** it requests a window ending at the time of the request and extending back a fixed,
+  short duration, not an unbounded history

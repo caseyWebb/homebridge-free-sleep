@@ -38,29 +38,105 @@ present from a previous launch.
 When `sides` is `'both'` (the default) and `host` is configured, the platform SHALL publish
 exactly three bridged accessories: `Pod Left`, `Pod Right`, and `Pod` (the hub). Each SHALL
 carry `AccessoryInformation` plus exactly the services its role currently enables: a side
-accessory carries its thermostat, and the hub carries the connection contact sensor. No
-accessory SHALL carry a service outside that enabled set.
+accessory carries its thermostat, its alarm programmable switch, and its dismiss switch; the
+hub carries the connection contact sensor. No accessory SHALL carry a service outside that
+enabled set.
 
 #### Scenario: Fresh install publishes three accessories with their services
 
 - **WHEN** the platform starts with `host` configured, `sides: 'both'`, and no accessories in
   the Homebridge cache
 - **THEN** exactly three accessories are registered, named `Pod Left`, `Pod Right`, and `Pod`;
-  each side accessory has `AccessoryInformation` and one thermostat; and the hub has
-  `AccessoryInformation` and one contact sensor
+  each side accessory has `AccessoryInformation`, one thermostat, one alarm programmable switch,
+  and one dismiss switch; and the hub has `AccessoryInformation` and one contact sensor
 
 #### Scenario: No service outside the enabled set is added
 
 - **WHEN** any of the three accessories is inspected after startup
 - **THEN** it exposes only `AccessoryInformation` and the services its role enables, and in
-  particular no side accessory carries a sensor and the hub carries no thermostat
+  particular no side accessory carries a sensor and the hub carries no thermostat, alarm
+  programmable switch, or dismiss switch
 
 #### Scenario: Narrowing sides removes that side's services with its accessory
 
 - **WHEN** the platform previously ran with `sides: 'both'` and is restarted with `sides:
   'left'`
-- **THEN** `Pod Right` and the thermostat it carried are gone, and `Pod Left` and the hub keep
-  their services
+- **THEN** `Pod Right` and the services it carried (including its alarm programmable switch and
+  dismiss switch) are gone, and `Pod Left` and the hub keep their services
+
+#### Scenario: Fresh install with occupancy configured publishes the sensor per side
+
+- **WHEN** the platform starts with `host` configured, `sides: 'both'`, `occupancySource` set
+  to `'presence'` or `'vitals'`, and no accessories in the Homebridge cache
+- **THEN** exactly three accessories are registered; each side accessory has
+  `AccessoryInformation`, one thermostat, one occupancy sensor, one alarm programmable switch,
+  and one dismiss switch; and the hub has `AccessoryInformation` and one contact sensor
+
+#### Scenario: Fresh install with occupancy off publishes no occupancy sensor
+
+- **WHEN** the platform starts with `occupancySource: 'none'` (the default)
+- **THEN** neither side accessory carries an occupancy sensor, and every other aspect of the
+  three-accessory topology is unchanged from before this capability existed
+
+#### Scenario: The hub's enabled set grows and shrinks with its own configuration
+
+- **WHEN** the platform starts with the prime-switch, LED, test-alarm, and server-fault
+  configuration values all enabled, and is later restarted with all four disabled
+- **THEN** the hub carries all four additional services (plus the always-present connection
+  and water-level sensors) on the first launch, and carries only the connection and
+  water-level sensors on the second — with no accessory unregistered, since the hub itself
+  still has enabled services
+
+### Requirement: Restoring from the accessory cache never duplicates, and prunes what is no longer enabled
+
+On every launch, the platform SHALL reconcile the Homebridge accessory cache against the
+currently-enabled set of accessories and services rather than unconditionally creating new
+ones. An accessory whose UUID is already in the cache SHALL be reused, not re-created and
+not re-registered. Any service present on a cached accessory whose subtype is not part of
+the currently-enabled set SHALL be removed from that accessory, without removing the
+accessory itself or its `AccessoryInformation` service.
+
+#### Scenario: Unchanged config restarts without duplication
+
+- **WHEN** the platform restarts with the same `host`, `sides`, and hub-service configuration
+  as the previous launch, and all expected accessories are already in the Homebridge cache
+- **THEN** no new accessory is registered, no cached accessory is unregistered, and the set
+  of accessory UUIDs after restart is identical to the set before restart
+
+#### Scenario: A no-longer-enabled service is pruned on restore
+
+- **WHEN** a cached accessory carries a service whose subtype is not in the current
+  enabled set for that accessory
+- **THEN** that service is removed from the accessory during restore, and the accessory's
+  `AccessoryInformation` service and its other still-enabled services are unaffected
+
+#### Scenario: Enabling occupancy on restart adds the service without duplicating others
+
+- **WHEN** the platform previously ran with `occupancySource: 'none'` and is restarted with
+  `occupancySource: 'presence'`
+- **THEN** each enabled side accessory gains exactly one occupancy sensor, and its existing
+  thermostat is unaffected and not duplicated
+
+#### Scenario: Disabling occupancy on restart prunes the service
+
+- **WHEN** the platform previously ran with a non-`'none'` `occupancySource` and is restarted
+  with `occupancySource: 'none'`
+- **THEN** the occupancy sensor is removed from every side accessory that carried it, and that
+  accessory's `AccessoryInformation` and thermostat are unaffected
+
+#### Scenario: Switching between non-none sources changes neither the accessory nor its service count
+
+- **WHEN** the platform previously ran with `occupancySource: 'presence'` and is restarted with
+  `occupancySource: 'vitals'`
+- **THEN** the same occupancy sensor service is reused on each side accessory — it is neither
+  removed nor duplicated — and only what drives its reported value changes
+
+#### Scenario: Disabling a hub service in config prunes it without touching the hub accessory
+
+- **WHEN** the hub previously carried the LED lightbulb (LED enabled in configuration) and the
+  platform restarts with LED disabled
+- **THEN** the LED lightbulb is removed from the hub accessory during restore, and the hub
+  accessory itself, its connection sensor, and its water-level sensor are unaffected
 
 ### Requirement: Accessory identity is derived from the configured host, not runtime network state
 
@@ -89,29 +165,6 @@ name currently resolves to.
 - **THEN** the derived UUIDs and `SerialNumber`s for all three accessories differ from
   those derived under the previous host — a deliberate new identity, documented as
   expected rather than a defect
-
-### Requirement: Restoring from the accessory cache never duplicates, and prunes what is no longer enabled
-
-On every launch, the platform SHALL reconcile the Homebridge accessory cache against the
-currently-enabled set of accessories and services rather than unconditionally creating new
-ones. An accessory whose UUID is already in the cache SHALL be reused, not re-created and
-not re-registered. Any service present on a cached accessory whose subtype is not part of
-the currently-enabled set SHALL be removed from that accessory, without removing the
-accessory itself or its `AccessoryInformation` service.
-
-#### Scenario: Unchanged config restarts without duplication
-
-- **WHEN** the platform restarts with the same `host` and `sides` configuration as the
-  previous launch, and all expected accessories are already in the Homebridge cache
-- **THEN** no new accessory is registered, no cached accessory is unregistered, and the set
-  of accessory UUIDs after restart is identical to the set before restart
-
-#### Scenario: A no-longer-enabled service is pruned on restore
-
-- **WHEN** a cached accessory carries a service whose subtype is not in the current
-  enabled set for that accessory
-- **THEN** that service is removed from the accessory during restore, and the accessory's
-  `AccessoryInformation` service and its other still-enabled services are unaffected
 
 ### Requirement: The `sides` option controls which side accessories exist
 
@@ -177,17 +230,18 @@ or restart, regardless of whether the Pod becomes reachable or its configured na
 
 ### Requirement: The platform owns the poll and write lifecycle, and observes the Pod before wiring handlers
 
-The platform SHALL construct exactly one cached-snapshot store, one poller and one write path
-per launch, and SHALL share them across every accessory and service it publishes. It SHALL
-perform its bootstrap observation of the Pod, and SHALL wait for that bootstrap to settle,
-before registering any read or write handler — so that the first read a controller makes has
-real data rather than a placeholder.
+The platform SHALL construct exactly one cached-snapshot store, one poller, one write path, and
+one alarm-window scheduler per launch, and SHALL share the snapshot store across every
+accessory and service it publishes. It SHALL perform its bootstrap observation of the Pod, and
+SHALL wait for that bootstrap to settle, before registering any read or write handler — so that
+the first read a controller makes has real data rather than a placeholder.
 
 A bootstrap that fails or times out SHALL NOT prevent the platform from publishing its
 accessories or from starting recurring polling.
 
-When Homebridge shuts down, the platform SHALL stop polling and stop the write path, leaving no
-pending timer and no in-flight work that could still touch HomeKit.
+When Homebridge shuts down, the platform SHALL stop polling, stop the write path, and stop the
+alarm-window scheduler, leaving no pending timer and no in-flight work that could still touch
+HomeKit.
 
 #### Scenario: One poller serves every service
 
@@ -210,14 +264,15 @@ pending timer and no in-flight work that could still touch HomeKit.
 #### Scenario: Shutdown releases everything
 
 - **WHEN** Homebridge shuts down
-- **THEN** polling stops, the write path stops, no timer remains scheduled, and the process can
-  exit without an open handle
+- **THEN** polling stops, the write path stops, the alarm-window scheduler stops, no timer
+  remains scheduled, and the process can exit without an open handle
 
 ### Requirement: Observed changes are routed to the services that publish them
 
 The platform SHALL subscribe to the cached view's change notifications once, and SHALL route
-each reported change to the service that publishes the affected characteristic — a side's change
-to that side's thermostat, a reachability change to the hub's connection sensor. A change to a
+each reported change to the service that publishes the affected characteristic — a side's
+temperature or power change to that side's thermostat, a side's alarm-vibration change to that
+side's alarm services, and a reachability change to the hub's connection sensor. A change to a
 field no published service publishes SHALL be ignored without error.
 
 Routing SHALL be the only mechanism by which a published characteristic is updated from observed
@@ -229,22 +284,43 @@ state; no service SHALL poll or re-read on its own.
 - **THEN** the left side's thermostat is updated and the right side's thermostat receives no
   update
 
+#### Scenario: A side's alarm-vibration change reaches that side's alarm services
+
+- **WHEN** an observation changes a side's alarm-vibrating state
+- **THEN** that side's alarm programmable switch and dismiss switch are updated as their own
+  requirements specify, and no other side's or the hub's services receive an update as a result
+
 #### Scenario: A reachability change reaches the hub
 
 - **WHEN** an observation changes the Pod's reachability
-- **THEN** the hub's connection sensor is updated and no thermostat characteristic is updated as
-  a result
+- **THEN** the hub's connection sensor is updated and no thermostat or alarm-service
+  characteristic is updated as a result
 
 #### Scenario: An unpublished field is ignored
 
 - **WHEN** a change is reported for a field no published service publishes
 - **THEN** no update is pushed and no error is raised
 
+#### Scenario: A side's occupancy change reaches only that side's occupancy sensor
+
+- **WHEN** an observation changes the left side's vitals-derived occupancy or its presence
+  trust flag
+- **THEN** the left side's occupancy sensor is updated, the right side's occupancy sensor
+  receives no update, and no thermostat or alarm-service characteristic is updated as a result
+
+#### Scenario: An occupancy change is ignored when the sensor is not published
+
+- **WHEN** `occupancySource` is `'none'` and an observation nonetheless reports a presence or
+  vitals value (for example, because a previous configuration's poll is still draining)
+- **THEN** no update is pushed anywhere and no error is raised
+
 #### Scenario: A failing service does not stop the others
 
-- **WHEN** one service throws while handling a change notification
-- **THEN** the other services still receive that notification, the failure is logged, and
-  subsequent notifications are still delivered to all of them
+- **WHEN** one service, including an occupancy sensor, throws while handling a change
+  notification
+- **THEN** the other services — including the other side's occupancy sensor and alarm services
+  — still receive that notification, the failure is logged, and subsequent notifications are
+  still delivered to all of them
 
 ### Requirement: A simulated Home-app session against a mock Pod stays within its request budget
 

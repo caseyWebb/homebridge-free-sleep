@@ -36,6 +36,34 @@ modification.
 - **THEN** validation succeeds, the parsed config carries that value unchanged, and no
   accessory topology, identity, or restore behavior in this change differs as a result
 
+#### Scenario: `awayModeWritePolicy` is preserved and now acted on
+
+- **WHEN** `awayModeWritePolicy` is given a valid, non-default value (`'block'`)
+- **THEN** validation succeeds, the parsed config carries that value, and a side write
+  attempted while either side is in away mode is governed by that value rather than by the
+  default `'mirror'` behavior
+
+#### Scenario: Changing this key's shape cost nothing, because nothing read it before now
+
+- **WHEN** comparing the config schema's `awayModeWritePolicy` enum and default as they exist
+  now against any earlier, pre-implementation description of the same key
+- **THEN** no migration of a deployed config is required, because no shipped behavior ever
+  branched on this key's value before this change
+
+#### Scenario: `occupancySource` is preserved and now acted on
+
+- **WHEN** `occupancySource` is given a valid, non-default value (`'presence'` or `'vitals'`)
+- **THEN** validation succeeds, the parsed config carries that value, and each enabled side
+  accessory publishes an occupancy sensor driven by that source instead of publishing none
+
+#### Scenario: The default value changes nothing, because nothing read it before now
+
+- **WHEN** comparing accessory topology under the default `occupancySource: 'none'` as it
+  behaves now against how it behaved before this change shipped
+- **THEN** the two are identical — no migration of a deployed config is required, because the
+  default value produces the same "no occupancy sensor" outcome the key's prior, unconsumed
+  state always produced
+
 ## ADDED Requirements
 
 ### Requirement: `waterLowSensorType` is consumed, and stays a two-value enum
