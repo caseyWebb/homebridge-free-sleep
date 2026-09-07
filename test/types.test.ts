@@ -192,6 +192,24 @@ describe('ServerStatusSchema', () => {
     }
   });
 
+  // N2 (hub-accessory PR #44 review): `biometricsInstallation` is NOT gated by
+  // `biometrics.enabled` upstream (`server/src/serverStatus.ts`'s `updateServices()` sets it
+  // unconditionally, before the `if (servicesDB.data.biometrics.enabled)` guard that gates its
+  // five siblings) — so the fixture carries it present even while the other five stay absent,
+  // and that combination must parse.
+  it('biometricsInstallation is present even while every other biometrics-gated key is absent', () => {
+    const result = ServerStatusSchema.safeParse(loadFixture('serverStatus.json'));
+    expect(result.success).toBe(true);
+    if (result.success) {
+      expect(result.data.biometricsInstallation?.status).toBe('healthy');
+      expect(result.data.analyzeSleepLeft).toBeUndefined();
+      expect(result.data.analyzeSleepRight).toBeUndefined();
+      expect(result.data.biometricsStream).toBeUndefined();
+      expect(result.data.biometricsCalibrationLeft).toBeUndefined();
+      expect(result.data.biometricsCalibrationRight).toBeUndefined();
+    }
+  });
+
   it('still parses when a biometrics-gated key is present', () => {
     const serverStatus = loadFixture('serverStatus.json') as Record<string, unknown>;
     const withBiometrics = {
@@ -249,6 +267,20 @@ describe('AlarmRequestSchema', () => {
   it('rejects an out-of-bounds duration', () => {
     const result = AlarmRequestSchema.safeParse({ ...validRequest, duration: 181 });
     expect(result.success).toBe(false);
+  });
+
+  // N1 (hub-accessory PR #44 review): matches upstream's own
+  // `server/src/db/schedulesSchema.ts`'s `AlarmSchema.duration` —
+  // `z.number().int().positive().min(0).max(180)` — whose binding lower bound is `.positive()`,
+  // not the redundant `.min(0)`, so `0` itself is rejected and `1` is the smallest valid value.
+  it('rejects a duration of 0', () => {
+    const result = AlarmRequestSchema.safeParse({ ...validRequest, duration: 0 });
+    expect(result.success).toBe(false);
+  });
+
+  it.each([1, 180])('accepts a boundary duration (%d)', (duration) => {
+    const result = AlarmRequestSchema.safeParse({ ...validRequest, duration });
+    expect(result.success).toBe(true);
   });
 
   it('rejects an unknown key', () => {

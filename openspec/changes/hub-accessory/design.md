@@ -225,30 +225,77 @@ at `bootstrapTimeoutMs`, default 10 s, so this window is short-lived).
 `accessory.context.lastNonZeroBrightness ?? 100` (persisted the same way the thermostat's
 `publishedF` shadow already is, per `docs/HOMEKIT.md`). `On=false` writes `ledBrightness: 0`
 (no separate on/off bit exists in `settings` — brightness *is* the power state, matching
-upstream's own `LedBrightnessSlider.tsx` model, cited in `docs/POD-API.md`).
+upstream's own `LedBrightnessSlider.tsx` model, cited in `docs/POD-API.md`). **N3 (PR #44
+review):** `lastNonZeroBrightness` is seeded from the currently-*observed* brightness at
+off-write time (still the pre-write cached value at that point), not only from a value this
+plugin itself explicitly wrote — an off-write following an externally-changed brightness (e.g.
+free-sleep's own web UI set it to 30, never routed through this plugin's own write path) restores
+that 30 on the next on-write, not the plugin-write default of 100.
 
-### 6. "Pod Test Alarm" is a fire-and-forget write; `PodClient.postAlarm` never retries
+**S4 (PR #44 review, tech-lead ruling — implemented, not merely documented as a known
+limitation):** the read-modify-write above originally read `ctx.snapshot.get().documents
+.deviceStatus?.settings` at HomeKit-write (submission) time, inside `LedService` itself — up to
+`pollIntervalMs` (default ~30s) stale. A gain changed externally (free-sleep's own web UI) inside
+that window, followed by an unrelated HomeKit brightness write, would silently overwrite the
+Pod's fresher, externally-set gain with this plugin's stale cached one — a real instance of the
+"corrupting biometrics gain settings" failure mode this whole decision exists to avoid, just
+triggered by staleness rather than a bare partial POST.
+
+**Fix:** `LedService` now submits only the field it is actually changing (`{ledBrightness}`);
+`WriteQueue.dispatch()`'s `device`-lane branch performs the "clone current, merge, post whole"
+step itself, immediately before dispatch, after first awaiting a bounded `refreshDeviceStatus()`
+callback (the same lane-aware callback-injection pattern `requestFastPoll` already establishes,
+wired to `poller.refresh('deviceStatus')` in `src/platform.ts` — `writeQueue.ts` still never
+imports `poller.ts`). This shrinks the staleness window from up to ~30s to roughly one request's
+round trip. **Residual race (explicitly not eliminated):** a gain changed externally in the
+narrow interval between that refresh completing and the POST actually landing is still clobbered
+— eliminating it entirely would need either a conditional/compare-and-swap write (upstream's
+`POST /api/deviceStatus` has no such primitive) or the device-scope optimistic-overlay
+generalization this decision already declines to build (see above) applied in the *opposite*
+direction (guarding reads, not writes) — out of scope for this fix. Documented here, and in
+README's `ledLightbulb` row, as a known, much-smaller residual rather than a solved problem.
+
+### 6. "Test Alarm" is two per-side switches, each a fire-and-forget write; `PodClient.postAlarm` never retries
 
 `POST /api/alarm` is non-idempotent at the hardware layer (a retried POST while the first is
 still landing double-fires the vibration) and gives no synchronous confirmation the alarm ran
 (Context, above — the route responds before `executeAlarm` resolves).
 
-**Resolution:** add `PodClient.postAlarm(request: AlarmRequest, signal?)`, validated against a
-new strict `AlarmRequestSchema` (`src/pod/types.ts`), that explicitly bypasses
-`requestWithRetry`'s network-error/5xx retry — it calls `singleAttempt` directly (still through
-the existing per-endpoint `enqueue` serialization, so `pod-client`'s "at most one in-flight
-request per endpoint" invariant is unaffected) and surfaces a network error or 5xx as a single
-failure with no second attempt. `TestAlarmService`'s `On` `onSet` handler calls it with
-`force: true` (required — `executeAlarm` silently no-ops off/away sides without it) and a fixed,
-short `duration`/`vibrationIntensity`/`vibrationPattern` the service itself chooses (not exposed
-as characteristics — "Test Alarm" is a single momentary trigger, not a configurable one).
-Regardless of the write's outcome (success, failure, or timeout), the switch's own `On`
-characteristic is pushed back to `Off` via a ~1 s `this.ctx.timers.setTimeout` (issue #20's own
-"self-reset after ~1 s") — this is deliberately decoupled from whether the alarm actually fired:
-upstream's own `Math.max(10, duration) * 1000` ms vibration (Context, above) genuinely outlasts
-the tile's own reset by an order of magnitude, and there is no reliable synchronous signal to
-wait for instead. The tile resetting after ~1 s communicates "the trigger was sent," never
-"the bed is done vibrating."
+**G0 (tech-lead ruling, PR #44 review — supersedes this decision's original "targets both
+sides" shape):** the original design shipped one hub-level switch that triggered **both** sides
+at once, reasoned as "a manual test trigger should prove the physical alarm actually fires,
+which either side alone would not fully prove." The tech lead overturned this: a hub accessory
+is not scoped to either sleeper, and a single both-sides control means testing one side's alarm
+can vibrate a *sleeping partner's* side as an unavoidable side effect — a real physical harm, not
+a UX nicety, and one no config toggle can mitigate short of removing the both-sides behavior
+itself. **Resolution: two independent switches, "Test Alarm Left" and "Test Alarm Right"**, each
+with its own subtype (`testAlarmLeft`/`testAlarmRight`) and its own `TestAlarmService` instance
+parameterized by `side`, each firing `postAlarm` for its own side only. The single
+`testAlarmSwitch` config boolean still gates *both* switches together (no new config key) —
+splitting the *trigger's target*, not the *opt-in gate*. Wanting to test only one side no longer
+requires exposing the vibration to the other; wanting to test both remains one tap per side,
+never zero.
+
+Everything else about the original mechanism carries over unchanged, just parameterized by
+`side`: add `PodClient.postAlarm(request: AlarmRequest, signal?)`, validated against a new strict
+`AlarmRequestSchema` (`src/pod/types.ts`), that explicitly bypasses `requestWithRetry`'s
+network-error/5xx retry — it calls `singleAttempt` directly (still through the existing
+per-endpoint `enqueue` serialization, so `pod-client`'s "at most one in-flight request per
+endpoint" invariant is unaffected) and surfaces a network error or 5xx as a single failure with
+no second attempt. Each switch's `On` `onSet` handler calls it with `force: true` (required —
+`executeAlarm` silently no-ops off/away sides without it) and a fixed, short
+`duration`/`vibrationIntensity`/`vibrationPattern` the service itself chooses (not exposed as
+characteristics — "Test Alarm" is a single momentary trigger, not a configurable one). Regardless
+of the write's outcome (success, failure, or timeout), the switch's own `On` characteristic is
+pushed back to `Off` via a ~1 s `this.ctx.timers.setTimeout` (issue #20's own "self-reset after
+~1 s") — this is deliberately decoupled from whether the alarm actually fired: upstream's own
+`Math.max(10, duration) * 1000` ms vibration (Context, above) genuinely outlasts the tile's own
+reset by an order of magnitude, and there is no reliable synchronous signal to wait for instead.
+The tile resetting after ~1 s communicates "the trigger was sent," never "the bed is done
+vibrating." (N4, PR #44 review: `postAlarm`'s rejection is caught, logged at `debug`, and
+otherwise swallowed — the write's `onSet` promise still resolves — so the HomeKit write itself
+always reports success regardless of whether the trigger reached the Pod; the self-reset above is
+the only signal a controller ever sees either way.)
 
 ### 7. Server-fault `StatusFault` means "the `serverStatus` poll itself is failing," not "a subsystem reports failed"
 
@@ -291,13 +338,19 @@ otherwise-unrelated upstream schemas that happen to look alike today. The module
 blocks" framing is updated to "Five blocks" and this deviation is called out explicitly in a
 comment at the new block, not left to be noticed later as an inconsistency.
 
-`ServerStatus`'s optional biometrics-gated keys (`analyzeSleepLeft`, `analyzeSleepRight`,
+`ServerStatus`'s six optional keys (`analyzeSleepLeft`, `analyzeSleepRight`,
 `biometricsInstallation`, `biometricsStream`, `biometricsCalibrationLeft`,
-`biometricsCalibrationRight` — present only when `servicesDB.data.biometrics.enabled`,
-`server/src/serverStatus.ts`'s `updateServices()`) are all `.optional()`, matching the read-side
-leniency `types.ts` already applies everywhere else (an absent key parses fine; the
-"any subsystem `=== 'failed'`" derivation simply has fewer subsystems to check when they're
-absent).
+`biometricsCalibrationRight`) are all `.optional()`, matching the read-side leniency `types.ts`
+already applies everywhere else (an absent key parses fine; the "any subsystem `=== 'failed'`"
+derivation simply has fewer subsystems to check when they're absent). **Correction (N2, PR #44
+review):** only five of those six are actually biometrics-gated — `server/src/serverStatus.ts`'s
+`updateServices()` sets `biometricsInstallation` unconditionally, before its
+`if (servicesDB.data.biometrics.enabled)` guard; `analyzeSleepLeft`, `analyzeSleepRight`,
+`biometricsStream`, `biometricsCalibrationLeft`, and `biometricsCalibrationRight` are the ones
+actually inside that guard. `biometricsInstallation` stays `.optional()` regardless (the read-side
+leniency rationale above holds independent of *why* a key might be absent), but it is in practice
+present whenever `GET /api/serverStatus` succeeds at all, not conditional on biometrics being
+enabled.
 
 ## Risks / Trade-offs
 
@@ -373,3 +426,55 @@ must be stated in README's config table; prime-off refusal mirrors the establish
 NOT_ALLOWED_IN_CURRENT_STATE pattern; postAlarm's no-retry opt-out is mandatory (also noted
 by the pod-client review long ago). The server-fault two-axis split (payload vs poll
 reachability) is the honest signal design requested.
+
+## Resolutions (PR #44 code review, 2026-09-06/07)
+
+- **G0 (both-sides test-alarm switch):** overturned — split into two per-side switches,
+  "Test Alarm Left"/"Test Alarm Right" (`TEST_ALARM_LEFT_SUBTYPE`/`TEST_ALARM_RIGHT_SUBTYPE`),
+  each firing `postAlarm` for its own side only; `testAlarmSwitch` stays the single boolean
+  gating both. Decision 6, above, is rewritten in place rather than left as a superseded
+  original. `enabledServiceKeysFor`/`constructServicesFor`/the platform's `shutdown` teardown all
+  grew from one instance to a `Map<Side, TestAlarmService>`, mirroring `thermostats`' own shape.
+- **S1 (server-fault reachability invisible):** `serverStatusConnection.online` is now a watched
+  `DeviceChangeField` (`'serverStatusOnline'`, `src/pod/snapshot.ts`), diffed in `diffWatched`
+  and routed to `ServerFaultService.refresh()` in `handleSnapshotChanges` — the same service the
+  existing `serverFault` (payload) field already routes to, since both axes live on one sensor.
+- **S2 (LED tile never reflects external changes):** `ledBrightness` is now a watched
+  `DeviceChangeField` too, routed to `LedService.refresh()`. The platform now retains
+  `this.ledService` (previously discarded after construction, since nothing needed to reach it
+  before this fix) for `handleSnapshotChanges` to call.
+- **S3 (prime switch latches on if unconfirmed):** a successful `{isPriming: true}` dispatch now
+  schedules exactly one bounded corrective `PrimeService.refresh()` (`scheduleConfirmCheck`,
+  the same retained/clearable-timer shape `scheduleRevert` already established, torn down by the
+  same `stop()`) at `fastPollIntervalMs + a 2s margin` after the write settles. A confirmed prime
+  is unaffected — the corrective push lands on an already-agreeing value.
+- **S4 (LED read-modify-write races an externally-changed gain):** implemented, not merely
+  documented — see Decision 5's own "S4" addendum above for the full mechanism
+  (`WriteQueue`'s new `refreshDeviceStatus` callback, `LedService` now submitting only the field
+  it changes). The now-much-smaller residual race is called out in both Decision 5 and README's
+  `ledLightbulb` row, per this review's own instruction.
+- **N1 (`AlarmRequestSchema.duration` bounds):** changed to `.positive().max(180)`, matching
+  upstream's `server/src/db/schedulesSchema.ts`'s `AlarmSchema.duration` exactly
+  (`z.number().int().positive().min(0).max(180)` — `.positive()` is the binding lower bound).
+  `docs/POD-API.md`'s "0–180 seconds" corrected to "1–180 seconds".
+- **N2 (`biometricsInstallation` wrongly documented as biometrics-gated):** it is not —
+  `server/src/serverStatus.ts`'s `updateServices()` sets it unconditionally, before the
+  `biometrics.enabled` guard that gates its five siblings. Corrected in `types.ts`'s comment,
+  Decision 8 above, `test/fixtures/README.md`, and the synthetic `serverStatus.json` fixture (now
+  carries `biometricsInstallation` present alongside the five genuinely gated keys staying
+  absent).
+- **N3 (LED `lastNonZeroBrightness` seeded from the plugin's own writes only):** an off-write now
+  seeds it from the currently-*observed* brightness first, so an externally-changed value
+  survives an off/on cycle through this plugin instead of being replaced by the plugin-write
+  default of 100.
+- **N4 (TestAlarm's swallowed rejection undocumented):** noted in `docs/HOMEKIT.md`'s alarm row
+  and Decision 6 above.
+- **N6 (poll-budget test doesn't cover `serverFaultSensorEnabled`):** `test/pollBudget.test.ts`'s
+  `wire()` helper takes an optional `serverFaultSensorEnabled` parameter, threaded to
+  `PodPoller`; the guardrail test is parameterized over `[false, true]` with a derived ceiling
+  (`+2` when enabled — one extra bootstrap poll of the `serverStatus` class, one extra second
+  poll at the scenario's own t=300s, on the same `slowPollIntervalMs` cadence as
+  settings/schedules/services).
+- **N5 (type-only import cycle):** deferred, per this review's own instruction — a one-line
+  `TODO` comment in `src/services/types.ts` references this review rather than restructuring
+  module boundaries in the same pass as the concurrent occupancy PR touching the same files.

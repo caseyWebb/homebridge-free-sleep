@@ -16,6 +16,12 @@
 import type { API, Logging, PlatformAccessory } from 'homebridge';
 
 import type { FreeSleepConfig } from '../config.ts';
+// TODO(N5, hub-accessory PR #44 review): this is a type-only import cycle with `platform.ts`
+// (which imports `ServiceContext` from this module) — erased at build time so it costs nothing
+// at runtime, but is nonetheless worth untangling by moving `MinimalPodClient` to its own module
+// or into `pod/client.ts`. Deliberately deferred out of this pass: a concurrent occupancy PR
+// touches both `platform.ts` and `services/types.ts`, and restructuring module boundaries here
+// at the same time would conflict with it for no behavioral gain.
 import type { MinimalPodClient } from '../platform.ts';
 import type { AwayModeGuard } from '../pod/awayModeGuard.ts';
 import type { SnapshotStore, TimerApi } from '../pod/snapshot.ts';

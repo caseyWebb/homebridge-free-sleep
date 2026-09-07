@@ -11,6 +11,17 @@
  * (with its own, stricter `deviceWriteDebounceMs`) coalesces a same-window pair into one dispatch
  * regardless of which characteristic HAP calls first.
  *
+ * S4 (hub-accessory PR #44 review): this service itself only ever names the one field it is
+ * actually changing (`ledBrightness`) — `WriteQueue.dispatch()`'s `device`-lane branch now does
+ * the "read the other three, merge, post whole" part, backfilling from a `deviceStatus` read
+ * refreshed immediately before dispatch, rather than this service reading (and thus pinning) the
+ * cached `v`/`gainLeft`/`gainRight` back at submission time. This closes the bulk of what was a
+ * `pollIntervalMs`-wide (default ~30s) staleness window in which an externally-changed gain
+ * (e.g. edited directly in free-sleep's own web UI) could be clobbered back to its stale cached
+ * value by an unrelated brightness write from this plugin. A small residual race remains — see
+ * design.md's Decision 5 and README's `ledLightbulb` row — bounded by the pre-dispatch refresh's
+ * own round trip rather than a full poll interval.
+ *
  * No optimistic overlay (design.md's Decision 2, a deliberate, accepted trade-off): a write's own
  * tile settles once the device lane's confirming fast-poll lands, up to roughly
  * `fastPollIntervalMs` after dispatch.
@@ -52,9 +63,10 @@ export class LedService {
     this.wireReadsAndWrites();
 
     // B1 pattern (every other service in this plugin): publish whatever the bootstrap already
-    // observed before this service is registered. Not wired to a further snapshot change event —
-    // `ledBrightness` is not among `pod-snapshot`'s watched fields (design.md's Decision 2) — so
-    // this only ever runs the once, here.
+    // observed before this service is registered. S2 fix (hub-accessory PR #44 review):
+    // `ledBrightness` is now a watched `DeviceChangeField` (`src/pod/snapshot.ts`) and the
+    // platform retains this instance and routes a `ledBrightness` change to `refresh()` — this
+    // call is only the *first* push, not the only one, unlike before the fix.
     this.refresh();
   }
 
@@ -94,26 +106,35 @@ export class LedService {
   }
 
   /**
-   * Reads the full, currently-cached `settings` object and submits a new one with only
-   * `ledBrightness` replaced — design.md's Decision 5's "clone current, merge, post whole" shape.
-   * Refuses with `SERVICE_COMMUNICATION_FAILURE` rather than guessing the other three fields when
-   * no `deviceStatus` has ever been observed yet (a brand-new launch racing the bootstrap poll).
+   * Submits only the field this write actually changes — `WriteQueue.dispatch()`'s `device`-lane
+   * branch performs the "clone current, merge, post whole" read-modify-write itself (S4 fix,
+   * this module's doc), against a `deviceStatus` freshly re-read immediately before dispatch
+   * rather than whatever this service last saw at submission time. Still refuses synchronously
+   * with `SERVICE_COMMUNICATION_FAILURE` — before any submission at all — when no `deviceStatus`
+   * has ever been observed yet (a brand-new launch racing the bootstrap poll): sending
+   * `{ledBrightness}` alone in that state would have nothing to backfill the other three fields
+   * from either, corrupting them exactly as design.md's Decision 5 warns against.
    */
   private async submitBrightness(target: number, hap: HAP): Promise<void> {
-    const settings = this.currentSettings();
-    if (!settings) {
+    if (!this.currentSettings()) {
       throw new hap.HapStatusError(hap.HAPStatus.SERVICE_COMMUNICATION_FAILURE);
     }
     if (target > 0) {
       contextOf(this.ctx).lastNonZeroBrightness = target;
+    } else {
+      // N3 fix (hub-accessory PR #44 review): before zeroing, seed `lastNonZeroBrightness` from
+      // the currently-*observed* brightness (still the pre-write cached value at this point) —
+      // the Pod's actual prior level — rather than leaving whatever this plugin itself last
+      // happened to write (or never wrote at all). An off-write following an externally-changed
+      // brightness (e.g. free-sleep's own web UI set it to 30) must restore that 30 on the next
+      // on-write, not fall back to the plugin's own stale/absent `lastNonZeroBrightness`.
+      const observed = this.currentBrightness();
+      if (observed !== undefined && observed > 0) {
+        contextOf(this.ctx).lastNonZeroBrightness = observed;
+      }
     }
     try {
-      await this.ctx.writeQueue.submitDeviceSettings({
-        v: settings.v,
-        gainLeft: settings.gainLeft,
-        gainRight: settings.gainRight,
-        ledBrightness: target,
-      });
+      await this.ctx.writeQueue.submitDeviceSettings({ ledBrightness: target });
     } catch (error) {
       this.ctx.log.debug(`FreeSleep: LED write failed: ${describeError(error)}`);
       throw new hap.HapStatusError(hap.HAPStatus.SERVICE_COMMUNICATION_FAILURE);

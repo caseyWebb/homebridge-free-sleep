@@ -217,6 +217,44 @@ describe('turning off zeroes the brightness', () => {
   });
 });
 
+describe('an off-write seeds lastNonZeroBrightness from the observed brightness, not this plugin\'s own last write (N3 fix)', () => {
+  it('external 30 -> HomeKit off -> on posts 30, not the plugin-write default of 100', async () => {
+    const s = setup();
+    // Simulates an externally-set brightness (e.g. free-sleep's own web UI) that this plugin
+    // itself never wrote — `lastNonZeroBrightness` has never been touched by a write handler.
+    s.snapshot.observeDeviceStatus({
+      ...deviceStatusFixture,
+      settings: { v: 1, gainLeft: 1, gainRight: 1, ledBrightness: 30 },
+    });
+    let onSetOn!: CharacteristicSetHandler;
+    const getSpy = vi.spyOn(Characteristic.prototype, 'onGet').mockImplementation(function (this: Characteristic) {
+      return this;
+    });
+    const setSpy = vi.spyOn(Characteristic.prototype, 'onSet').mockImplementation(function (
+      this: Characteristic,
+      handler: CharacteristicSetHandler,
+    ) {
+      if (this.UUID === s.api.hap.Characteristic.On.UUID) onSetOn = handler;
+      return this;
+    });
+    new LedService(s.ctx);
+    getSpy.mockRestore();
+    setSpy.mockRestore();
+
+    // Off write: seeds lastNonZeroBrightness from the observed 30 before zeroing.
+    const pOff = onSetOn(false, {} as never) as Promise<void>;
+    await vi.advanceTimersByTimeAsync(500);
+    await pOff;
+    expect(s.fake.postDeviceStatusCalls[0]).toEqual({ settings: { v: 1, gainLeft: 1, gainRight: 1, ledBrightness: 0 } });
+
+    // On write with no accompanying Brightness: restores 30 (the Pod's actual prior level), not 100.
+    const pOn = onSetOn(true, {} as never) as Promise<void>;
+    await vi.advanceTimersByTimeAsync(500);
+    await pOn;
+    expect(s.fake.postDeviceStatusCalls[1]).toEqual({ settings: { v: 1, gainLeft: 1, gainRight: 1, ledBrightness: 30 } });
+  });
+});
+
 describe('refuses a write when no deviceStatus has ever been observed yet', () => {
   it('rejects with SERVICE_COMMUNICATION_FAILURE and sends no request', async () => {
     const s = setup(); // no observeDeviceStatus call at all

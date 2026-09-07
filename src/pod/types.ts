@@ -500,13 +500,18 @@ const ServerStatusInfoSchema = z.object({
 export type ServerStatusInfo = z.infer<typeof ServerStatusInfoSchema>;
 
 /**
- * Twelve subsystems are always present. The six biometrics-gated ones (`analyzeSleepLeft`,
- * `analyzeSleepRight`, `biometricsInstallation`, `biometricsStream`, `biometricsCalibrationLeft`,
- * `biometricsCalibrationRight`) are present only when `servicesDB.data.biometrics.enabled`
- * (`server/src/serverStatus.ts`'s `updateServices()`) — `.optional()`, matching this file's
- * read-side leniency everywhere else: an absent key parses fine, and the "any subsystem
- * `status === 'failed'`" derivation (`src/pod/snapshot.ts`) simply has fewer subsystems to check
- * when they're absent.
+ * Twelve subsystems are always present, plus `biometricsInstallation` — thirteen unconditional
+ * in practice. N2 (hub-accessory PR #44 review): `server/src/serverStatus.ts`'s
+ * `updateServices()` sets `this.status.biometricsInstallation =
+ * servicesDB.data.biometrics.jobs.installation` unconditionally, *before* its
+ * `if (servicesDB.data.biometrics.enabled)` gate — only the other five
+ * (`analyzeSleepLeft`, `analyzeSleepRight`, `biometricsStream`, `biometricsCalibrationLeft`,
+ * `biometricsCalibrationRight`) live inside that gate and are absent when biometrics is
+ * disabled. `biometricsInstallation` stays `.optional()` here regardless, matching this file's
+ * read-side leniency everywhere else (an absent key parses fine either way, and the "any
+ * subsystem `status === 'failed'`" derivation, `src/pod/snapshot.ts`, simply has fewer
+ * subsystems to check when one is absent) — but a reader should not infer from the schema shape
+ * alone that it is biometrics-gated like its five siblings.
  */
 export const ServerStatusSchema = z.object({
   alarmSchedule: ServerStatusInfoSchema,
@@ -549,7 +554,12 @@ export const AlarmRequestSchema = z
       message: 'vibrationIntensity cannot exceed 100',
     }),
     vibrationPattern: z.enum(['double', 'rise']),
-    duration: z.number().int().min(0, { message: 'duration must be non-negative' }).max(180, {
+    // N1 (hub-accessory PR #44 review): matches upstream's own
+    // `AlarmSchema.duration` exactly (`server/src/db/schedulesSchema.ts`:
+    // `z.number().int().positive().min(0).max(180)`) — `.positive()` is the operative bound
+    // (strictly greater than zero; the redundant `.min(0)` upstream adds nothing beyond it), so
+    // the smallest accepted integer is 1, not 0.
+    duration: z.number().int().positive({ message: 'duration must be positive' }).max(180, {
       message: 'duration cannot exceed 180',
     }),
     force: z.boolean(),

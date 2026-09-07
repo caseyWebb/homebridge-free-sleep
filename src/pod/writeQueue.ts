@@ -85,6 +85,13 @@ export type WriteOrigin = 'user' | 'keepAlive';
  * branch splits them back apart into a bare top-level `isPriming` and a nested `settings` object
  * at dispatch time, since that's the shape `POST /api/deviceStatus` actually expects (design.md's
  * "Requires a `src/pod/writeQueue.ts` change").
+ *
+ * S4 (hub-accessory PR #44 review): a caller no longer has to fill in every one of the four
+ * `DEVICE_SETTINGS_KEYS` itself to avoid a partial `settings` POST silently dropping the others
+ * (`updateSettings` CBOR-encodes exactly the keys it's given, design.md's Decision 5) — `dispatch()`
+ * now backfills any key this cycle's patch left unset from a just-refreshed (`refreshDeviceStatus`)
+ * observed `settings` object, so a submitter (`LedService`) only ever needs to name the field it is
+ * actually changing.
  */
 export type DevicePatch = Partial<{
   v: number;
@@ -111,6 +118,17 @@ export interface WriteQueueOptions {
   snapshot: SnapshotStore;
   /** Called on success only, naming which class's confirmation the dispatch needs. */
   requestFastPoll: (lane: FastPollLane, untilMs: number) => void;
+  /**
+   * S4 (hub-accessory PR #44 review): awaited, when provided, immediately before a `device`-lane
+   * dispatch that carries any of `DEVICE_SETTINGS_KEYS` — a bounded read (`poller.refresh
+   * ('deviceStatus')` in production, via the same lane-aware callback-injection pattern
+   * `requestFastPoll` already establishes so this module never imports `poller.ts`) so the
+   * read-modify-write below merges against gains observed as close to dispatch time as possible,
+   * not whatever was cached at submission time (up to `pollIntervalMs`, default 30s, stale).
+   * Optional — omitted, every existing caller (most tests, and any future one that doesn't wire
+   * a poller) gets exactly today's behavior of merging against whatever `snapshot` already holds.
+   */
+  refreshDeviceStatus?: () => Promise<void>;
   /**
    * Consulted on every side-lane dispatch (away-mode-guard change, tech-lead resolution 2).
    * Defaults to an internally-constructed guard using `policy: 'mirror'` (the config default)
@@ -229,6 +247,8 @@ export class WriteQueue {
   private readonly client: PodClient;
   private readonly snapshot: SnapshotStore;
   private readonly requestFastPoll: (lane: FastPollLane, untilMs: number) => void;
+  /** S4 fix — see `WriteQueueOptions.refreshDeviceStatus`'s doc. */
+  private readonly refreshDeviceStatus: (() => Promise<void>) | undefined;
   private readonly awayModeGuard: AwayModeGuard;
   private readonly timers: TimerApi;
   private readonly logger: Logger;
@@ -261,6 +281,7 @@ export class WriteQueue {
     this.client = options.client;
     this.snapshot = options.snapshot;
     this.requestFastPoll = options.requestFastPoll;
+    this.refreshDeviceStatus = options.refreshDeviceStatus;
     this.timers = options.timers ?? defaultTimerApi;
     this.logger = options.logger ?? defaultLogger;
 
@@ -485,9 +506,30 @@ export class WriteQueue {
       // `settings` (which the Pod would silently ignore, `settings` being CBOR-encoded
       // key-for-key).
       const devicePatch = patch as DevicePatch;
+      const wantsSettingsWrite = DEVICE_SETTINGS_KEYS.some((key) => devicePatch[key] !== undefined);
+      // S4 fix (hub-accessory PR #44 review): a bounded pre-dispatch refresh, only when this
+      // dispatch actually touches the settings sub-object — an `isPriming`-only patch (PrimeService)
+      // has no gains to keep fresh and gains nothing from the extra round trip. `this.stopped` is
+      // re-checked below (`settleWrite`'s own convention) since `stop()` can land while this await
+      // is outstanding.
+      if (wantsSettingsWrite && this.refreshDeviceStatus) {
+        try {
+          await this.refreshDeviceStatus();
+        } catch (error) {
+          this.logger.debug(`writeQueue: pre-dispatch deviceStatus refresh failed: ${describeError(error)}`);
+        }
+      }
+      // The read-modify-write itself: fresh (post-refresh) observed settings are the base, and
+      // only the field(s) this cycle actually asked to change (present in `devicePatch`) override
+      // them — never the other way around, or a stale value captured back at submission time
+      // would win over the very refresh just performed.
+      const freshSettings = this.snapshot.get().documents.deviceStatus?.settings;
       const settingsFields: DevicePatch = {};
-      for (const key of DEVICE_SETTINGS_KEYS) {
-        if (devicePatch[key] !== undefined) settingsFields[key] = devicePatch[key];
+      if (wantsSettingsWrite) {
+        for (const key of DEVICE_SETTINGS_KEYS) {
+          const value = devicePatch[key] ?? freshSettings?.[key];
+          if (value !== undefined) settingsFields[key] = value;
+        }
       }
       body = {
         ...(devicePatch.isPriming !== undefined ? { isPriming: devicePatch.isPriming } : {}),

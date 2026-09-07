@@ -234,7 +234,27 @@ export type SideChangeField =
   | 'isAlarmVibrating'
   | 'awayMode';
 
-export type DeviceChangeField = 'waterLevelState' | 'isPriming' | 'connectionOnline' | 'serverFault';
+export type DeviceChangeField =
+  | 'waterLevelState'
+  | 'isPriming'
+  | 'connectionOnline'
+  | 'serverFault'
+  /**
+   * S1 (hub-accessory PR #44 review): the `serverStatus` poll's own reachability
+   * (`serverStatusConnection.online`) was tracked in `RawState`/`EffectiveSnapshot` but never
+   * diffed as a watched field, so `ServerFaultService`'s `StatusFault`/`StatusActive` were never
+   * pushed on a reachability transition — only a `serverFault` (payload) change routed to
+   * `refresh()`. Named distinctly from `connectionOnline` (which stays `deviceStatus`-specific).
+   */
+  | 'serverStatusOnline'
+  /**
+   * S2 (hub-accessory PR #44 review): `ledBrightness` was deliberately left unwatched
+   * (design.md's Decision 2 — no *overlay* for it) but that also meant no poll-driven `refresh()`
+   * ever ran after construction, so an external brightness/on-off change (e.g. free-sleep's own
+   * web UI) never reached the "Pod LED" tile. This is a plain watched-field diff like any other
+   * device-level field, unrelated to Decision 2's overlay non-goal.
+   */
+  | 'ledBrightness';
 
 interface SideChange<F extends SideChangeField, V> {
   scope: 'side';
@@ -267,7 +287,9 @@ export type Change =
   | DeviceChange<'waterLevelState', WaterLevel>
   | DeviceChange<'isPriming', boolean>
   | DeviceChange<'connectionOnline', boolean>
-  | DeviceChange<'serverFault', boolean>;
+  | DeviceChange<'serverFault', boolean>
+  | DeviceChange<'serverStatusOnline', boolean>
+  | DeviceChange<'ledBrightness', number>;
 
 export type Listener = (changes: readonly Change[]) => void;
 
@@ -582,6 +604,16 @@ function diffWatched(previous: EffectiveSnapshot, current: EffectiveSnapshot): C
   pushDeviceChange(changes, 'isPriming', previous.isPriming, current.isPriming);
   pushDeviceChange(changes, 'connectionOnline', previous.connection.online, current.connection.online);
   pushDeviceChange(changes, 'serverFault', previous.serverFault, current.serverFault);
+  // S1 fix: reachability of the serverStatus poll itself, independent of the payload signal above.
+  pushDeviceChange(changes, 'serverStatusOnline', previous.serverStatusConnection.online, current.serverStatusConnection.online);
+  // S2 fix: an externally-changed LED brightness/on-off must reach the "Pod LED" tile too, not
+  // just this plugin's own writes (which the write queue's fast-poll acceleration already covers).
+  pushDeviceChange(
+    changes,
+    'ledBrightness',
+    previous.documents.deviceStatus?.settings.ledBrightness,
+    current.documents.deviceStatus?.settings.ledBrightness,
+  );
   return changes;
 }
 

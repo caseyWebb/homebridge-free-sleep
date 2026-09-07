@@ -159,6 +159,89 @@ describe('turning the switch on triggers a prime request', () => {
   });
 });
 
+// ---------------------------------------------------------------------------------------
+// S3 fix (hub-accessory PR #44 review): a successful prime-on write only accelerates polling —
+// it never itself proves priming started, so an unconfirmed prime must not latch the tile on
+// forever. Default bound: fastPollIntervalMs (5000, unconfigured) + a 2000ms safety margin = 7000ms.
+// ---------------------------------------------------------------------------------------
+
+describe('an unconfirmed prime-on write self-corrects within the bound (S3 fix)', () => {
+  it('the tile returns to off within the bound when the Pod never confirms priming', async () => {
+    const s = setup();
+    // No `s.snapshot.observeDeviceStatus({isPriming: true})` anywhere in this test — the polls
+    // (simulated or not) keep reporting `isPriming: false` throughout, exactly the reviewer's
+    // reproduction ("polls keep isPriming:false, no diff -> refresh never runs").
+    const service = new PrimeService(s.ctx);
+    const hapService = s.accessory.getServiceById(s.api.hap.Service.Switch, PRIME_SUBTYPE)!;
+    const onChar = hapService.getCharacteristic(s.api.hap.Characteristic.On);
+    const refreshSpy = vi.spyOn(service, 'refresh');
+
+    const pending = onChar.handleSetRequest(true);
+    await vi.advanceTimersByTimeAsync(500); // device-lane debounce flush -> dispatch settles
+    await pending;
+    expect(onChar.value).toBe(true); // HAP's own optimistic assignment on the successful write
+
+    await vi.advanceTimersByTimeAsync(6_999); // just under the 7000ms bound
+    expect(refreshSpy).not.toHaveBeenCalled();
+    expect(onChar.value).toBe(true);
+
+    await vi.advanceTimersByTimeAsync(1); // crosses the bound
+    expect(refreshSpy).toHaveBeenCalledTimes(1);
+    expect(onChar.value).toBe(false); // corrected back to the Pod's actual (never-confirmed) state
+  });
+
+  it('a confirmed prime (the ordinary case) stays on — the corrective check is a no-op', async () => {
+    const s = setup();
+    const service = new PrimeService(s.ctx);
+    const hapService = s.accessory.getServiceById(s.api.hap.Service.Switch, PRIME_SUBTYPE)!;
+    const onChar = hapService.getCharacteristic(s.api.hap.Characteristic.On);
+    const refreshSpy = vi.spyOn(service, 'refresh');
+
+    const pending = onChar.handleSetRequest(true);
+    await vi.advanceTimersByTimeAsync(500);
+    await pending;
+    expect(onChar.value).toBe(true);
+
+    // The poller's own confirming fast-poll lands well within the bound — routed the ordinary
+    // way, via `handleSnapshotChanges`'s `isPriming` diff, not via the corrective timer.
+    s.snapshot.observeDeviceStatus({ ...deviceStatusFixture, isPriming: true });
+    service.refresh();
+
+    await vi.advanceTimersByTimeAsync(7_000); // past the bound
+    expect(refreshSpy).toHaveBeenCalled(); // the corrective check still fires...
+    expect(onChar.value).toBe(true); // ...but it's a no-op: isPriming is genuinely true by now
+  });
+
+  it('a second On write before the first corrective check fires clears the first timer and installs exactly one replacement', async () => {
+    // Not a raw `pendingCount()` delta (unlike `scheduleRevert`'s own coalescing test elsewhere
+    // in this file): hap-nodejs's own per-accessory timer overhead can itself fire and clear
+    // during the ~1s this test's two writes span, which would make a before/after pendingCount
+    // comparison flaky for reasons unrelated to `confirmCheckTimer`. Spying on the injected
+    // `TimerApi` directly is exact regardless of what else is scheduled.
+    const s = setup();
+    const clearSpy = vi.spyOn(s.ctx.timers, 'clearTimeout');
+    const service = new PrimeService(s.ctx);
+    const hapService = s.accessory.getServiceById(s.api.hap.Service.Switch, PRIME_SUBTYPE)!;
+    const onChar = hapService.getCharacteristic(s.api.hap.Characteristic.On);
+
+    const p1 = onChar.handleSetRequest(true);
+    await vi.advanceTimersByTimeAsync(500);
+    await p1;
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const firstConfirmTimer = (service as any).confirmCheckTimer;
+    expect(firstConfirmTimer).not.toBeNull();
+
+    const p2 = onChar.handleSetRequest(true);
+    await vi.advanceTimersByTimeAsync(500);
+    await p2;
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const secondConfirmTimer = (service as any).confirmCheckTimer;
+    expect(secondConfirmTimer).not.toBeNull();
+    expect(secondConfirmTimer).not.toBe(firstConfirmTimer); // replaced, not stacked
+    expect(clearSpy.mock.calls.some((call) => call[0] === firstConfirmTimer)).toBe(true);
+  });
+});
+
 describe('turning the switch off is refused (design.md Decision 3)', () => {
   it('sends no request and rejects with a status distinct from a communication failure', async () => {
     const s = setup();

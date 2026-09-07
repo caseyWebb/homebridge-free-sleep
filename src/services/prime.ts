@@ -11,6 +11,17 @@
  * (design.md's Context). This mirrors `away-mode-guard`'s own established refuse-then-revert
  * shape (`AwayModeBlockedError` / `scheduleAwayModeRevert` in `src/services/thermostat.ts`),
  * reusing the same `NOT_ALLOWED_IN_CURRENT_STATE` mapping.
+ *
+ * S3 (hub-accessory PR #44 review): a successful `{isPriming: true}` dispatch only ever accelerates
+ * polling (design.md's Decision 2) — it never itself corrects the tile. If the Pod never actually
+ * starts priming (hardware refusal, a race, or anything else that keeps the confirming polls
+ * reporting `isPriming: false`), `snapshot`'s diff never fires — `false` to `false` is not a
+ * change — so `handleSnapshotChanges` never calls `refresh()`, and the tile HAP flipped optimistically
+ * to `On` on the successful `onSet` latches there forever. The fix: after a successful `On`-write
+ * settles, schedule exactly one bounded corrective `refresh()` — reusing the same
+ * retained/clearable-timer shape `scheduleRevert` below already established for the refused-off
+ * case, torn down by the same `stop()`. A confirmed prime (the ordinary case) is unaffected: by
+ * the time this timer fires, `isPriming` is already `true`, so the corrective push is a no-op.
  */
 
 import type { Service } from 'homebridge';
@@ -24,6 +35,18 @@ export const POD_PRIME_NAME = 'Pod Prime';
 /** How long after a refused off-write to correct the tile HAP applied optimistically ahead of
  * the throw — matches `thermostat.ts`'s own `AWAY_MODE_BLOCKED_REVERT_DELAY_MS`. */
 const PRIME_OFF_REVERT_DELAY_MS = 500;
+
+/**
+ * S3 fix: matches `platform.ts`'s own duplicated default (`poller.ts` doesn't export its
+ * `fastPollIntervalMs` default) — the confirming fast-poll window a successful prime-on write
+ * already triggers (design.md's Decision 2). `ctx.config.pollIntervals.fastPollIntervalMs`
+ * overrides it when configured, exactly like every other fast-poll-window consumer.
+ */
+const DEFAULT_FAST_POLL_INTERVAL_MS = 5000;
+/** Safety margin over one fast-poll interval — covers the request's own round trip and commit,
+ * so the corrective check runs strictly after the confirming poll had a chance to land, not
+ * exactly when it was merely scheduled. */
+const PRIME_CONFIRM_CHECK_MARGIN_MS = 2000;
 
 /** Raised from the `On` characteristic's `onSet` handler, before any call into `WriteQueue`, when
  * the written value is `false` (design.md's Decision 3) — the Pod has no PRIME-stop command. */
@@ -46,11 +69,19 @@ export class PrimeService {
   /** The pending revert timer, if any — retained so `stop()` can clear it on shutdown, mirroring
    * `ThermostatService`'s own `awayModeRevertTimer`. */
   private revertTimer: TimerHandle | null = null;
+  /** S3 fix: the pending post-write corrective-check timer, if any — same retained/clearable
+   * shape as `revertTimer`, torn down by the same `stop()`. */
+  private confirmCheckTimer: TimerHandle | null = null;
+  /** `ctx.config.pollIntervals.fastPollIntervalMs` (default 5000) plus a fixed safety margin —
+   * see `PRIME_CONFIRM_CHECK_MARGIN_MS`'s doc. */
+  private readonly confirmCheckDelayMs: number;
 
   constructor(ctx: ServiceContext) {
     this.ctx = ctx;
     const hap = ctx.api.hap;
     const accessory = ctx.accessory;
+    this.confirmCheckDelayMs =
+      (ctx.config.pollIntervals.fastPollIntervalMs ?? DEFAULT_FAST_POLL_INTERVAL_MS) + PRIME_CONFIRM_CHECK_MARGIN_MS;
 
     const existing = accessory.getServiceById(hap.Service.Switch, PRIME_SUBTYPE);
     this.service = existing ?? accessory.addService(new hap.Service.Switch(POD_PRIME_NAME, PRIME_SUBTYPE));
@@ -78,6 +109,10 @@ export class PrimeService {
           throw new PrimeCannotBeStoppedError();
         }
         await this.ctx.writeQueue.submitDeviceSettings({ isPriming: true });
+        // S3 fix: the dispatch succeeding only means the Pod *accepted* the write — it never by
+        // itself proves priming actually started (see this module's doc). Schedule one bounded
+        // corrective push so an unconfirmed prime doesn't leave the tile latched `On` forever.
+        this.scheduleConfirmCheck();
       } catch (error) {
         if (error instanceof PrimeCannotBeStoppedError) {
           this.ctx.log.debug(`FreeSleep: prime-off write refused: ${describeError(error)}`);
@@ -105,12 +140,34 @@ export class PrimeService {
     }, PRIME_OFF_REVERT_DELAY_MS);
   }
 
-  /** Clears any pending revert timer — wired into the platform's `shutdown` teardown alongside
-   * `ThermostatService.stop()`. */
+  /**
+   * S3 fix: schedules exactly one bounded `refresh()` after a successful prime-on write —
+   * `confirmCheckDelayMs` after now, which is the confirming fast-poll window (design.md's
+   * Decision 2) plus a safety margin. A repeat `On` write before this fires (e.g. a second tap)
+   * gets exactly one pending timer, mirroring `scheduleRevert`'s own coalescing. If `isPriming`
+   * is `true` by the time this fires (the ordinary, confirmed case), `refresh()` is a no-op — the
+   * characteristic already agrees.
+   */
+  private scheduleConfirmCheck(): void {
+    if (this.confirmCheckTimer !== null) {
+      this.ctx.timers.clearTimeout(this.confirmCheckTimer);
+    }
+    this.confirmCheckTimer = this.ctx.timers.setTimeout(() => {
+      this.confirmCheckTimer = null;
+      this.refresh();
+    }, this.confirmCheckDelayMs);
+  }
+
+  /** Clears any pending revert/confirm-check timer — wired into the platform's `shutdown`
+   * teardown alongside `ThermostatService.stop()`. */
   stop(): void {
     if (this.revertTimer !== null) {
       this.ctx.timers.clearTimeout(this.revertTimer);
       this.revertTimer = null;
+    }
+    if (this.confirmCheckTimer !== null) {
+      this.ctx.timers.clearTimeout(this.confirmCheckTimer);
+      this.confirmCheckTimer = null;
     }
   }
 

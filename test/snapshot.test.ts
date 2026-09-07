@@ -194,6 +194,8 @@ describe('snapshot store: change notifications (3.1-3.5)', () => {
         case 'isPriming':
         case 'connectionOnline':
         case 'serverFault':
+        case 'serverStatusOnline':
+        case 'ledBrightness':
           return `${change.field}=${change.current}`;
       }
     }
@@ -528,5 +530,89 @@ describe('snapshot store: documents.serverStatus is exposed alongside the other 
     expect(store.get().documents.serverStatus).toBeUndefined();
     store.observeServerStatus(serverStatusFixture);
     expect(store.get().documents.serverStatus).toEqual(serverStatusFixture);
+  });
+});
+
+// ---------------------------------------------------------------------------------------
+// S1 fix (hub-accessory PR #44 review): serverStatusOnline is a watched DeviceChangeField
+// ---------------------------------------------------------------------------------------
+
+describe('snapshot store: serverStatusOnline is a watched DeviceChangeField (S1 fix)', () => {
+  it('a success followed by a failure emits a serverStatusOnline change, and the values differ', () => {
+    const store = new SnapshotStore();
+    store.observeServerStatus(serverStatusFixture);
+
+    const received: Change[] = [];
+    store.subscribe((changes) => received.push(...changes));
+
+    store.recordServerStatusFailure('network');
+
+    const onlineChanges = received.filter((c) => c.field === 'serverStatusOnline');
+    expect(onlineChanges).toHaveLength(1);
+    expect(onlineChanges[0]).toEqual({ scope: 'device', field: 'serverStatusOnline', previous: true, current: false });
+    expect(store.get().serverStatusConnection.online).toBe(false);
+  });
+
+  it('a recovery (failure -> success) also emits, in the other direction', () => {
+    const store = new SnapshotStore();
+    store.recordServerStatusFailure('network');
+
+    const received: Change[] = [];
+    store.subscribe((changes) => received.push(...changes));
+
+    store.observeServerStatus(serverStatusFixture);
+
+    const onlineChanges = received.filter((c) => c.field === 'serverStatusOnline');
+    expect(onlineChanges).toHaveLength(1);
+    expect(onlineChanges[0]).toEqual({ scope: 'device', field: 'serverStatusOnline', previous: false, current: true });
+  });
+
+  it('a repeated failure with no reachability change emits no serverStatusOnline event', () => {
+    const store = new SnapshotStore();
+    store.recordServerStatusFailure('network');
+
+    const received: Change[] = [];
+    store.subscribe((changes) => received.push(...changes));
+
+    store.recordServerStatusFailure('timeout'); // still offline — no transition
+    expect(received.filter((c) => c.field === 'serverStatusOnline')).toHaveLength(0);
+  });
+});
+
+// ---------------------------------------------------------------------------------------
+// S2 fix (hub-accessory PR #44 review): ledBrightness is a watched DeviceChangeField
+// ---------------------------------------------------------------------------------------
+
+describe('snapshot store: ledBrightness is a watched DeviceChangeField (S2 fix)', () => {
+  function withLedBrightness(ledBrightness: number): DeviceStatus {
+    return {
+      ...structuredClone(deviceStatusFixture),
+      settings: { ...deviceStatusFixture.settings, ledBrightness },
+    };
+  }
+
+  it('an externally-changed brightness (e.g. via free-sleep\'s own web UI) emits a ledBrightness change', () => {
+    const store = new SnapshotStore();
+    store.observeDeviceStatus(withLedBrightness(20));
+
+    const received: Change[] = [];
+    store.subscribe((changes) => received.push(...changes));
+
+    store.observeDeviceStatus(withLedBrightness(80));
+
+    const brightnessChanges = received.filter((c) => c.field === 'ledBrightness');
+    expect(brightnessChanges).toHaveLength(1);
+    expect(brightnessChanges[0]).toEqual({ scope: 'device', field: 'ledBrightness', previous: 20, current: 80 });
+  });
+
+  it('an unchanged observation emits no ledBrightness event', () => {
+    const store = new SnapshotStore();
+    store.observeDeviceStatus(withLedBrightness(20));
+
+    const received: Change[] = [];
+    store.subscribe((changes) => received.push(...changes));
+
+    store.observeDeviceStatus(withLedBrightness(20));
+    expect(received.filter((c) => c.field === 'ledBrightness')).toHaveLength(0);
   });
 });

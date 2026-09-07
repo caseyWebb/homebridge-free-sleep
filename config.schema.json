@@ -153,10 +153,10 @@
         "description": "Publishes a hub lightbulb controlling the Pod's LED brightness. Every write re-posts the Pod's full device-settings object, debounced by the device-lane write debounce below (minimum 500ms) — a brightness drag can take up to roughly the fast-poll window (default ~5s) to visibly settle in the Home app, since this field has no optimistic feedback. Off by default."
       },
       "testAlarmSwitch": {
-        "title": "Pod Test Alarm switch",
+        "title": "Pod Test Alarm switches",
         "type": "boolean",
         "default": false,
-        "description": "Publishes a momentary hub switch that manually triggers the Pod's alarm vibration, overriding away mode and power state. The tile self-resets to off after about a second regardless of outcome; the physical vibration itself lasts at least 10 seconds. Off by default."
+        "description": "Publishes two momentary hub switches, Test Alarm Left and Test Alarm Right, that each manually trigger the Pod's alarm vibration for that side only, overriding away mode and power state. Each tile self-resets to off after about a second regardless of outcome; the physical vibration itself lasts at least 10 seconds. Off by default."
       },
       "serverFaultSensor": {
         "title": "Pod Server Fault sensor",

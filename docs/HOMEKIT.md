@@ -246,7 +246,7 @@ routinely miss the entire alarm.**
 | Occupancy | `OccupancySensor`, source configurable | See below. |
 | LED | `Lightbulb` + `Brightness` (default **off**) | Joins the Lights category, so "Hey Siri, turn off all the lights" hits it and it pollutes the Home tab's Lights status. Fine, but opt-in. |
 | Prime | `Switch` (default off) | Write is one-way; there is no stop command. Writing OFF should refuse. Loud, runs for minutes. |
-| Test alarm | `Switch` (default **off**) | An accidental "turn on everything" firing a bed vibration alarm at 3 a.m. is a genuinely bad outcome. Needs `force: true` since `executeAlarm` refuses when the side is off. |
+| Test alarm | Two per-side `Switch`es, "Test Alarm Left"/"Test Alarm Right" (default **off**) | One both-sides switch was rejected (PR #44 tech-lead ruling): a hub-level trigger firing on both sides risks vibrating a sleeping partner's side as a side effect of testing the other. Needs `force: true` since `executeAlarm` refuses when the side is off. `postAlarm`'s rejection is logged and swallowed, never surfaced to HomeKit (N4) — the switch always reports its write as having "succeeded" regardless of whether the trigger actually reached the Pod. |
 | Connection | `ContactSensor` (default on) | See No Response above. |
 | Server fault | `ContactSensor` (default off) | Any `/api/serverStatus` subsystem `=== 'failed'`. |
 | Heart rate / HRV / breathing | **nothing in v1** | See below. |

@@ -23,8 +23,15 @@ function clientFor(pod: MockPod): PodClient {
  * one, matching what a single always-on plugin instance would do); a `settings`-lane write gets
  * a single confirming `refresh('settings')` instead — accelerating `deviceStatus` polling would
  * confirm nothing a settings write actually changed (S2).
+ *
+ * `serverFaultSensorEnabled` (N6, hub-accessory PR #44 review): threaded straight through to
+ * `PodPoller`'s own option of the same name — `false` (the config default) reproduces this
+ * test's original, un-parameterized shape exactly; `true` additionally registers and polls the
+ * `serverStatus` class on the same slow cadence as `settings`/`schedules`/`services`, so the
+ * budget guardrail below can also be run with it enabled against a correspondingly higher ceiling
+ * (see that test's own derivation comment).
  */
-function wire(pod: MockPod, timers: ReturnType<typeof createTimerHarness>) {
+function wire(pod: MockPod, timers: ReturnType<typeof createTimerHarness>, serverFaultSensorEnabled = false) {
   const snapshot = new SnapshotStore({ timers });
   const client = clientFor(pod);
   const poller = new PodPoller({
@@ -35,6 +42,7 @@ function wire(pod: MockPod, timers: ReturnType<typeof createTimerHarness>) {
     slowPollIntervalMs: 300_000,
     fastPollIntervalMs: 5_000,
     maxBackoffMs: 60_000,
+    serverFaultSensorEnabled,
   });
   let releaseWriteMode: (() => void) | null = null;
   const requestFastPoll = (lane: 'deviceStatus' | 'settings', untilMs: number): void => {
@@ -63,13 +71,25 @@ function wire(pod: MockPod, timers: ReturnType<typeof createTimerHarness>) {
 // ---------------------------------------------------------------------------------------
 
 describe('guardrail: the five-minute Home-app session (10.1, 10.2, 10.4)', () => {
-  it('stays within the request budget: <=40 total, exactly 1 write, >=10 deviceStatus reads, zero delta across each read burst', async () => {
+  // N6 (hub-accessory PR #44 review): parameterized over `serverFaultSensorEnabled` so the
+  // guardrail also covers the shape most installs won't opt into but some will. The derived
+  // ceiling accounts for exactly two extra requests when enabled — a `serverStatus` poll shares
+  // the slow cadence with `settings`/`schedules`/`services`, so it gains one request at bootstrap
+  // (5 classes fire instead of 4) and one more at the scenario's own second slow-class poll at
+  // t=300s (4 requests instead of 3) — the same `+40`-over-the-31-32-derivation headroom logic
+  // the disabled case's own comment below explains, just shifted by that `+2`.
+  it.each([
+    { serverFaultSensorEnabled: false, ceiling: 40 },
+    { serverFaultSensorEnabled: true, ceiling: 42 },
+  ])(
+    'stays within the request budget (serverFaultSensorEnabled=$serverFaultSensorEnabled, ceiling=$ceiling): exactly 1 write, >=10 deviceStatus reads, zero delta across each read burst',
+    async ({ serverFaultSensorEnabled, ceiling }) => {
     vi.useFakeTimers();
     const pod = await startMockPod();
     try {
       const timers = createTimerHarness();
       timers.random = () => 0.5; // jitter fixed to zero, per design.md's derivation table
-      const { snapshot, poller, queue } = wire(pod, timers);
+      const { snapshot, poller, queue } = wire(pod, timers, serverFaultSensorEnabled);
 
       // --- t = 0: bootstrap, all four classes -------------------------------------------
       await poller.bootstrap();
@@ -113,17 +133,28 @@ describe('guardrail: the five-minute Home-app session (10.1, 10.2, 10.4)', () =>
       // the real HTTP round trips to the mock actually settle between virtual-time jumps —
       // see timerHarness.ts) lands one request shy of that at 31, an artifact of step boundary
       // rounding rather than a scheduling bug; either way the sharp per-burst delta assertions
-      // above are the precise proof, and this total is the coarse net. N = 40 gives comfortable
-      // headroom over 31-32 so a default tweak or slightly different drag timing doesn't flake
-      // this test, while staying far below what any real regression produces (see the
+      // above are the precise proof, and this total is the coarse net. N = 40 (42 with
+      // serverFaultSensorEnabled, per this describe block's own comment) gives comfortable
+      // headroom over 31-32 (33-34) so a default tweak or slightly different drag timing doesn't
+      // flake this test, while staying far below what any real regression produces (see the
       // "guardrail actually guards" test below for a concrete failing case).
-      expect(pod.requests.length).toBeLessThanOrEqual(40);
+      expect(pod.requests.length).toBeLessThanOrEqual(ceiling);
 
       const writes = pod.requests.filter((r) => r.method === 'POST');
       expect(writes.length).toBe(1); // catches a coalescing regression (6 separate POSTs -> 37, still <40)
 
       const deviceStatusReads = pod.requests.filter((r) => r.method === 'GET' && r.path === '/api/deviceStatus');
       expect(deviceStatusReads.length).toBeGreaterThanOrEqual(10); // catches a poller that silently died
+
+      if (serverFaultSensorEnabled) {
+        // At least the bootstrap poll; the scenario's own t=300s second slow-class poll is
+        // subject to the same fake-timer step-boundary rounding the derivation comment above
+        // already documents for deviceStatus reads (31 vs. the derived 32), so this stays a
+        // loose floor rather than an exact count — the ceiling assertion above is what actually
+        // proves the +2 budget.
+        const serverStatusReads = pod.requests.filter((r) => r.method === 'GET' && r.path === '/api/serverStatus');
+        expect(serverStatusReads.length).toBeGreaterThanOrEqual(1);
+      }
     } finally {
       await pod.close();
     }

@@ -29,7 +29,7 @@ import { CONNECTION_SUBTYPE } from '../src/services/connection.js';
 import { WATER_LOW_SUBTYPE } from '../src/services/waterLow.js';
 import { PRIME_SUBTYPE } from '../src/services/prime.js';
 import { LED_SUBTYPE } from '../src/services/led.js';
-import { TEST_ALARM_SUBTYPE } from '../src/services/testAlarm.js';
+import { TEST_ALARM_LEFT_SUBTYPE, TEST_ALARM_RIGHT_SUBTYPE } from '../src/services/testAlarm.js';
 import { SERVER_FAULT_SUBTYPE } from '../src/services/serverFault.js';
 import { fToC } from '../src/pod/temperature.js';
 import {
@@ -86,7 +86,8 @@ interface PlatformInternals {
   connectionService: { refresh: () => void } | undefined;
   waterLowService: { refresh: () => void } | undefined;
   primeService: { refresh: () => void; stop: () => void } | undefined;
-  testAlarmService: { stop: () => void } | undefined;
+  ledService: { refresh: () => void } | undefined;
+  testAlarmServices: Map<Side, { stop: () => void }>;
   serverFaultService: { refresh: () => void } | undefined;
   handleSnapshotChanges: (changes: readonly Change[]) => void;
 }
@@ -719,7 +720,10 @@ describe('the hub\'s enabled service set grows and shrinks with its own configur
       ]);
       if (overrides.primeSwitch) expected.add(`${hap.Service.Switch.UUID}:${PRIME_SUBTYPE}`);
       if (overrides.ledLightbulb) expected.add(`${hap.Service.Lightbulb.UUID}:${LED_SUBTYPE}`);
-      if (overrides.testAlarmSwitch) expected.add(`${hap.Service.Switch.UUID}:${TEST_ALARM_SUBTYPE}`);
+      if (overrides.testAlarmSwitch) {
+        expected.add(`${hap.Service.Switch.UUID}:${TEST_ALARM_LEFT_SUBTYPE}`);
+        expected.add(`${hap.Service.Switch.UUID}:${TEST_ALARM_RIGHT_SUBTYPE}`);
+      }
       if (overrides.serverFaultSensor) expected.add(`${hap.Service.ContactSensor.UUID}:${SERVER_FAULT_SUBTYPE}`);
 
       expect(keys).toEqual(expected);
@@ -728,7 +732,7 @@ describe('the hub\'s enabled service set grows and shrinks with its own configur
 });
 
 describe('constructServicesFor grows to construct all four conditional hub services (tasks.md 9.3)', () => {
-  it('all four enabled: all five hub services (plus connection) exist on the hub accessory', async () => {
+  it('all four enabled: all six hub services (plus connection) exist on the hub accessory', async () => {
     const { platform } = await simulateRestart(
       factory(resolvedFakeClient()),
       baseConfig({ primeSwitch: true, ledLightbulb: true, testAlarmSwitch: true, serverFaultSensor: true }),
@@ -738,7 +742,10 @@ describe('constructServicesFor grows to construct all four conditional hub servi
     expect(i.connectionService).toBeDefined();
     expect(i.waterLowService).toBeDefined();
     expect(i.primeService).toBeDefined();
-    expect(i.testAlarmService).toBeDefined();
+    expect(i.ledService).toBeDefined();
+    // G0: two per-side TestAlarmServices, not one shared instance.
+    expect(i.testAlarmServices.get('left')).toBeDefined();
+    expect(i.testAlarmServices.get('right')).toBeDefined();
     expect(i.serverFaultService).toBeDefined();
   });
 
@@ -752,7 +759,8 @@ describe('constructServicesFor grows to construct all four conditional hub servi
     expect(i.connectionService).toBeDefined();
     expect(i.waterLowService).toBeDefined();
     expect(i.primeService).toBeUndefined();
-    expect(i.testAlarmService).toBeUndefined();
+    expect(i.ledService).toBeUndefined();
+    expect(i.testAlarmServices.size).toBe(0);
     expect(i.serverFaultService).toBeUndefined();
   });
 });
@@ -817,6 +825,49 @@ describe('the three new hub-accessory snapshot fields route only to their own se
     expect(primeSpy).not.toHaveBeenCalled();
     expect(waterLowSpy).not.toHaveBeenCalled();
   });
+
+  // S1 fix (PR #44 review): the serverStatus poll's own reachability axis also routes to
+  // ServerFaultService.refresh() — distinct from, but landing on the same service as, the
+  // `serverFault` payload signal above.
+  it('serverStatusOnline routes only to ServerFaultService.refresh()', async () => {
+    const { platform } = await simulateRestart(
+      factory(resolvedFakeClient()),
+      baseConfig({ primeSwitch: true, ledLightbulb: true, testAlarmSwitch: true, serverFaultSensor: true }),
+      [],
+    );
+    const i = internals(platform);
+    const primeSpy = vi.spyOn(i.primeService!, 'refresh');
+    const waterLowSpy = vi.spyOn(i.waterLowService!, 'refresh');
+    const serverFaultSpy = vi.spyOn(i.serverFaultService!, 'refresh');
+
+    i.handleSnapshotChanges([{ scope: 'device', field: 'serverStatusOnline', previous: true, current: false }]);
+
+    expect(serverFaultSpy).toHaveBeenCalledTimes(1);
+    expect(primeSpy).not.toHaveBeenCalled();
+    expect(waterLowSpy).not.toHaveBeenCalled();
+  });
+
+  // S2 fix (PR #44 review): an externally-changed LED brightness/on-off routes to
+  // LedService.refresh() so the tile no longer goes stale after construction.
+  it('ledBrightness routes only to LedService.refresh()', async () => {
+    const { platform } = await simulateRestart(
+      factory(resolvedFakeClient()),
+      baseConfig({ primeSwitch: true, ledLightbulb: true, testAlarmSwitch: true, serverFaultSensor: true }),
+      [],
+    );
+    const i = internals(platform);
+    const primeSpy = vi.spyOn(i.primeService!, 'refresh');
+    const waterLowSpy = vi.spyOn(i.waterLowService!, 'refresh');
+    const serverFaultSpy = vi.spyOn(i.serverFaultService!, 'refresh');
+    const ledSpy = vi.spyOn(i.ledService!, 'refresh');
+
+    i.handleSnapshotChanges([{ scope: 'device', field: 'ledBrightness', previous: 20, current: 80 }]);
+
+    expect(ledSpy).toHaveBeenCalledTimes(1);
+    expect(primeSpy).not.toHaveBeenCalled();
+    expect(waterLowSpy).not.toHaveBeenCalled();
+    expect(serverFaultSpy).not.toHaveBeenCalled();
+  });
 });
 
 // ---------------------------------------------------------------------------------------
@@ -847,7 +898,10 @@ describe('shutdown stops PrimeService and TestAlarmService alongside the existin
       const hub = api.registeredAccessories.find((a) => a.displayName === 'Pod')!;
       const hap = api.hap;
       const primeSwitch = hub.getServiceById(hap.Service.Switch, PRIME_SUBTYPE)!;
-      const testAlarmSwitch = hub.getServiceById(hap.Service.Switch, TEST_ALARM_SUBTYPE)!;
+      // G0: two per-side test-alarm switches — exercise both, so shutdown must clear both
+      // TestAlarmService instances' self-reset timers.
+      const testAlarmLeftSwitch = hub.getServiceById(hap.Service.Switch, TEST_ALARM_LEFT_SUBTYPE)!;
+      const testAlarmRightSwitch = hub.getServiceById(hap.Service.Switch, TEST_ALARM_RIGHT_SUBTYPE)!;
 
       // Refused prime-off write — schedules PrimeService's revert timer.
       const primeOn = primeSwitch.getCharacteristic(hap.Characteristic.On);
@@ -855,10 +909,14 @@ describe('shutdown stops PrimeService and TestAlarmService alongside the existin
       primeOff.catch(() => undefined);
       await vi.advanceTimersByTimeAsync(0);
 
-      // An in-flight test-alarm trigger — schedules TestAlarmService's self-reset timer.
-      const testAlarmOn = testAlarmSwitch.getCharacteristic(hap.Characteristic.On);
-      const alarmPending = testAlarmOn.handleSetRequest(true);
-      alarmPending.catch(() => undefined);
+      // In-flight test-alarm triggers, both sides — schedules each TestAlarmService's own
+      // self-reset timer.
+      const testAlarmLeftOn = testAlarmLeftSwitch.getCharacteristic(hap.Characteristic.On);
+      const alarmLeftPending = testAlarmLeftOn.handleSetRequest(true);
+      alarmLeftPending.catch(() => undefined);
+      const testAlarmRightOn = testAlarmRightSwitch.getCharacteristic(hap.Characteristic.On);
+      const alarmRightPending = testAlarmRightOn.handleSetRequest(true);
+      alarmRightPending.catch(() => undefined);
       await vi.advanceTimersByTimeAsync(0);
 
       expect(timers.pendingCount()).toBeGreaterThan(perAccessoryOverhead);

@@ -51,7 +51,7 @@ import { CONNECTION_SUBTYPE, ConnectionService } from './services/connection.ts'
 import { LED_SUBTYPE, LedService } from './services/led.ts';
 import { PRIME_SUBTYPE, PrimeService } from './services/prime.ts';
 import { SERVER_FAULT_SUBTYPE, ServerFaultService } from './services/serverFault.ts';
-import { TEST_ALARM_SUBTYPE, TestAlarmService } from './services/testAlarm.ts';
+import { TEST_ALARM_LEFT_SUBTYPE, TEST_ALARM_RIGHT_SUBTYPE, TestAlarmService } from './services/testAlarm.ts';
 import { isThermostatChange, THERMOSTAT_SUBTYPE, ThermostatService } from './services/thermostat.ts';
 import type { ServiceContext } from './services/types.ts';
 import { WATER_LOW_SUBTYPE, WaterLowService } from './services/waterLow.ts';
@@ -168,7 +168,11 @@ function enabledServiceKeysFor(hap: HAP, role: Role, config: FreeSleepConfig): R
     ];
     if (config.primeSwitch) keys.push(`${hap.Service.Switch.UUID}:${PRIME_SUBTYPE}`);
     if (config.ledLightbulb) keys.push(`${hap.Service.Lightbulb.UUID}:${LED_SUBTYPE}`);
-    if (config.testAlarmSwitch) keys.push(`${hap.Service.Switch.UUID}:${TEST_ALARM_SUBTYPE}`);
+    // G0 (tech-lead ruling, PR #44 review): two independent per-side switches, not one
+    // both-sides switch — still gated by the single `testAlarmSwitch` boolean.
+    if (config.testAlarmSwitch) {
+      keys.push(`${hap.Service.Switch.UUID}:${TEST_ALARM_LEFT_SUBTYPE}`, `${hap.Service.Switch.UUID}:${TEST_ALARM_RIGHT_SUBTYPE}`);
+    }
     if (config.serverFaultSensor) keys.push(`${hap.Service.ContactSensor.UUID}:${SERVER_FAULT_SUBTYPE}`);
     return new Set(keys);
   }
@@ -213,12 +217,13 @@ export class FreeSleepPlatform implements DynamicPlatformPlugin {
   private connectionService: ConnectionService | undefined;
   private waterLowService: WaterLowService | undefined;
   private primeService: PrimeService | undefined;
-  // No stored `ledService` field: unlike the other four hub services, `LedService` watches no
-  // snapshot-change field (`ledBrightness` is not among `pod-snapshot`'s watched fields,
-  // design.md's Decision 2) and owns no timer for `shutdown` to stop — there is nothing for
-  // `handleSnapshotChanges` or `shutdown` to reach it for, so it is constructed and left to the
-  // accessory's own service list rather than retained here unused.
-  private testAlarmService: TestAlarmService | undefined;
+  // S2 fix (PR #44 review): `LedService` is now retained — `ledBrightness` became a watched
+  // `DeviceChangeField` (`src/pod/snapshot.ts`) so an externally-changed brightness/on-off reaches
+  // the "Pod LED" tile, and `handleSnapshotChanges` needs this reference to route to it.
+  private ledService: LedService | undefined;
+  // G0 (tech-lead ruling, PR #44 review): one `TestAlarmService` per side, not one shared,
+  // both-sides instance — mirrors `thermostats`' own per-`Side` map.
+  private readonly testAlarmServices = new Map<Side, TestAlarmService>();
   private serverFaultService: ServerFaultService | undefined;
 
   constructor(
@@ -299,6 +304,11 @@ export class FreeSleepPlatform implements DynamicPlatformPlugin {
           void poller.refresh('settings');
         }
       },
+      // S4 fix (PR #44 review): a bounded pre-dispatch refresh for the device lane, via the same
+      // lane-aware callback-injection pattern `requestFastPoll` above already establishes —
+      // `writeQueue.ts` still never imports `poller.ts` (design.md, "Module dependency
+      // direction").
+      refreshDeviceStatus: () => poller.refresh('deviceStatus'),
       awayModeGuard,
       timers: this.timers,
       ...(pollOptions.writeDebounceMs !== undefined ? { writeDebounceMs: pollOptions.writeDebounceMs } : {}),
@@ -346,7 +356,9 @@ export class FreeSleepPlatform implements DynamicPlatformPlugin {
         thermostat.stop();
       }
       this.primeService?.stop();
-      this.testAlarmService?.stop();
+      for (const testAlarmService of this.testAlarmServices.values()) {
+        testAlarmService.stop();
+      }
       this.unsubscribeSnapshot?.();
       this.unsubscribeSnapshot = undefined;
     });
@@ -370,6 +382,13 @@ export class FreeSleepPlatform implements DynamicPlatformPlugin {
           this.primeService?.refresh();
         } else if (change.scope === 'device' && change.field === 'serverFault') {
           this.serverFaultService?.refresh();
+        } else if (change.scope === 'device' && change.field === 'serverStatusOnline') {
+          // S1 fix (PR #44 review): the reachability axis, independent of the payload signal
+          // above — both route to the same service's `refresh()`, which reads both.
+          this.serverFaultService?.refresh();
+        } else if (change.scope === 'device' && change.field === 'ledBrightness') {
+          // S2 fix (PR #44 review): an externally-changed brightness/on-off must reach the tile.
+          this.ledService?.refresh();
         }
         // isAlarmVibrating, awayMode: no published service watches these fields yet — ignored,
         // without error (design.md's routing table; #13/#16/#19).
@@ -405,8 +424,11 @@ export class FreeSleepPlatform implements DynamicPlatformPlugin {
       this.connectionService = new ConnectionService(ctx);
       this.waterLowService = new WaterLowService(ctx);
       if (ctx.config.primeSwitch) this.primeService = new PrimeService(ctx);
-      if (ctx.config.ledLightbulb) new LedService(ctx);
-      if (ctx.config.testAlarmSwitch) this.testAlarmService = new TestAlarmService(ctx);
+      if (ctx.config.ledLightbulb) this.ledService = new LedService(ctx);
+      if (ctx.config.testAlarmSwitch) {
+        this.testAlarmServices.set('left', new TestAlarmService(ctx, 'left'));
+        this.testAlarmServices.set('right', new TestAlarmService(ctx, 'right'));
+      }
       if (ctx.config.serverFaultSensor) this.serverFaultService = new ServerFaultService(ctx);
     } else {
       this.thermostats.set(role, new ThermostatService(ctx, role, this.platformStartedAt));

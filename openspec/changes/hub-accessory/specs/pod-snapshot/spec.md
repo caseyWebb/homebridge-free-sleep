@@ -6,8 +6,13 @@ The set of fields that produce change notifications SHALL be enumerated explicit
 derived from a generic deep comparison of responses. It SHALL cover, per side, the current
 temperature, the target temperature, the power state, the alarm-vibrating state, and away
 mode; and, for the device as a whole, the water-level interpretation, the priming state,
-reachability of the device-status endpoint, and whether the most recently observed subsystem
-health report contains a failed subsystem.
+reachability of the device-status endpoint, reachability of the subsystem-health endpoint
+(**revised, S1, PR #44 review** — this endpoint's reachability was already tracked as data,
+per the "ADDED Requirements" section below, but was not itself a watched field until this
+revision), whether the most recently observed subsystem health report contains a failed
+subsystem, and the LED brightness (**revised, S2, PR #44 review** — an externally-changed
+brightness must reach the "Pod LED" tile, not only a change this plugin's own write path
+already accelerates via the fast-poll window).
 
 A field that changes on essentially every observation by its nature — in particular the
 remaining-seconds countdown — SHALL NOT be a watched field. It SHALL still be readable from
@@ -36,6 +41,25 @@ notification, because doing so would emit an event on every poll forever.
 
 - **WHEN** a new subsystem-health observation reports the identical set of failed-or-not
   subsystems, and the derived failure boolean is therefore unchanged
+- **THEN** no change notification is delivered for that field
+
+#### Scenario: A subsystem-health reachability transition generates one notification (S1, PR #44 review)
+
+- **WHEN** the subsystem-health endpoint's reachability changes — a success following a
+  failure, or a failure following a success
+- **THEN** exactly one change notification is delivered carrying that field, distinct from any
+  notification carrying the failed-subsystem-derivation field
+
+#### Scenario: A change in LED brightness generates one notification (S2, PR #44 review)
+
+- **WHEN** a device-status observation's LED brightness differs from the previous observation's,
+  regardless of whether this plugin's own write path caused the change
+- **THEN** exactly one change notification is delivered carrying that field
+
+#### Scenario: An unchanged LED brightness generates no event (S2, PR #44 review)
+
+- **WHEN** a new device-status observation reports the identical LED brightness as the previous
+  one
 - **THEN** no change notification is delivered for that field
 
 ## ADDED Requirements

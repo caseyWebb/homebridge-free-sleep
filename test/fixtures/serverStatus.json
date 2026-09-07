@@ -70,5 +70,11 @@
     "status": "healthy",
     "description": "Temperature scheduler",
     "message": "OK"
+  },
+  "biometricsInstallation": {
+    "name": "biometricsInstallation",
+    "status": "healthy",
+    "description": "Biometrics installation",
+    "message": "OK"
   }
 }
