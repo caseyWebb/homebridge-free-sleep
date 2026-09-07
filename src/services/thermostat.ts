@@ -20,6 +20,7 @@ import { AwayModeBlockedError } from '../pod/awayModeGuard.ts';
 import { clampTargetF, cToF, fToC, TARGET_TEMP_PROPS } from '../pod/temperature.ts';
 import type { Change, EffectiveSideStatus, TimerHandle } from '../pod/snapshot.ts';
 import type { Side } from '../pod/types.ts';
+import { CONFIGURED_NAME, seedConfiguredName } from './serviceName.ts';
 import type { ServiceContext } from './types.ts';
 
 /** How long after a `block`-refused write to correct any characteristic value HAP applied
@@ -89,6 +90,7 @@ export class ThermostatService {
 
     const existing = accessory.getServiceById(hap.Service.Thermostat, THERMOSTAT_SUBTYPE);
     this.service = existing ?? accessory.addService(new hap.Service.Thermostat(accessory.displayName, THERMOSTAT_SUBTYPE));
+    seedConfiguredName(this.service, hap, CONFIGURED_NAME.thermostat);
 
     // Every setProps call happens before any value is set and before the accessory is
     // registered (specs/thermostat-service/spec.md, tasks.md 2.3) — `setProps` after publish

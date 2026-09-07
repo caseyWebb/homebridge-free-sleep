@@ -20,6 +20,7 @@
 
 import type { Characteristic, Service, WithUUID } from 'homebridge';
 
+import { CONFIGURED_NAME, seedConfiguredName } from './serviceName.ts';
 import type { ServiceContext } from './types.ts';
 
 export const CONNECTION_SUBTYPE = 'connection';
@@ -46,6 +47,7 @@ export class ConnectionService {
     const existing = accessory.getServiceById(hap.Service.ContactSensor, CONNECTION_SUBTYPE);
     this.service =
       existing ?? accessory.addService(new hap.Service.ContactSensor(POD_CONNECTION_NAME, CONNECTION_SUBTYPE));
+    seedConfiguredName(this.service, hap, CONFIGURED_NAME.podConnection);
 
     ensureCharacteristic(this.service, hap.Characteristic.StatusFault);
     ensureCharacteristic(this.service, hap.Characteristic.StatusActive);

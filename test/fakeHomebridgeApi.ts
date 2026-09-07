@@ -73,6 +73,25 @@ export class FakePlatformAccessory<T extends UnknownContext = UnknownContext> ex
     this.services = this._associatedHAPAccessory.services;
   }
 
+  /**
+   * Wraps an already-constructed hap-nodejs `Accessory` — notably one produced by
+   * `Accessory.deserialize(...)` — instead of building a fresh one the way the normal
+   * constructor does. This is what lets a test represent a genuinely restored cached
+   * accessory (round-tripped through hap-nodejs's own `serialize`/`deserialize`, so a
+   * characteristic can be truly *absent*, not merely unmodified on a live object) rather than
+   * the live-object reuse `simulateRestart` does, which cannot represent that case.
+   */
+  static fromHapAccessory(hapAccessory: Accessory): FakePlatformAccessory {
+    // Goes through the normal constructor (so `EventEmitter`'s own state is properly
+    // initialized) with `hapAccessory`'s own displayName/UUID/category, then swaps in
+    // `hapAccessory` itself in place of the throwaway `Accessory` the constructor built —
+    // `_associatedHAPAccessory` is `readonly` only at the type level, not at runtime.
+    const wrapper = new FakePlatformAccessory(hapAccessory.displayName, hapAccessory.UUID, hapAccessory.category);
+    (wrapper as unknown as { _associatedHAPAccessory: Accessory })._associatedHAPAccessory = hapAccessory;
+    wrapper.services = hapAccessory.services;
+    return wrapper;
+  }
+
   updateDisplayName(name: string): void {
     this.displayName = name;
     this._associatedHAPAccessory.displayName = name;

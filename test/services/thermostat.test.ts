@@ -9,8 +9,10 @@ import { SnapshotStore } from '../../src/pod/snapshot.js';
 import { cToF, F_MAX, F_MIN, fToC } from '../../src/pod/temperature.js';
 import { DeviceStatusSchema, type DeviceStatus, type Settings } from '../../src/pod/types.js';
 import { WriteQueue, type FastPollLane } from '../../src/pod/writeQueue.js';
+import { CONFIGURED_NAME } from '../../src/services/serviceName.js';
 import { isThermostatChange, THERMOSTAT_SUBTYPE, ThermostatService } from '../../src/services/thermostat.js';
 import type { ServiceContext } from '../../src/services/types.js';
+import { captureCharacteristicWarnings } from './configuredNameHelpers.js';
 import { createFakePodClient, type FakePodClient } from '../fakePodClient.js';
 import { FakeHomebridgeApi, FakePlatformAccessory, createFakeLogging } from '../fakeHomebridgeApi.js';
 import { loadFixture } from '../loadFixture.js';
@@ -847,5 +849,36 @@ describe('isThermostatChange', () => {
     expect(isThermostatChange({ scope: 'side', field: 'isOn', side: 'left', previous: false, current: true })).toBe(true);
     expect(isThermostatChange({ scope: 'side', field: 'awayMode', side: 'left', previous: false, current: true })).toBe(false);
     expect(isThermostatChange({ scope: 'device', field: 'connectionOnline', previous: false, current: true })).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------------------
+// ConfiguredName seeding (release-polish tasks.md 2.1)
+// ---------------------------------------------------------------------------------------
+
+describe('ConfiguredName seeding (2.1)', () => {
+  it('seeds ConfiguredName to "Thermostat" on first construction', () => {
+    const { ctx, accessory, api } = setup();
+    new ThermostatService(ctx, 'left', 0);
+    const service = accessory.services.find((sv) => sv.UUID === api.hap.Service.Thermostat.UUID)!;
+    expect(service.getCharacteristic(Characteristic.ConfiguredName).value).toBe(CONFIGURED_NAME.thermostat);
+  });
+
+  it('leaves an existing ConfiguredName (e.g. a controller rename) untouched on reconstruction', () => {
+    const { ctx, accessory, api } = setup();
+    new ThermostatService(ctx, 'left', 0);
+    const service = accessory.services.find((sv) => sv.UUID === api.hap.Service.Thermostat.UUID)!;
+    service.getCharacteristic(Characteristic.ConfiguredName).updateValue('Bedroom Thermostat');
+
+    new ThermostatService(ctx, 'left', 0); // simulates a restart against the same accessory
+
+    expect(service.getCharacteristic(Characteristic.ConfiguredName).value).toBe('Bedroom Thermostat');
+  });
+
+  it('adds ConfiguredName without emitting a characteristic-warning event', () => {
+    const { ctx, accessory } = setup();
+    const warnings = captureCharacteristicWarnings(accessory);
+    new ThermostatService(ctx, 'left', 0);
+    expect(warnings).toHaveLength(0);
   });
 });

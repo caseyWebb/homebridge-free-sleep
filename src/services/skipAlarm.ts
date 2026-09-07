@@ -73,6 +73,7 @@ import type { Service } from 'homebridge';
 import type { Change, TimerHandle } from '../pod/snapshot.ts';
 import type { Side } from '../pod/types.ts';
 import { nextAlarmSkipInstant } from '../pod/alarmSchedule.ts';
+import { CONFIGURED_NAME, seedConfiguredName } from './serviceName.ts';
 import type { ServiceContext } from './types.ts';
 
 export const SKIP_ALARM_SUBTYPE = 'skipAlarm';
@@ -164,6 +165,7 @@ export class SkipAlarmService {
 
     const existing = accessory.getServiceById(hap.Service.Switch, SKIP_ALARM_SUBTYPE);
     this.service = existing ?? accessory.addService(new hap.Service.Switch(SKIP_ALARM_NAMES[side], SKIP_ALARM_SUBTYPE));
+    seedConfiguredName(this.service, hap, CONFIGURED_NAME.skipNextAlarm);
 
     this.wireReadsAndWrites();
 

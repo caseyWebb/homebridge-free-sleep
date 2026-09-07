@@ -36,6 +36,7 @@ import type { Service } from 'homebridge';
 
 import type { TimerHandle } from '../pod/snapshot.ts';
 import type { AlarmRequest, Side } from '../pod/types.ts';
+import { seedConfiguredName, TEST_ALARM_CONFIGURED_NAME } from './serviceName.ts';
 import type { ServiceContext } from './types.ts';
 
 /** Per-side subtypes — distinct HAP services, each independently restorable/prunable. */
@@ -47,10 +48,14 @@ export const TEST_ALARM_SUBTYPES: Readonly<Record<Side, string>> = {
   right: TEST_ALARM_RIGHT_SUBTYPE,
 };
 
-const TEST_ALARM_NAMES: Readonly<Record<Side, string>> = {
-  left: 'Test Alarm Left',
-  right: 'Test Alarm Right',
-};
+/** The pre-existing `Name` convention for these two switches (design.md's own note: the
+ * `ConfiguredName` default for this pair is "already fully-formed", i.e. identical to this).
+ * Defined in terms of the already-imported `TEST_ALARM_CONFIGURED_NAME` rather than duplicating
+ * its literal strings — this module already depends on `./serviceName.ts` for
+ * `seedConfiguredName`, so aliasing here (rather than having `serviceName.ts` import back from
+ * this module) keeps that a one-directional dependency instead of a module cycle. Exported for
+ * any caller that wants the `Name`-convention value specifically. */
+export const TEST_ALARM_NAMES: Readonly<Record<Side, string>> = TEST_ALARM_CONFIGURED_NAME;
 
 /** Issue #20's own "self-reset after ~1s" (design.md's Decision 6). */
 const RESET_DELAY_MS = 1000;
@@ -88,6 +93,7 @@ export class TestAlarmService {
 
     const existing = accessory.getServiceById(hap.Service.Switch, subtype);
     this.service = existing ?? accessory.addService(new hap.Service.Switch(TEST_ALARM_NAMES[side], subtype));
+    seedConfiguredName(this.service, hap, TEST_ALARM_CONFIGURED_NAME[side]);
 
     this.wireWrites();
   }

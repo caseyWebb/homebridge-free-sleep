@@ -2,7 +2,7 @@
   "pluginAlias": "FreeSleep",
   "pluginType": "platform",
   "singular": true,
-  "headerDisplay": "Exposes an Eight Sleep Pod running the free-sleep firmware to Apple HomeKit. `host` is the only field most installs need. `sides`, the poll/write timing overrides, the No Response delay, keep-alive, the occupancy source, the water-low sensor type, alarm events, the per-side Away Mode and Skip Next Alarm switches, and the four hub-service toggles (prime, LED, test alarm, server fault) are live; the remaining fields are reserved for a future release and have no effect yet.",
+  "headerDisplay": "Exposes an Eight Sleep Pod running the free-sleep firmware to Apple HomeKit. `host` is the only field most installs need. Every other field below — `sides`, the poll/write timing overrides, the No Response delay, keep-alive, the occupancy source, the water-low sensor type, alarm events, the per-side Away Mode and Skip Next Alarm switches, and the four hub-service toggles (prime, LED, test alarm, server fault) — is live and optional.",
   "schema": {
     "type": "object",
     "properties": {

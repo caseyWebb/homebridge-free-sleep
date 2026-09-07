@@ -8,8 +8,10 @@ import { AwayModeGuard } from '../../src/pod/awayModeGuard.js';
 import { SnapshotStore } from '../../src/pod/snapshot.js';
 import { DeviceStatusSchema, SchedulesSchema, ServicesSchema, SettingsSchema } from '../../src/pod/types.js';
 import { WriteQueue } from '../../src/pod/writeQueue.js';
-import { WATER_LOW_SUBTYPE, WaterLowService } from '../../src/services/waterLow.js';
+import { CONFIGURED_NAME } from '../../src/services/serviceName.js';
 import type { ServiceContext } from '../../src/services/types.js';
+import { WATER_LOW_SUBTYPE, WaterLowService } from '../../src/services/waterLow.js';
+import { captureCharacteristicWarnings } from './configuredNameHelpers.js';
 import { createFakePodClient } from '../fakePodClient.js';
 import { FakeHomebridgeApi, FakePlatformAccessory, createFakeLogging } from '../fakeHomebridgeApi.js';
 import { loadFixture } from '../loadFixture.js';
@@ -215,5 +217,39 @@ describe('B1: bootstrap-observed state is pushed at construction', () => {
       s.api.hap.Characteristic.ContactSensorState.CONTACT_DETECTED,
     );
     void service;
+  });
+});
+
+// ---------------------------------------------------------------------------------------
+// ConfiguredName seeding (release-polish tasks.md 2.9)
+// ---------------------------------------------------------------------------------------
+
+describe('ConfiguredName seeding (2.9)', () => {
+  it('seeds ConfiguredName to "Water Level" on first construction, regardless of waterLowSensorType', () => {
+    const s = setup();
+    const ctx = contextFor(s);
+    new WaterLowService(ctx);
+    const service = s.accessory.getServiceById(s.api.hap.Service.ContactSensor, WATER_LOW_SUBTYPE)!;
+    expect(service.getCharacteristic(Characteristic.ConfiguredName).value).toBe(CONFIGURED_NAME.waterLevel);
+  });
+
+  it('leaves an existing ConfiguredName (e.g. a controller rename) untouched on reconstruction', () => {
+    const s = setup();
+    const ctx = contextFor(s);
+    new WaterLowService(ctx);
+    const service = s.accessory.getServiceById(s.api.hap.Service.ContactSensor, WATER_LOW_SUBTYPE)!;
+    service.getCharacteristic(Characteristic.ConfiguredName).updateValue('Bedroom Water Level');
+
+    new WaterLowService(ctx); // simulates a restart against the same accessory
+
+    expect(service.getCharacteristic(Characteristic.ConfiguredName).value).toBe('Bedroom Water Level');
+  });
+
+  it('adds ConfiguredName without emitting a characteristic-warning event', () => {
+    const s = setup();
+    const ctx = contextFor(s);
+    const warnings = captureCharacteristicWarnings(s.accessory);
+    new WaterLowService(ctx);
+    expect(warnings).toHaveLength(0);
   });
 });

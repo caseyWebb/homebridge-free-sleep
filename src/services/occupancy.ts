@@ -28,6 +28,7 @@ import type { Characteristic, Service, WithUUID } from 'homebridge';
 
 import type { Change, EffectiveSideStatus } from '../pod/snapshot.ts';
 import type { Side } from '../pod/types.ts';
+import { CONFIGURED_NAME, seedConfiguredName } from './serviceName.ts';
 import type { ServiceContext } from './types.ts';
 
 export const OCCUPANCY_SUBTYPE = 'occupancy';
@@ -75,6 +76,7 @@ export class OccupancySensorService {
       accessory.addService(
         new hap.Service.OccupancySensor(`${accessory.displayName} ${OCCUPANCY_NAME_SUFFIX}`, OCCUPANCY_SUBTYPE),
       );
+    seedConfiguredName(this.service, hap, CONFIGURED_NAME.occupancy);
 
     ensureCharacteristic(this.service, hap.Characteristic.StatusActive);
 
