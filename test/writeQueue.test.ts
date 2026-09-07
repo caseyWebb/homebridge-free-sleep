@@ -763,3 +763,90 @@ describe('write queue: stop() (9.7)', () => {
     expect(timers.pendingCount()).toBe(0);
   });
 });
+
+// ---------------------------------------------------------------------------------------
+// 10 — user-intent priority (keep-alive change, tasks.md 4.9 and 6.1, tech-lead resolution 5)
+//
+// `submitSide`'s third argument (`origin`, default `'user'`) lets a caller mark itself as
+// `'keepAlive'`. When a debounce-window merge combines a user-origin `isOn` with a
+// keep-alive-origin `secondsRemaining`, `applyOriginPriority` drops the keep-alive field before
+// `reduceDurationFields` runs at all — so the user's explicit power toggle is what dispatches,
+// never overridden by a same-window re-arm. The first test below is the pre-fix baseline,
+// replayed unchanged: two *same*-origin (`'user'`) submissions still get the ordinary four-case
+// reduction with no origin-priority involved at all, proving the fix is scoped to the specific
+// cross-origin combination and does not alter `pod-write-queue`'s existing, reviewed rule.
+// ---------------------------------------------------------------------------------------
+
+describe('write queue: user-intent priority (10, keep-alive tech-lead resolution 5)', () => {
+  it("baseline (unchanged): two same-origin ('user') submissions in one window still resolve by the four-case reduction — secondsRemaining wins, exactly as 8.3's ordering already covers", async () => {
+    // Real timers only — see the note on the 8.2 describe block above.
+    vi.useRealTimers();
+    const pod = await startMockPod();
+    try {
+      const timers = createTimerHarness();
+      const snapshot = new SnapshotStore({ timers });
+      const queue = new WriteQueue({ client: clientFor(pod), snapshot, requestFastPoll: () => {}, timers });
+
+      const p1 = queue.submitSide('left', { isOn: false }); // default origin: 'user'
+      const p2 = queue.submitSide('left', { secondsRemaining: 600 }); // default origin: 'user'
+      await realDelay(450);
+      await Promise.all([p1, p2]);
+
+      expect(pod.state.deviceStatus.left.secondsRemaining).toBe(600); // unchanged baseline outcome
+      queue.stop();
+    } finally {
+      await pod.close();
+    }
+  });
+
+  it("an explicit user off submitted in the same debounce window as a keep-alive re-arm always turns the side off, with no optimistic-tile reversion (pod-keep-alive spec)", async () => {
+    // Real timers only — see the note on the 8.2 describe block above.
+    vi.useRealTimers();
+    const pod = await startMockPod({ state: { deviceStatus: { left: { secondsRemaining: 43200 } } } });
+    try {
+      const timers = createTimerHarness();
+      const snapshot = new SnapshotStore({ timers });
+      const client = clientFor(pod);
+      // Seeded so raw left.isOn starts true — the scenario the design.md Risk analysis traced:
+      // without the fix, a reversion would be observable as the optimistic "off" overlay never
+      // taking hold (or being cleared), falling back to this still-true raw value.
+      snapshot.observeDeviceStatus(await client.getDeviceStatus());
+      const queue = new WriteQueue({ client, snapshot, requestFastPoll: () => {}, timers });
+
+      const rearm = queue.submitSide('left', { secondsRemaining: 600 }, 'keepAlive');
+      const userOff = queue.submitSide('left', { isOn: false }); // default origin: 'user'
+      // Synchronous, before either submission's debounce has even started to elapse: the
+      // optimistic "off" tile is already in effect and never reverts to the stale raw `true`.
+      expect(snapshot.get().left.isOn).toBe(false);
+
+      await realDelay(450);
+      await Promise.all([rearm, userOff]);
+
+      expect(pod.state.deviceStatus.left.secondsRemaining).toBe(0); // side ends OFF, not re-armed
+      expect(snapshot.get().left.isOn).toBe(false); // still no reversion, post-dispatch
+      queue.stop();
+    } finally {
+      await pod.close();
+    }
+  });
+
+  it('a keep-alive re-arm alone, with no competing user write in the same window, still refreshes the duration', async () => {
+    // Real timers only — see the note on the 8.2 describe block above.
+    vi.useRealTimers();
+    const pod = await startMockPod();
+    try {
+      const timers = createTimerHarness();
+      const snapshot = new SnapshotStore({ timers });
+      const queue = new WriteQueue({ client: clientFor(pod), snapshot, requestFastPoll: () => {}, timers });
+
+      const p = queue.submitSide('left', { secondsRemaining: 600 }, 'keepAlive');
+      await realDelay(450);
+      await p;
+
+      expect(pod.state.deviceStatus.left.secondsRemaining).toBe(600);
+      queue.stop();
+    } finally {
+      await pod.close();
+    }
+  });
+});

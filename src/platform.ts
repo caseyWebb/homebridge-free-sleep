@@ -7,10 +7,11 @@
  * stable UUID/SerialNumber derivation from the *configured* host, `configureAccessory`
  * restore with prune-on-restore, unregistering the unused side when `sides !== 'both'`,
  * one-time display-name seeding from `GET /api/settings`, the bail-without-host startup
- * guard, and constructing and owning the snapshot store, poller, write queue and (as of the
- * away-mode-guard change) away-mode guard for the whole platform's lifetime, bootstrapping
- * before any HAP handler is registered, routing snapshot change events to the services that
- * publish them, and stopping everything on Homebridge shutdown (design.md, "Platform wiring").
+ * guard, and constructing and owning the snapshot store, poller, write queue, (as of the
+ * away-mode-guard change) away-mode guard, and (as of the `keep-alive` change, #12) the
+ * keep-alive component for the whole platform's lifetime, bootstrapping before any HAP handler
+ * is registered, routing snapshot change events to the services that publish them, and stopping
+ * everything on Homebridge shutdown (design.md, "Platform wiring").
  *
  * Per docs/HOMEKIT.md's Homebridge 2.x API notes: HAP **types** come from `homebridge`;
  * runtime enums/classes always come from `api.hap`, never a direct `@homebridge/hap-nodejs`
@@ -40,6 +41,7 @@ import type {
 } from './pod/types.ts';
 import { AwayModeGuard } from './pod/awayModeGuard.ts';
 import { DEFAULT_TIMEOUT_MS, PodClient, RETRY_BASE_DELAY_MS, RETRY_JITTER_MS } from './pod/client.ts';
+import { KeepAlive } from './pod/keepAlive.ts';
 import { PodPoller } from './pod/poller.ts';
 import { defaultTimerApi, SnapshotStore, type Change, type TimerApi } from './pod/snapshot.ts';
 import { WriteQueue } from './pod/writeQueue.ts';
@@ -172,6 +174,11 @@ export class FreeSleepPlatform implements DynamicPlatformPlugin {
   /** Consulted by `writeQueue` itself on every side-lane dispatch (away-mode-guard change,
    * tech-lead resolution 2) — also threaded through `ServiceContext` (see `serviceContextFor`). */
   private readonly awayModeGuard: AwayModeGuard | undefined;
+  /** Owns its own timer for the platform's lifetime, stopped alongside `poller`/`writeQueue` on
+   * shutdown (`keep-alive` change, #12). `undefined` only when `config` itself failed to parse —
+   * unlike `poller`/`writeQueue`, it is still constructed (inert) when `keepAlive` is `false`;
+   * its own constructor schedules nothing at all in that case (design.md). */
+  private readonly keepAlive: KeepAlive | undefined;
   private unsubscribeSnapshot: (() => void) | undefined;
 
   private readonly thermostats = new Map<Side, ThermostatService>();
@@ -263,6 +270,19 @@ export class FreeSleepPlatform implements DynamicPlatformPlugin {
     });
     this.writeQueue = writeQueue;
 
+    // One `KeepAlive` per launch (#12), sharing the same snapshot and write queue — its own
+    // re-arm writes pass through `writeQueue.submitSide` under the `'keepAlive'` origin, so they
+    // inherit debouncing, the mutex, and the away-mode guard uniformly with every other caller
+    // (design.md, "Re-arm writes go through submitSide, not runExclusive").
+    this.keepAlive = new KeepAlive({
+      snapshot,
+      writeQueue,
+      timers: this.timers,
+      keepAliveMs: parsed.data.keepAliveMs,
+      keepAliveThresholdMs: parsed.data.keepAliveThresholdMs,
+      enabled: parsed.data.keepAlive,
+    });
+
     // Subscribed exactly once (specs/platform/spec.md, tasks.md 7.3); each service call is
     // individually wrapped so one throwing service does not stop the others from being
     // notified.
@@ -280,6 +300,7 @@ export class FreeSleepPlatform implements DynamicPlatformPlugin {
     this.api.on('shutdown', () => {
       this.poller?.stop();
       this.writeQueue?.stop();
+      this.keepAlive?.stop();
       for (const thermostat of this.thermostats.values()) {
         thermostat.stop();
       }

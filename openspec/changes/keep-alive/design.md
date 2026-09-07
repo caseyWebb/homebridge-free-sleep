@@ -113,7 +113,11 @@ per 15 min." This design does not add a fourth config key for that. Instead:
   constant), at least 1 minute so a very small configured threshold cannot spin the timer.
   Checking at half the threshold guarantees a side crossing the threshold is caught before its
   remaining time can reach zero, since the check interval is always strictly smaller than the
-  window between "crossed the threshold" and "would expire."
+  window between "crossed the threshold" and "would expire." **This guarantee holds only when
+  `keepAliveThresholdMs / 2` is not itself pushed *upward* by the 60_000ms floor** — below a
+  120_000ms threshold, the floor wins and the derived interval can exceed the threshold it's
+  supposed to catch. `config.ts`'s `keepAliveThresholdMs` minimum was raised from 1000ms to
+  120_000ms for exactly this reason (PR #40 review, F3 — see the addendum below).
 - Redundant re-arms are suppressed with a per-side, in-memory `nextDueAtMs`, set on a successful
   submission to `now + (keepAliveMs - keepAliveThresholdMs)` — the earliest wall-clock time the
   *newly re-armed* duration would itself next approach the threshold. A tick before that time
@@ -190,6 +194,23 @@ design with no code changes needed here:
 
 This is the one interaction that genuinely needs a second set of eyes before implementation —
 see Open Questions.
+
+**Note (recorded per a PR #39 review comment on issue #12, executed 2026-09-06):** under the
+`'mirror'` policy specifically, a bare `secondsRemaining` re-arm is *not* mirrored to the other
+side by this plugin's own `mirrorToOtherSide` — `WriteQueue` only ever mirrors the overlayable
+fields (`targetTemperatureF`, `isOn`, `isAlarmVibrating`), and `secondsRemaining` is neither one
+of those nor itself overlayable (`snapshot.ts`'s `OverlayableField`). This is symmetric with the
+*addressed* side's own duration writes, which likewise install no overlay — `secondsRemaining`
+stays honest only via the next poll, for either side, by design. But free-sleep's own
+`updateSide` applies the posted duration to **both** sides server-side whenever either side is
+away (`controlBothSides`), regardless of what this plugin mirrors. Concretely: an away-mode
+keep-alive re-arm silently drives both sides' remaining time on the Pod, with nothing telling
+HomeKit until the next `deviceStatus` poll observes it. **Accepted, poll-corrected** — not fixed
+here: the cached view is only ever briefly stale (one `pollIntervalMs`, 30s by default), and this
+is not a regression keep-alive introduces so much as the pre-existing "`secondsRemaining` is
+never reflected optimistically for any caller" behavior extended to a caller (`KeepAlive`) that
+happens to write only that field. No mechanism change follows from this note; it exists so the
+gap is documented rather than rediscovered.
 
 ## Risks / Trade-offs
 
@@ -273,3 +294,34 @@ task breakdown as currently written — they are asking for confirmation, not ra
    turns the side off") and a mock-as-oracle test proving it, plus the inverse (keep-alive
    re-arm alone still refreshes). The optimistic-off tile reversion the analysis traced is
    thereby prevented too.
+
+## Addendum (PR #40 review, 2026-09-06)
+
+A reviewer walking `checkSide` end-to-end found it acted on `raw.deviceStatus` even when that
+cache was unconfirmed for a long stretch — e.g. a user-off write's overlay (`writeSettleMs`)
+expiring with no successful `deviceStatus` observation since (a reboot, or a run of failed
+reads), leaving the effective view reporting the pre-off `isOn: true` again. Fixed, not merely
+noted, since it re-arms a side the user explicitly turned off:
+
+- **`checkSide` now requires the observation behind it to be fresh** (`src/pod/keepAlive.ts`'s
+  `isObservationFresh`): `connection.online` must be `true`, `connection.lastSuccessAt` must be
+  set, and it must be no older than `checkIntervalMs` — a bound chosen because it's the only
+  poll-cadence-shaped number this module has any business knowing about on its own, and because
+  a healthy connection (production's default `pollIntervalMs`, 30s, is always meant to be
+  smaller than `checkIntervalMs`'s own 60s floor) always has a fresher observation than that
+  inside every check window.
+- **`keepAliveThresholdMs`'s config minimum rose from 1000ms to 120_000ms (2 min)** so the
+  "check at half the threshold" guarantee (above) can no longer silently break for a small
+  configured threshold — `config.ts`, `config.schema.json`, and the README table all updated;
+  the schema-parity test in `test/config.test.ts` now pins the new bound.
+- **An in-flight re-arm is now tracked per side** (`armingInFlight`), so a dispatch stuck behind
+  a slow mutex or a stalled request no longer accumulates one redundant `submitSide` call per
+  tick — a reviewer probe produced 6 identical POSTs through a gated dispatch before this fix,
+  1 after. A rejected re-arm (most commonly a blocked away-mode write) now starts the same
+  cooldown a successful one would, so a persistently blocked side doesn't retry — and
+  debug-log — every single tick.
+
+No spec or task-breakdown change follows from this addendum; `specs/pod-keep-alive/spec.md`'s
+existing requirements already describe the *intended* behavior (a side observed on and below
+threshold is re-armed, one comfortably above is left alone) — this addendum closes a gap
+between that intent and what `checkSide` actually read before acting on it.

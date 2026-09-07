@@ -24,13 +24,15 @@ function readConfigSchemaJson(): {
   return JSON.parse(text);
 }
 
+// `keepAlive` moved out of this list at `keep-alive` (#12) — it is consumed starting with this
+// change, not merely reserved (config spec's MODIFIED requirement, "Reserved keys are fully
+// defaulted..."). Its own defaulting/validation is covered by the dedicated describe block below.
 const RESERVED_KEYS = [
   'pollIntervals',
   'writeSettleMs',
   'noResponseAfterMs',
   'occupancySource',
   'waterLowSensorType',
-  'keepAlive',
   'awayModeWritePolicy',
 ] as const;
 
@@ -142,7 +144,7 @@ describe('FreeSleepConfigSchema — sides', () => {
 });
 
 describe('FreeSleepConfigSchema — reserved keys', () => {
-  it('fully defaults all seven reserved keys when omitted', () => {
+  it('fully defaults all six reserved keys when omitted', () => {
     const result = FreeSleepConfigSchema.safeParse({ host: 'pod.local' });
     expect(result.success).toBe(true);
     if (!result.success) return;
@@ -154,7 +156,6 @@ describe('FreeSleepConfigSchema — reserved keys', () => {
     expect(result.data.noResponseAfterMs).toBe(600000);
     expect(result.data.occupancySource).toBe('none');
     expect(result.data.waterLowSensorType).toBe('contact');
-    expect(result.data.keepAlive).toBe(true);
     expect(result.data.awayModeWritePolicy).toBe('mirror');
   });
 
@@ -163,7 +164,6 @@ describe('FreeSleepConfigSchema — reserved keys', () => {
     ['noResponseAfterMs', -1],
     ['occupancySource', 'weather'],
     ['waterLowSensorType', 'moisture'],
-    ['keepAlive', 'yes'],
     ['awayModeWritePolicy', 'ignore'],
   ] as const)('rejects an invalid %s value, naming that key', (key, value) => {
     const result = FreeSleepConfigSchema.safeParse({ host: 'pod.local', [key]: value });
@@ -178,7 +178,6 @@ describe('FreeSleepConfigSchema — reserved keys', () => {
     ['noResponseAfterMs', 0, 0],
     ['occupancySource', 'presence', 'presence'],
     ['waterLowSensorType', 'leak', 'leak'],
-    ['keepAlive', false, false],
     ['awayModeWritePolicy', 'block', 'block'],
   ] as const)('parses a valid non-default %s value unchanged', (key, value, expected) => {
     const result = FreeSleepConfigSchema.safeParse({ host: 'pod.local', [key]: value });
@@ -248,6 +247,168 @@ describe('FreeSleepConfigSchema — reserved keys', () => {
       });
       expect(result.success).toBe(false);
     });
+  });
+});
+
+// keep-alive (#12): keepAlive/keepAliveMs/keepAliveThresholdMs are consumed starting with this
+// change (specs/config/spec.md's ADDED requirement, "`keepAlive`, `keepAliveMs`, and
+// `keepAliveThresholdMs` are defaulted and validated").
+describe('FreeSleepConfigSchema — keepAlive, keepAliveMs, keepAliveThresholdMs', () => {
+  it('all three default when omitted', () => {
+    const result = FreeSleepConfigSchema.safeParse({ host: 'pod.local' });
+    expect(result.success).toBe(true);
+    if (!result.success) return;
+    expect(result.data.keepAlive).toBe(true);
+    expect(result.data.keepAliveMs).toBe(43_200_000);
+    expect(result.data.keepAliveThresholdMs).toBe(1_800_000);
+  });
+
+  it('rejects a non-boolean keepAlive, naming that key', () => {
+    const result = FreeSleepConfigSchema.safeParse({ host: 'pod.local', keepAlive: 'yes' });
+    expect(result.success).toBe(false);
+    if (!result.success) {
+      expect(result.error.issues.some((issue) => issue.path.join('.') === 'keepAlive')).toBe(true);
+    }
+  });
+
+  it('parses a valid non-default keepAlive value unchanged', () => {
+    const result = FreeSleepConfigSchema.safeParse({ host: 'pod.local', keepAlive: false });
+    expect(result.success).toBe(true);
+    if (result.success) {
+      expect(result.data.keepAlive).toBe(false);
+    }
+  });
+
+  it.each([
+    ['keepAliveMs', 999],
+    ['keepAliveThresholdMs', 999],
+  ] as const)('rejects a below-minimum %s, naming that key', (key, value) => {
+    const result = FreeSleepConfigSchema.safeParse({ host: 'pod.local', [key]: value });
+    expect(result.success).toBe(false);
+    if (!result.success) {
+      expect(result.error.issues.some((issue) => issue.path.join('.') === key)).toBe(true);
+    }
+  });
+
+  // F3 (PR #40 review): keepAliveThresholdMs's own minimum rose from 1000ms to 120_000ms (2 min)
+  // — see src/config.ts's doc comment for why (the derived check-interval guarantee only holds
+  // once keepAliveThresholdMs / 2 reaches the 60_000ms check-interval floor on its own). Pinned
+  // exactly at the new boundary, one below it, so a future accidental revert of the bound fails
+  // this test rather than only the vaguer "999" case above.
+  it('rejects keepAliveThresholdMs one below its new 120000ms minimum, naming that key', () => {
+    const result = FreeSleepConfigSchema.safeParse({
+      host: 'pod.local',
+      keepAliveMs: 200_000,
+      keepAliveThresholdMs: 119_999,
+    });
+    expect(result.success).toBe(false);
+    if (!result.success) {
+      expect(result.error.issues.some((issue) => issue.path.join('.') === 'keepAliveThresholdMs')).toBe(true);
+    }
+  });
+
+  it('accepts keepAliveThresholdMs exactly at its minimum, given a large-enough keepAliveMs', () => {
+    const result = FreeSleepConfigSchema.safeParse({
+      host: 'pod.local',
+      keepAliveMs: 200_000,
+      keepAliveThresholdMs: 120_000,
+    });
+    expect(result.success).toBe(true);
+  });
+
+  // keepAliveMs cannot be accepted at its own literal minimum (1000): keepAliveThresholdMs's
+  // own minimum is now 120_000 (F3), and the cross-field check requires it strictly less than
+  // keepAliveMs — so no valid threshold exists anywhere near keepAliveMs's own floor. This is
+  // exercised instead by the "one below keepAliveMs" test further below, at a keepAliveMs
+  // comfortably above keepAliveThresholdMs's own 120_000 minimum.
+  it('accepts keepAliveMs one above the combined floor (keepAliveThresholdMs at its own minimum)', () => {
+    const result = FreeSleepConfigSchema.safeParse({
+      host: 'pod.local',
+      keepAliveMs: 120_001,
+      keepAliveThresholdMs: 120_000,
+    });
+    expect(result.success).toBe(true);
+  });
+
+  it.each([
+    ['keepAliveMs', 1.5],
+    ['keepAliveThresholdMs', 1.5],
+  ] as const)('rejects a non-integer %s, naming that key', (key, value) => {
+    const result = FreeSleepConfigSchema.safeParse({ host: 'pod.local', [key]: value });
+    expect(result.success).toBe(false);
+    if (!result.success) {
+      expect(result.error.issues.some((issue) => issue.path.join('.') === key)).toBe(true);
+    }
+  });
+
+  it('parses valid, non-default keepAliveMs/keepAliveThresholdMs unchanged', () => {
+    const result = FreeSleepConfigSchema.safeParse({
+      host: 'pod.local',
+      keepAliveMs: 3_600_000,
+      keepAliveThresholdMs: 300_000,
+    });
+    expect(result.success).toBe(true);
+    if (result.success) {
+      expect(result.data.keepAliveMs).toBe(3_600_000);
+      expect(result.data.keepAliveThresholdMs).toBe(300_000);
+    }
+  });
+
+  it('rejects keepAliveThresholdMs equal to keepAliveMs, identifying the conflict', () => {
+    const result = FreeSleepConfigSchema.safeParse({
+      host: 'pod.local',
+      keepAliveMs: 200_000,
+      keepAliveThresholdMs: 200_000,
+    });
+    expect(result.success).toBe(false);
+    if (!result.success) {
+      expect(result.error.issues.some((issue) => issue.path.join('.') === 'keepAliveThresholdMs')).toBe(true);
+    }
+  });
+
+  it('rejects keepAliveThresholdMs greater than keepAliveMs, identifying the conflict', () => {
+    const result = FreeSleepConfigSchema.safeParse({
+      host: 'pod.local',
+      keepAliveMs: 200_000,
+      keepAliveThresholdMs: 300_000,
+    });
+    expect(result.success).toBe(false);
+    if (!result.success) {
+      expect(result.error.issues.some((issue) => issue.path.join('.') === 'keepAliveThresholdMs')).toBe(true);
+    }
+  });
+
+  it('accepts keepAliveThresholdMs one below keepAliveMs', () => {
+    const result = FreeSleepConfigSchema.safeParse({
+      host: 'pod.local',
+      keepAliveMs: 200_000,
+      keepAliveThresholdMs: 199_999,
+    });
+    expect(result.success).toBe(true);
+  });
+});
+
+// F3 (PR #40 review): config.schema.json's own `minimum` for keepAliveThresholdMs must track
+// the zod boundary exactly, not merely "close enough" — a UI-side minimum lower than the zod
+// minimum would let a value through the config UI that the plugin then refuses at startup.
+describe('config.schema.json <-> FreeSleepConfigSchema parity — keepAliveThresholdMs minimum (F3)', () => {
+  it("config.schema.json's keepAliveThresholdMs.minimum is exactly 120000, matching the zod boundary", () => {
+    const property = readConfigSchemaJson().schema.properties.keepAliveThresholdMs;
+    expect(property, 'config.schema.json is missing keepAliveThresholdMs').toBeDefined();
+    expect(property?.minimum).toBe(120_000);
+
+    const oneBelow = FreeSleepConfigSchema.safeParse({
+      host: 'pod.local',
+      keepAliveMs: 200_000,
+      keepAliveThresholdMs: (property?.minimum ?? 0) - 1,
+    });
+    const at = FreeSleepConfigSchema.safeParse({
+      host: 'pod.local',
+      keepAliveMs: 200_000,
+      keepAliveThresholdMs: property?.minimum,
+    });
+    expect(oneBelow.success).toBe(false);
+    expect(at.success).toBe(true);
   });
 });
 

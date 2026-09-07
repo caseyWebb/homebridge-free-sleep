@@ -560,3 +560,101 @@ describe('shutdown stops polling, the write path and the subscription (tasks.md 
     }
   });
 });
+
+// ---------------------------------------------------------------------------------------
+// keep-alive wiring (keep-alive change, tasks.md 3.1, 3.2)
+// ---------------------------------------------------------------------------------------
+
+describe('keep-alive wiring (tasks.md 3.1, 3.2)', () => {
+  it('parsed.data.keepAliveMs/keepAliveThresholdMs/keepAlive flow through to an actual re-arm write', async () => {
+    vi.useFakeTimers();
+    try {
+      const timers = createTimerHarness();
+      const postDeviceStatusCalls: unknown[] = [];
+      const onDeviceStatus = structuredClone(fixtureDeviceStatus);
+      onDeviceStatus.left.isOn = true;
+      onDeviceStatus.left.secondsRemaining = 60; // well under the configured 120_000ms threshold
+      const client = resolvedFakeClient({
+        getDeviceStatus: () => Promise.resolve(structuredClone(onDeviceStatus)),
+        postDeviceStatus: (patch) => {
+          postDeviceStatusCalls.push(patch);
+          return Promise.resolve();
+        },
+      });
+      await simulateRestart(
+        factory(client, timers),
+        baseConfig({ keepAliveMs: 600_000, keepAliveThresholdMs: 120_000 }),
+        [],
+      );
+
+      // checkIntervalMs = clamp(120_000 / 2, 60_000, 900_000) = 60_000; +400 for the re-arm's
+      // own write-queue debounce to flush and dispatch.
+      await advanceFakeTime(60_000 + 400, 100);
+
+      expect(postDeviceStatusCalls).toContainEqual({ left: { secondsRemaining: 600 } });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('keepAlive: false disables the component entirely, even for a side already on and past threshold', async () => {
+    vi.useFakeTimers();
+    try {
+      const timers = createTimerHarness();
+      const postDeviceStatusCalls: unknown[] = [];
+      const onDeviceStatus = structuredClone(fixtureDeviceStatus);
+      onDeviceStatus.left.isOn = true;
+      onDeviceStatus.left.secondsRemaining = 60;
+      const client = resolvedFakeClient({
+        getDeviceStatus: () => Promise.resolve(structuredClone(onDeviceStatus)),
+        postDeviceStatus: (patch) => {
+          postDeviceStatusCalls.push(patch);
+          return Promise.resolve();
+        },
+      });
+      await simulateRestart(
+        factory(client, timers),
+        baseConfig({ keepAlive: false, keepAliveMs: 600_000, keepAliveThresholdMs: 120_000 }),
+        [],
+      );
+
+      // No real I/O settling needed here (resolvedFakeClient never touches a real socket), so a
+      // single large fake-timer jump is enough — unlike advanceFakeTime's small-step convention,
+      // which exists specifically for tests driving a real mock Pod over real sockets.
+      await vi.advanceTimersByTimeAsync(2_000_000);
+      expect(postDeviceStatusCalls).toHaveLength(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('platform shutdown stops the keep-alive timer alongside the poller and write queue', async () => {
+    vi.useFakeTimers();
+    try {
+      const timers = createTimerHarness();
+      const api = new FakeHomebridgeApi();
+      const log = createFakeLogging();
+      const client = resolvedFakeClient();
+      const platform = new FreeSleepPlatform(
+        log,
+        baseConfig({ keepAliveMs: 600_000, keepAliveThresholdMs: 120_000 }),
+        api.asApi(),
+        client,
+        timers,
+      );
+      await api.fireDidFinishLaunching();
+
+      const perAccessoryOverhead = api.registeredAccessories.length;
+      // The keep-alive check timer contributes to this pending count exactly like the poller's
+      // and write queue's own timers do — no dedicated assertion of "which" timer it is, mirroring
+      // the plain 7.4 shutdown test's own convention above.
+      expect(timers.pendingCount()).toBeGreaterThan(perAccessoryOverhead);
+
+      await api.fireShutdown();
+      expect(timers.pendingCount()).toBe(perAccessoryOverhead);
+      void platform;
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});

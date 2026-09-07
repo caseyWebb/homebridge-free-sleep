@@ -40,6 +40,15 @@
  * is a synchronous snapshot read with no `await`, and `dispatch()` already runs serialized behind
  * the write mutex for its entire async lifetime (see `pumpMutex` below) — so no separate
  * `runExclusive` call is needed to make the check atomic against another in-flight dispatch.
+ *
+ * **User-intent priority (`keep-alive`'s design.md, tech-lead resolution 5):** `submitSide`
+ * takes an `origin` (`'user'` by default, `'keepAlive'` for `KeepAlive`'s re-arm writes),
+ * tracked per field for the lane's currently-accumulating cycle. If that cycle's merged patch
+ * ends up carrying both a user-origin `isOn` and a keep-alive-origin `secondsRemaining`, the
+ * `secondsRemaining` field is dropped *before* `reduceDurationFields` runs — so a user's
+ * explicit power toggle landing in the same debounce window as a keep-alive re-arm always wins,
+ * rather than the four-case reduction's ordinary "non-zero `secondsRemaining` beats `isOn`" rule
+ * (which exists for a different, single-origin case: `#10`'s own power+temperature merge).
  */
 
 import { AwayModeGuard, AwayModeBlockedError, type AwayModeDecision } from './awayModeGuard.ts';
@@ -61,6 +70,14 @@ export type SidePatch = Partial<{
   secondsRemaining: number;
   isAlarmVibrating: boolean;
 }>;
+
+/**
+ * Who originated a `submitSide` call (`keep-alive`'s design.md, tech-lead resolution 5).
+ * `'user'` is the default — every pre-existing caller (`thermostat.ts`'s `onSet` handlers)
+ * passes no origin at all and gets exactly today's behavior. `'keepAlive'` is used only by
+ * `KeepAlive`'s re-arm writes (`src/pod/keepAlive.ts`).
+ */
+export type WriteOrigin = 'user' | 'keepAlive';
 
 export type DevicePatch = Partial<{ v: number; gainLeft: number; gainRight: number; ledBrightness: number }>;
 
@@ -117,6 +134,14 @@ interface LaneRuntime<P> {
    * for the same field (see the module doc above).
    */
   overlayOwnership: Map<string, OverlayHandle>;
+  /**
+   * The origin (`'user'` | `'keepAlive'`) each currently-accumulating field in `pending` was
+   * last submitted under — populated only by `submitSide` (device/settings lanes never write to
+   * it, and always read back an empty map, which is harmless: `applyOriginPriority` only ever
+   * consults it for `isOn`/`secondsRemaining`). Reset to a fresh, empty `Map` at the start of
+   * each new write cycle, mirroring `overlayOwnership`'s own per-cycle lifecycle.
+   */
+  fieldOrigin: Map<string, WriteOrigin>;
 }
 
 interface MutexTask {
@@ -141,6 +166,31 @@ function reduceDurationFields(patch: SidePatch): SidePatch {
     delete reduced.secondsRemaining;
   }
   return reduced;
+}
+
+/**
+ * User-intent priority (`keep-alive`'s design.md, tech-lead resolution 5): runs *before*
+ * `reduceDurationFields`. A merged patch carrying both a user-origin `isOn` and a
+ * keep-alive-origin `secondsRemaining` has `secondsRemaining` dropped outright, so the
+ * duration-field reduction below never even sees it — the user's explicit power toggle is what
+ * reaches the Pod, and no optimistic "off" tile installed for it is ever recomputed away. Every
+ * other origin combination (both `'user'`, or no `isOn` present in this cycle at all — the
+ * ordinary case for a plain re-arm with nothing else pending) is unaffected.
+ */
+function applyOriginPriority(patch: SidePatch, fieldOrigin: ReadonlyMap<string, WriteOrigin>): SidePatch {
+  if (patch.isOn === undefined || patch.secondsRemaining === undefined) return patch;
+  const isOnOrigin = fieldOrigin.get('isOn') ?? 'user';
+  const secondsRemainingOrigin = fieldOrigin.get('secondsRemaining') ?? 'user';
+  // N6: this drops the keep-alive re-arm the same way whether the user's `isOn` is `false` or
+  // `true` — a user turning a side back *on* in the same window also wins outright, deliberately:
+  // the Pod's own `isOn: true` already gets the full 12h duration (module doc above), so the
+  // keep-alive re-arm's more precise duration has nothing to add here either.
+  if (isOnOrigin === 'user' && secondsRemainingOrigin === 'keepAlive') {
+    const reduced = { ...patch };
+    delete reduced.secondsRemaining;
+    return reduced;
+  }
+  return patch;
 }
 
 function isSideLane(lane: LaneId): lane is Side {
@@ -202,10 +252,17 @@ export class WriteQueue {
   // Submission
   // -----------------------------------------------------------------------------------
 
-  submitSide(side: Side, patch: SidePatch): Promise<void> {
+  submitSide(side: Side, patch: SidePatch, origin: WriteOrigin = 'user'): Promise<void> {
     const rt = side === 'left' ? this.left : this.right;
-    return this.submit(side, rt, patch, () =>
-      this.syncSideOverlays(side, reduceDurationFields(rt.pending ?? {}), rt.overlayOwnership),
+    return this.submit(
+      side,
+      rt,
+      patch,
+      () => this.syncSideOverlays(side, this.reducedSidePatch(rt), rt.overlayOwnership),
+      (isNewCycle) => {
+        if (isNewCycle) rt.fieldOrigin.clear();
+        for (const key of Object.keys(patch)) rt.fieldOrigin.set(key, origin);
+      },
     );
   }
 
@@ -221,11 +278,18 @@ export class WriteQueue {
     );
   }
 
+  /** `reduceDurationFields(rt.pending)`, but with user-intent priority (module doc's "User-intent
+   * priority" section) applied first — the same order the eventual dispatch uses. */
+  private reducedSidePatch(rt: LaneRuntime<SidePatch>): SidePatch {
+    return reduceDurationFields(applyOriginPriority(rt.pending ?? {}, rt.fieldOrigin));
+  }
+
   private submit<P extends object>(
     lane: LaneId,
     rt: LaneRuntime<P>,
     patch: P,
     syncOverlays: () => void,
+    onMerge?: (isNewCycle: boolean) => void,
   ): Promise<void> {
     if (this.stopped) {
       return Promise.reject(new WriteQueueStoppedError());
@@ -238,8 +302,10 @@ export class WriteQueue {
         rt.overlayOwnership = new Map();
         this.liveOverlayBatches.add(rt.overlayOwnership);
         rt.maxWaitTimer = this.timers.setTimeout(() => this.flush(lane, rt), this.writeMaxDebounceMs);
+        onMerge?.(true);
       } else {
         Object.assign(rt.pending, patch);
+        onMerge?.(false);
       }
       rt.waiters.push({ resolve, reject });
       if (rt.debounceTimer !== null) this.timers.clearTimeout(rt.debounceTimer);
@@ -327,8 +393,13 @@ export class WriteQueue {
     const patch = rt.pending;
     const waiters = rt.waiters;
     const ownership = rt.overlayOwnership;
+    // Captured (and reset) here, not read live at dispatch time — the next cycle's own
+    // submissions must never retroactively change what origin *this* flushed cycle dispatches
+    // under (module doc's "User-intent priority").
+    const fieldOrigin = new Map(rt.fieldOrigin);
     rt.pending = null;
     rt.waiters = [];
+    rt.fieldOrigin = new Map();
     if (rt.debounceTimer !== null) {
       this.timers.clearTimeout(rt.debounceTimer);
       rt.debounceTimer = null;
@@ -337,24 +408,36 @@ export class WriteQueue {
       this.timers.clearTimeout(rt.maxWaitTimer);
       rt.maxWaitTimer = null;
     }
-    this.enqueueDispatch(lane, patch, waiters, ownership);
+    this.enqueueDispatch(lane, patch, waiters, ownership, fieldOrigin);
   }
 
-  private enqueueDispatch(lane: LaneId, patch: object, waiters: Waiter[], ownership: Map<string, OverlayHandle>): void {
+  private enqueueDispatch(
+    lane: LaneId,
+    patch: object,
+    waiters: Waiter[],
+    ownership: Map<string, OverlayHandle>,
+    fieldOrigin: ReadonlyMap<string, WriteOrigin>,
+  ): void {
     const task: MutexTask = {
-      run: () => this.dispatch(lane, patch, waiters, ownership),
+      run: () => this.dispatch(lane, patch, waiters, ownership, fieldOrigin),
       abandon: () => waiters.forEach((w) => w.reject(new WriteQueueStoppedError())),
     };
     this.mutexQueue.push(task);
     this.pumpMutex();
   }
 
-  private async dispatch(lane: LaneId, patch: object, waiters: Waiter[], ownership: Map<string, OverlayHandle>): Promise<void> {
+  private async dispatch(
+    lane: LaneId,
+    patch: object,
+    waiters: Waiter[],
+    ownership: Map<string, OverlayHandle>,
+    fieldOrigin: ReadonlyMap<string, WriteOrigin>,
+  ): Promise<void> {
     let body: object;
     let sideReduced: SidePatch | undefined;
     let awayDecision: AwayModeDecision = 'plain';
     if (isSideLane(lane)) {
-      sideReduced = reduceDurationFields(patch as SidePatch);
+      sideReduced = reduceDurationFields(applyOriginPriority(patch as SidePatch, fieldOrigin));
       this.logger.debug(`writeQueue: ${lane} submitted ${JSON.stringify(patch)}, dispatching ${JSON.stringify(sideReduced)}`);
       body = { [lane]: sideReduced };
 
@@ -573,5 +656,12 @@ export class WriteQueue {
 }
 
 function emptyLane<P>(): LaneRuntime<P> {
-  return { pending: null, waiters: [], debounceTimer: null, maxWaitTimer: null, overlayOwnership: new Map() };
+  return {
+    pending: null,
+    waiters: [],
+    debounceTimer: null,
+    maxWaitTimer: null,
+    overlayOwnership: new Map(),
+    fieldOrigin: new Map(),
+  };
 }

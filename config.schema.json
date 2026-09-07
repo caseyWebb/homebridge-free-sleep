@@ -2,7 +2,7 @@
   "pluginAlias": "FreeSleep",
   "pluginType": "platform",
   "singular": true,
-  "headerDisplay": "Exposes an Eight Sleep Pod running the free-sleep firmware to Apple HomeKit. `host` is the only field most installs need. `sides`, the poll/write timing overrides, and the No Response delay are live; the remaining fields are reserved for a future release and have no effect yet.",
+  "headerDisplay": "Exposes an Eight Sleep Pod running the free-sleep firmware to Apple HomeKit. `host` is the only field most installs need. `sides`, the poll/write timing overrides, the No Response delay, and keep-alive are live; the remaining fields are reserved for a future release and have no effect yet.",
   "schema": {
     "type": "object",
     "properties": {
@@ -107,9 +107,24 @@
         ]
       },
       "keepAlive": {
-        "title": "Keep-alive (reserved, no effect yet)",
+        "title": "Keep-alive",
         "type": "boolean",
-        "default": true
+        "default": true,
+        "description": "Periodically re-arms a side's 12-hour on-duration while it is on, so 'on' never silently expires overnight."
+      },
+      "keepAliveMs": {
+        "title": "Keep-alive re-arm duration (ms)",
+        "type": "integer",
+        "default": 43200000,
+        "minimum": 1000,
+        "description": "Must be strictly greater than the re-arm threshold below. This UI cannot enforce that relationship between two separate fields — an invalid combination is caught by the plugin at Homebridge startup, which fails to load rather than silently accepting it."
+      },
+      "keepAliveThresholdMs": {
+        "title": "Keep-alive re-arm threshold (ms)",
+        "type": "integer",
+        "default": 1800000,
+        "minimum": 120000,
+        "description": "A side is re-armed once its remaining time drops below this. Must be strictly less than the re-arm duration above — this UI cannot enforce that cross-field relationship, so an invalid combination is instead caught loudly at Homebridge startup. Minimum 120000ms (2 min): below that, the plugin's internally-derived check cadence can no longer catch every side before it expires (see src/config.ts)."
       },
       "awayModeWritePolicy": {
         "title": "Away-mode write policy — governs a write to either side while one side has away mode on: mirror the change with a second real POST /api/deviceStatus to the other side (updating its cached state to match), or block the write",

@@ -153,8 +153,50 @@ export const FreeSleepConfigSchema = z.object({
     })
     .default('contact'),
 
-  /** Reserved — see module doc. */
+  /**
+   * Consumed starting with `keep-alive` (#12): `false` disables the whole component (no timer,
+   * no writes); `true` (the default) runs it, re-posting `keepAliveMs` as a side's
+   * `secondsRemaining` once its remaining time drops below `keepAliveThresholdMs`, but only
+   * while that side is currently observed on (`src/pod/keepAlive.ts`).
+   */
   keepAlive: z.boolean().default(true),
+
+  /**
+   * Consumed starting with `keep-alive` (#12). The duration (ms) re-posted as a side's
+   * `secondsRemaining` when it is re-armed. Default 43_200_000 (12h), matching the Pod's own
+   * `isOn: true` duration (`server/src/routes/deviceStatus/updateDeviceStatus.ts`). Minimum
+   * 1000ms (design.md Open Question 3 / tech-lead resolution 3) — enough to reject nonsensical
+   * configuration without a more specific bound.
+   */
+  keepAliveMs: z
+    .number()
+    .int()
+    .min(1000, { message: 'keepAliveMs must be at least 1000ms' })
+    .default(43_200_000),
+
+  /**
+   * Consumed starting with `keep-alive` (#12). A side is re-armed once its observed remaining
+   * time drops below this. Default 1_800_000 (30 min).
+   *
+   * Minimum 120_000ms (2 min) — raised from the original 1000ms bound (PR #40 review, F3) once a
+   * real reviewer walked the arithmetic `src/pod/keepAlive.ts` actually derives from this value:
+   * `checkIntervalMs = clamp(keepAliveThresholdMs / 2, 60_000, 900_000)`. The module's own
+   * design intent is "checking at half the threshold guarantees a side crossing it is caught
+   * before its remaining time can reach zero" (`keepAlive.ts`'s doc comment) — but that is only
+   * true when `keepAliveThresholdMs / 2` is not itself clamped *upward* by the 60_000ms check-
+   * interval floor. Below 120_000ms, half the threshold is less than 60_000ms, the floor wins,
+   * and the derived check interval can end up *larger* than the threshold it's meant to catch —
+   * silently breaking the very guarantee the design relies on. 120_000ms is exactly the point
+   * where `keepAliveThresholdMs / 2` first reaches the floor on its own, so the guarantee holds
+   * for every value this schema now accepts. Must be strictly less than `keepAliveMs` —
+   * enforced by the object-level `.superRefine` below, since a threshold at or above the
+   * duration would either never fire or fire immediately on every re-arm.
+   */
+  keepAliveThresholdMs: z
+    .number()
+    .int()
+    .min(120_000, { message: 'keepAliveThresholdMs must be at least 120000ms (2 min) — see src/config.ts for why' })
+    .default(1_800_000),
 
   /** Reserved — see module doc. */
   awayModeWritePolicy: z
@@ -162,6 +204,17 @@ export const FreeSleepConfigSchema = z.object({
       message: "awayModeWritePolicy must be one of 'mirror' or 'block'",
     })
     .default('mirror'),
+}).superRefine((data, ctx) => {
+  if (data.keepAliveThresholdMs >= data.keepAliveMs) {
+    ctx.addIssue({
+      code: 'custom',
+      path: ['keepAliveThresholdMs'],
+      message:
+        'keepAliveThresholdMs must be strictly less than keepAliveMs — a threshold at or above ' +
+        'the duration would either never fire or fire immediately on every re-arm ' +
+        `(got keepAliveThresholdMs=${data.keepAliveThresholdMs}, keepAliveMs=${data.keepAliveMs}).`,
+    });
+  }
 });
 
 export type FreeSleepConfig = z.infer<typeof FreeSleepConfigSchema>;
