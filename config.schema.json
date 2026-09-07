@@ -2,7 +2,7 @@
   "pluginAlias": "FreeSleep",
   "pluginType": "platform",
   "singular": true,
-  "headerDisplay": "Exposes an Eight Sleep Pod running the free-sleep firmware to Apple HomeKit. `host` is the only field most installs need. `sides`, the poll/write timing overrides, the No Response delay, keep-alive, the occupancy source, the water-low sensor type, alarm events, and the four hub-service toggles (prime, LED, test alarm, server fault) are live; the remaining fields are reserved for a future release and have no effect yet.",
+  "headerDisplay": "Exposes an Eight Sleep Pod running the free-sleep firmware to Apple HomeKit. `host` is the only field most installs need. `sides`, the poll/write timing overrides, the No Response delay, keep-alive, the occupancy source, the water-low sensor type, alarm events, the per-side Away Mode and Skip Next Alarm switches, and the four hub-service toggles (prime, LED, test alarm, server fault) are live; the remaining fields are reserved for a future release and have no effect yet.",
   "schema": {
     "type": "object",
     "properties": {
@@ -170,6 +170,24 @@
         "type": "boolean",
         "default": true,
         "description": "Publishes a per-side alarm-press event and a Dismiss Alarm switch, and runs a scheduler that briefly polls the Pod faster around each predicted alarm so the short-lived vibration event is not missed. On by default — the extra polling only ever runs near an actually-enabled alarm and has no effect on an alarm-free Pod; turn off to opt out or to keep a soak profile's request volume frozen."
+      },
+      "awayModeSwitch": {
+        "title": "Away Mode switch",
+        "type": "boolean",
+        "default": true,
+        "description": "Publishes a per-side Away Mode switch, bound to the Pod's own away-mode setting — pauses that side's schedules and alarms. On by default."
+      },
+      "skipAlarmSwitch": {
+        "title": "Skip Next Alarm switch",
+        "type": "boolean",
+        "default": true,
+        "description": "Publishes a per-side Skip Next Alarm switch — turning it on skips that side's next scheduled alarm; turning it off restores the schedule. On by default."
+      },
+      "awayModeTurnsSideOff": {
+        "title": "Away Mode turns the side off first",
+        "type": "boolean",
+        "default": false,
+        "description": "When enabled, turning a side's Away Mode switch on first turns that side off, then enables away mode, as two sequenced writes. Turning Away Mode off never touches power, regardless of this setting. Off by default. Has no effect when the Away Mode switch itself is disabled."
       }
     },
     "required": ["host"]

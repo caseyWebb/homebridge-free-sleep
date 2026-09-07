@@ -95,12 +95,15 @@ before the switch can ship, not deferred as a known issue.
 
 ## Impact
 
-- **New files**: `src/services/awayMode.ts`, `src/services/skipAlarm.ts`,
-  `src/pod/alarmSchedule.ts`.
-- **Modified**: `src/pod/writeQueue.ts` (ordering-hazard fix — see design.md), `src/config.ts`
-  / `config.schema.json` / `README.md` (three new consumed keys), `src/platform.ts`
-  (construct both services, extend `enabledServiceKeysFor`), `src/services/types.ts` (no
-  change expected — both services use the existing `ServiceContext` as-is).
+- **New files**: `src/services/awayMode.ts`, `src/services/skipAlarm.ts`.
+- **Modified**: `src/pod/writeQueue.ts` (ordering-hazard fix — see design.md), `src/pod/
+  alarmSchedule.ts` (adds the `nextAlarmSkipInstant` export this change's Skip Next Alarm
+  switch consumes — **not** a new file: `alarm-events` created and owns this module; per this
+  change's own design.md Addendum, "`alarm-events` lands first and creates `src/pod/
+  alarmSchedule.ts` (pure derivation); this change CONSUMES it"), `src/config.ts` /
+  `config.schema.json` / `README.md` (three new consumed keys), `src/platform.ts` (construct
+  both services, extend `enabledServiceKeysFor`), `src/services/types.ts` (no change expected
+  — both services use the existing `ServiceContext` as-is).
 - **Not modified**: `src/pod/snapshot.ts` (the Away Mode switch reads the already-overlayable
   `awayMode` field as-is; the Skip Next Alarm switch keeps its own local optimistic shadow
   rather than adding `scheduleOverrides.alarm.expiresAt` as a new overlayable field — see

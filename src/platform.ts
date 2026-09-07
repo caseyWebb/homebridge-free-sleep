@@ -52,11 +52,13 @@ import { PodPoller } from './pod/poller.ts';
 import { defaultTimerApi, SnapshotStore, type Change, type TimerApi } from './pod/snapshot.ts';
 import { WriteQueue } from './pod/writeQueue.ts';
 import { ALARM_DISMISS_SUBTYPE, ALARM_PRESS_SUBTYPE, AlarmService, isAlarmChange } from './services/alarm.ts';
+import { AWAY_MODE_SUBTYPE, AwayModeService, isAwayModeChange } from './services/awayMode.ts';
 import { CONNECTION_SUBTYPE, ConnectionService } from './services/connection.ts';
 import { LED_SUBTYPE, LedService } from './services/led.ts';
 import { isOccupancyChange, OCCUPANCY_SUBTYPE, OccupancySensorService } from './services/occupancy.ts';
 import { PRIME_SUBTYPE, PrimeService } from './services/prime.ts';
 import { SERVER_FAULT_SUBTYPE, ServerFaultService } from './services/serverFault.ts';
+import { isSkipAlarmChange, SKIP_ALARM_SUBTYPE, SkipAlarmService } from './services/skipAlarm.ts';
 import { TEST_ALARM_LEFT_SUBTYPE, TEST_ALARM_RIGHT_SUBTYPE, TestAlarmService } from './services/testAlarm.ts';
 import { isThermostatChange, THERMOSTAT_SUBTYPE, ThermostatService } from './services/thermostat.ts';
 import type { ServiceContext } from './services/types.ts';
@@ -211,6 +213,9 @@ function enabledServiceKeysFor(hap: HAP, role: Role, config: FreeSleepConfig): R
       `${hap.Service.Switch.UUID}:${ALARM_DISMISS_SUBTYPE}`,
     );
   }
+  // settings-switches (#17/#18, tech-lead resolution 3): each gated by its own boolean, default true.
+  if (config.awayModeSwitch) keys.push(`${hap.Service.Switch.UUID}:${AWAY_MODE_SUBTYPE}`);
+  if (config.skipAlarmSwitch) keys.push(`${hap.Service.Switch.UUID}:${SKIP_ALARM_SUBTYPE}`);
   return new Set(keys);
 }
 
@@ -258,6 +263,10 @@ export class FreeSleepPlatform implements DynamicPlatformPlugin {
   private readonly occupancySensors = new Map<Side, OccupancySensorService>();
   /** alarm-events (#16). Populated only when `config.alarmEvents` is `true` (the default). */
   private readonly alarmServices = new Map<Side, AlarmService>();
+  /** settings-switches (#18). Populated only when `config.awayModeSwitch` is `true` (the default). */
+  private readonly awayModeServices = new Map<Side, AwayModeService>();
+  /** settings-switches (#17). Populated only when `config.skipAlarmSwitch` is `true` (the default). */
+  private readonly skipAlarmServices = new Map<Side, SkipAlarmService>();
   private connectionService: ConnectionService | undefined;
   private waterLowService: WaterLowService | undefined;
   private primeService: PrimeService | undefined;
@@ -423,6 +432,12 @@ export class FreeSleepPlatform implements DynamicPlatformPlugin {
       for (const alarmService of this.alarmServices.values()) {
         alarmService.stop();
       }
+      for (const awayModeService of this.awayModeServices.values()) {
+        awayModeService.stop();
+      }
+      for (const skipAlarmService of this.skipAlarmServices.values()) {
+        skipAlarmService.stop();
+      }
       this.unsubscribeSnapshot?.();
       this.unsubscribeSnapshot = undefined;
     });
@@ -453,6 +468,20 @@ export class FreeSleepPlatform implements DynamicPlatformPlugin {
         if (isAlarmChange(change)) {
           this.alarmServices.get(change.side)?.handleChange(change);
         }
+        // settings-switches (#18): a settings-driven awayMode change (e.g. an out-of-band toggle
+        // via free-sleep's own web UI, or this switch's own write settling) reaches the Away Mode
+        // switch's own push logic.
+        if (isAwayModeChange(change)) {
+          this.awayModeServices.get(change.side)?.refresh();
+        }
+        // S6 (settings-switches PR #46 review): same routing for a settings-driven
+        // `scheduleOverrides.alarm.expiresAt` change — an out-of-band override (free-sleep's own
+        // web UI, or this switch's own write settling) reaches `SkipAlarmService.refresh()`,
+        // which also (re-)arms its own expiry timer against the newly-observed value (src/
+        // services/skipAlarm.ts's own module doc, "Snapshot-change routing").
+        if (isSkipAlarmChange(change)) {
+          this.skipAlarmServices.get(change.side)?.refresh();
+        }
         if (change.scope === 'device' && change.field === 'connectionOnline') {
           this.connectionService?.refresh();
         } else if (change.scope === 'device' && change.field === 'waterLevelState') {
@@ -469,9 +498,8 @@ export class FreeSleepPlatform implements DynamicPlatformPlugin {
           // S2 fix (PR #44 review): an externally-changed brightness/on-off must reach the tile.
           this.ledService?.refresh();
         }
-        // awayMode: no published service watches this field yet — ignored, without error
-        // (design.md's routing table; #13/#19/#20). isAlarmVibrating now routes to that side's
-        // AlarmService above (#16).
+        // isAlarmVibrating routes to that side's AlarmService above (#16); awayMode routes to
+        // that side's AwayModeService above (settings-switches, #18).
       } catch (error) {
         this.log.warn(`FreeSleep: a service failed to handle a snapshot change: ${describeError(error)}`);
       }
@@ -538,6 +566,14 @@ export class FreeSleepPlatform implements DynamicPlatformPlugin {
       // alarm-events (#16, tech-lead resolution 2): gated by `alarmEvents` (default true).
       if (ctx.config.alarmEvents) {
         this.alarmServices.set(role, new AlarmService(ctx, role, this.platformStartedAt));
+      }
+      // settings-switches (#17/#18, tech-lead resolution 3): each gated by its own boolean,
+      // default true.
+      if (ctx.config.awayModeSwitch) {
+        this.awayModeServices.set(role, new AwayModeService(ctx, role, this.platformStartedAt));
+      }
+      if (ctx.config.skipAlarmSwitch) {
+        this.skipAlarmServices.set(role, new SkipAlarmService(ctx, role, this.platformStartedAt));
       }
     }
   }

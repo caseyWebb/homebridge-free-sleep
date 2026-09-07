@@ -27,6 +27,8 @@ import {
   type Side,
 } from '../src/pod/types.js';
 import { ALARM_DISMISS_SUBTYPE } from '../src/services/alarm.js';
+import { AWAY_MODE_SUBTYPE } from '../src/services/awayMode.js';
+import { SKIP_ALARM_SUBTYPE } from '../src/services/skipAlarm.js';
 import { THERMOSTAT_SUBTYPE, type ThermostatService } from '../src/services/thermostat.js';
 import { CONNECTION_SUBTYPE } from '../src/services/connection.js';
 import { WATER_LOW_SUBTYPE } from '../src/services/waterLow.js';
@@ -96,6 +98,8 @@ interface PlatformInternals {
   serverFaultService: { refresh: () => void } | undefined;
   alarmServices: Map<Side, { handleChange: (change: Change) => void; stop: () => void }>;
   alarmWindowScheduler: { stop: () => void } | undefined;
+  awayModeServices: Map<Side, { refresh: () => void; stop: () => void }>;
+  skipAlarmServices: Map<Side, { refresh: () => void; stop: () => void }>;
   handleSnapshotChanges: (changes: readonly Change[]) => void;
 }
 
@@ -1413,6 +1417,104 @@ describe('shutdown clears each AlarmService\'s pending revert timer (tasks.md 7.
       void platform;
     } finally {
       vi.useRealTimers();
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------------------
+// settings-switches (#17/#18, tech-lead resolution 3): construction, prune-on-restore,
+// snapshot-change routing, and shutdown for the Away Mode and Skip Next Alarm switches.
+// ---------------------------------------------------------------------------------------
+
+describe('settings-switches: construction (tasks.md 4.4, 5.5)', () => {
+  it('both switches are constructed per side by default (awayModeSwitch/skipAlarmSwitch default true)', async () => {
+    const { platform } = await simulateRestart(factory(resolvedFakeClient()), baseConfig(), []);
+    const i = internals(platform);
+    expect(i.awayModeServices.size).toBe(2);
+    expect(i.skipAlarmServices.size).toBe(2);
+  });
+
+  it('awayModeSwitch: false constructs no AwayModeService for either side; skipAlarmSwitch is unaffected', async () => {
+    const { platform } = await simulateRestart(factory(resolvedFakeClient()), baseConfig({ awayModeSwitch: false }), []);
+    const i = internals(platform);
+    expect(i.awayModeServices.size).toBe(0);
+    expect(i.skipAlarmServices.size).toBe(2);
+  });
+
+  it('skipAlarmSwitch: false constructs no SkipAlarmService for either side; awayModeSwitch is unaffected', async () => {
+    const { platform } = await simulateRestart(factory(resolvedFakeClient()), baseConfig({ skipAlarmSwitch: false }), []);
+    const i = internals(platform);
+    expect(i.skipAlarmServices.size).toBe(0);
+    expect(i.awayModeServices.size).toBe(2);
+  });
+});
+
+describe('settings-switches: disabling a switch prunes it on restore, leaving the thermostat untouched (tasks.md 4.4, 5.5)', () => {
+  it('awayModeSwitch: true -> false prunes the Away Mode switch service', async () => {
+    const first = await simulateRestart(factory(resolvedFakeClient()), baseConfig(), []);
+    const previous = first.api.registeredAccessories;
+    const hap = first.api.hap;
+    // `resolvedFakeClient()` returns real fixture settings, so each side accessory is named
+    // from `settings.<side>.name` ("Left"/"Right") rather than the "Pod Left" fallback.
+    const left = previous.find((a) => a.displayName === 'Left')!;
+    expect(left.getServiceById(hap.Service.Switch, AWAY_MODE_SUBTYPE)).toBeDefined();
+
+    const second = await simulateRestart(factory(resolvedFakeClient()), baseConfig({ awayModeSwitch: false }), previous);
+    expect(internals(second.platform).awayModeServices.size).toBe(0);
+    expect(left.getServiceById(hap.Service.Switch, AWAY_MODE_SUBTYPE)).toBeUndefined();
+    expect(left.getServiceById(hap.Service.Thermostat, THERMOSTAT_SUBTYPE)).toBeDefined();
+  });
+
+  it('skipAlarmSwitch: true -> false prunes the Skip Next Alarm switch service', async () => {
+    const first = await simulateRestart(factory(resolvedFakeClient()), baseConfig(), []);
+    const previous = first.api.registeredAccessories;
+    const hap = first.api.hap;
+    const left = previous.find((a) => a.displayName === 'Left')!;
+    expect(left.getServiceById(hap.Service.Switch, SKIP_ALARM_SUBTYPE)).toBeDefined();
+
+    const second = await simulateRestart(factory(resolvedFakeClient()), baseConfig({ skipAlarmSwitch: false }), previous);
+    expect(internals(second.platform).skipAlarmServices.size).toBe(0);
+    expect(left.getServiceById(hap.Service.Switch, SKIP_ALARM_SUBTYPE)).toBeUndefined();
+    expect(left.getServiceById(hap.Service.Thermostat, THERMOSTAT_SUBTYPE)).toBeDefined();
+  });
+});
+
+describe("a side's awayMode change reaches only that side's AwayModeService (settings-switches)", () => {
+  it('a left-side awayMode change reaches only the left AwayModeService', async () => {
+    const { platform } = await simulateRestart(factory(resolvedFakeClient()), baseConfig(), []);
+    const i = internals(platform);
+    const left = i.awayModeServices.get('left')!;
+    const right = i.awayModeServices.get('right')!;
+    const leftSpy = vi.spyOn(left, 'refresh');
+    const rightSpy = vi.spyOn(right, 'refresh');
+    const thermostatLeft = i.thermostats.get('left')!;
+    const thermostatSpy = vi.spyOn(thermostatLeft, 'refresh');
+
+    i.handleSnapshotChanges([{ scope: 'side', field: 'awayMode', side: 'left', previous: false, current: true }]);
+
+    expect(leftSpy).toHaveBeenCalledTimes(1);
+    expect(rightSpy).not.toHaveBeenCalled();
+    expect(thermostatSpy).not.toHaveBeenCalled();
+  });
+
+  it('awayModeSwitch: false constructs no AwayModeService for either side, and the change is ignored without error', async () => {
+    const { platform } = await simulateRestart(factory(resolvedFakeClient()), baseConfig({ awayModeSwitch: false }), []);
+    const i = internals(platform);
+    expect(i.awayModeServices.size).toBe(0);
+    expect(() =>
+      i.handleSnapshotChanges([{ scope: 'side', field: 'awayMode', side: 'left', previous: false, current: true }]),
+    ).not.toThrow();
+  });
+});
+
+describe('shutdown stops each side\'s AwayModeService and SkipAlarmService (settings-switches)', () => {
+  it('stop() is called on every constructed AwayModeService and SkipAlarmService', async () => {
+    const { platform, api } = await simulateRestart(factory(resolvedFakeClient()), baseConfig(), []);
+    const i = internals(platform);
+    const stopSpies = [...i.awayModeServices.values(), ...i.skipAlarmServices.values()].map((s) => vi.spyOn(s, 'stop'));
+    await api.fireShutdown();
+    for (const spy of stopSpies) {
+      expect(spy).toHaveBeenCalledTimes(1);
     }
   });
 });
