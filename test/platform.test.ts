@@ -251,8 +251,12 @@ describe('fresh install, sides: both', () => {
         }
         expect(new Set(nonInfoServices.map((s) => s.subtype))).toEqual(new Set(['connection', 'waterLow']));
       } else {
-        expect(nonInfoServices).toHaveLength(1);
-        expect(nonInfoServices[0]?.UUID).toBe(api.hap.Service.Thermostat.UUID);
+        // alarm-events: a side accessory also carries its alarm programmable switch and its
+        // dismiss switch by default (`alarmEvents: true` — tech-lead resolution 2).
+        expect(nonInfoServices).toHaveLength(3);
+        expect(nonInfoServices.some((s) => s.UUID === api.hap.Service.Thermostat.UUID)).toBe(true);
+        expect(nonInfoServices.some((s) => s.UUID === api.hap.Service.StatelessProgrammableSwitch.UUID)).toBe(true);
+        expect(nonInfoServices.filter((s) => s.UUID === api.hap.Service.Switch.UUID)).toHaveLength(1);
       }
     }
   });
@@ -303,6 +307,40 @@ describe('prune-on-restore', () => {
     expect(leftAccessory.services.some((s) => s.UUID === seedApi.hap.Service.AccessoryInformation.UUID)).toBe(
       true,
     );
+  });
+
+  // alarm-events (#16, tasks.md 7.3): a synthetic alarm-shaped service on the hub (where the
+  // role's enabled set never includes it) is pruned, while a side accessory's *real* alarm
+  // services — constructed fresh because `alarmEvents` defaults to `true` — are kept.
+  it('a synthetic alarm-press service on the hub is pruned; a side accessory keeps its real alarm services', async () => {
+    const seedApi = new FakeHomebridgeApi();
+    const previous = (['left', 'right', 'hub'] as const).map((role) =>
+      existingAccessory(seedApi, 'pod.local', role),
+    );
+    const hubAccessory = previous.find((a) => a.displayName === 'Pod')!;
+
+    const syntheticPress = new seedApi.hap.Service.StatelessProgrammableSwitch('Synthetic Alarm', 'alarm-press');
+    hubAccessory.addService(syntheticPress);
+    const syntheticDismiss = new seedApi.hap.Service.Switch('Synthetic Dismiss', 'alarm-dismiss');
+    hubAccessory.addService(syntheticDismiss);
+
+    const { api } = await simulateRestart(factoryWithPodClient(resolvingPodClient()), baseConfig(), previous);
+    void api;
+
+    expect(
+      hubAccessory.services.some((s) => s.UUID === syntheticPress.UUID && s.subtype === 'alarm-press'),
+    ).toBe(false);
+    expect(
+      hubAccessory.services.some((s) => s.UUID === syntheticDismiss.UUID && s.subtype === 'alarm-dismiss'),
+    ).toBe(false);
+
+    const leftAccessory = previous.find((a) => a.displayName === 'Pod Left')!;
+    expect(
+      leftAccessory.services.some((s) => s.UUID === seedApi.hap.Service.StatelessProgrammableSwitch.UUID && s.subtype === 'alarm-press'),
+    ).toBe(true);
+    expect(
+      leftAccessory.services.some((s) => s.UUID === seedApi.hap.Service.Switch.UUID && s.subtype === 'alarm-dismiss'),
+    ).toBe(true);
   });
 });
 

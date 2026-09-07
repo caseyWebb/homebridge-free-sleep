@@ -303,8 +303,8 @@ async function postSettings(pod: MockPod, body: unknown): Promise<Response> {
 }
 
 type PartialDeviceStatus = {
-  left: { isOn: boolean; secondsRemaining: number; targetTemperatureF: number };
-  right: { isOn: boolean; secondsRemaining: number; targetTemperatureF: number };
+  left: { isOn: boolean; secondsRemaining: number; targetTemperatureF: number; isAlarmVibrating: boolean };
+  right: { isOn: boolean; secondsRemaining: number; targetTemperatureF: number; isAlarmVibrating: boolean };
 };
 
 async function getDeviceStatus(pod: MockPod): Promise<PartialDeviceStatus> {
@@ -519,6 +519,55 @@ describe('fixed command expansion and ordering (5.5)', () => {
       'TEMP_LEVEL_RIGHT',
       'SET_SETTINGS',
     ]);
+  });
+});
+
+// alarm-events (#16): fault-injection-style alarm control (tasks.md 1.1, 1.2).
+describe('setAlarmVibrating (alarm-events, tasks.md 1.1)', () => {
+  it('sets isAlarmVibrating directly, with no HTTP round trip and no recorded command or request', async () => {
+    const pod = await start();
+    const requestsBefore = pod.requests.length;
+    const commandsBefore = pod.commands.length;
+
+    pod.setAlarmVibrating('left', true);
+
+    expect(pod.requests.length).toBe(requestsBefore);
+    expect(pod.commands.length).toBe(commandsBefore);
+
+    const status = await getDeviceStatus(pod);
+    expect(status.left.isAlarmVibrating).toBe(true);
+    expect(status.right.isAlarmVibrating).toBe(false);
+  });
+
+  it('can be set back to false directly, still with no HTTP round trip', async () => {
+    const pod = await start();
+    pod.setAlarmVibrating('right', true);
+    const requestsBefore = pod.requests.length;
+    const commandsBefore = pod.commands.length;
+
+    pod.setAlarmVibrating('right', false);
+
+    expect(pod.requests.length).toBe(requestsBefore);
+    expect(pod.commands.length).toBe(commandsBefore);
+    const status = await getDeviceStatus(pod);
+    expect(status.right.isAlarmVibrating).toBe(false);
+  });
+
+  // tasks.md 1.2: the pre-existing updateSide alarm branch still forces isAlarmVibrating to
+  // false and records ALARM_CLEAR regardless of which side's write set it — confirmed here
+  // starting from a `setAlarmVibrating`-injected true, i.e. state a real Pod alarm firing would
+  // have produced, rather than only ever starting from the fixture's own default false.
+  it('a subsequent isAlarmVibrating: false write still forces false and records ALARM_CLEAR, from an injected-true starting state', async () => {
+    const pod = await start();
+    pod.setAlarmVibrating('left', true);
+
+    await postDeviceStatus(pod, { left: { isAlarmVibrating: false } });
+
+    const status = await getDeviceStatus(pod);
+    expect(status.left.isAlarmVibrating).toBe(false);
+    const alarmClear = pod.commands.find((c) => c.name === 'ALARM_CLEAR');
+    expect(alarmClear).toBeDefined();
+    expect(alarmClear!.side).toBeUndefined();
   });
 });
 

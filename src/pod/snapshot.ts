@@ -606,6 +606,38 @@ export class SnapshotStore {
     });
   }
 
+  /**
+   * CI regression (alarm-events PR #45 review, found via a new B2 test — "a successful dismiss
+   * whose writeSettleMs guard timer is outstanding at shutdown"): clears every currently-
+   * installed overlay entry's own pending expiry timer directly, with no commit/notification —
+   * shutdown-time only, never called mid-session.
+   *
+   * `WriteQueue.stop()` (the overlay's sole writer) is documented as "the only place that ever
+   * needs everything torn down," walking its own per-batch overlay-handle bookkeeping
+   * (`liveOverlayBatches`) — but that bookkeeping only ever tracks a write cycle's overlay while
+   * it is still *in flight*: `settleWrite`'s own tail removes a cycle from `liveOverlayBatches`
+   * the moment it settles (success *or* failure), because at that point `WriteQueue` itself is
+   * done with it — the overlay's own `writeSettleMs` window is not a `WriteQueue` concern from
+   * then on, it is `SnapshotStore`'s (design.md, "Overlay lifecycle lives in..."). A *settled*
+   * overlay's own timer is therefore left with no other trigger to clear it before its natural
+   * expiry (or `raw` agreement) — normally harmless, since the platform keeps running and one of
+   * those two eventually happens, but fatal for "no pending timer survives shutdown" if shutdown
+   * itself lands inside that window, which nothing previously exercised until this alarm-events
+   * regression test did (every prior "shutdown clears X" test used a *failed/blocked* write,
+   * whose overlay clears immediately, or gave a successful one time to settle naturally first).
+   * This is the one thing `WriteQueue.stop()` cannot reconstruct from its own bookkeeping alone,
+   * so `SnapshotStore` exposes this narrow shutdown-only escape hatch instead — it is not the
+   * general-purpose "dispose everything" method this module's own doc says deliberately does not
+   * exist; it clears bookkeeping only, with none of a normal `commit()`'s diff/notify machinery,
+   * since nothing should still be listening by the time shutdown calls this.
+   */
+  clearAllOverlaysForShutdown(): void {
+    for (const entry of this.overlay.values()) {
+      if (entry.timerHandle) this.timers.clearTimeout(entry.timerHandle);
+    }
+    this.overlay.clear();
+  }
+
   // ---- subscription --------------------------------------------------------------------
 
   subscribe(listener: Listener): () => void {

@@ -9,7 +9,7 @@
  *
  *   | Key                  | Owner (reads it for behavior)   |
  *   |----------------------|----------------------------------|
- *   | `pollIntervals`      | `poller-and-write-queue` (#8), plus `pollIntervals.deviceWriteDebounceMs` (`hub-accessory`, #20) |
+ *   | `pollIntervals`      | `poller-and-write-queue` (#8), plus `pollIntervals.deviceWriteDebounceMs` (`hub-accessory`, #20) and `pollIntervals.alarmPollIntervalMs` (`alarm-events`, #16) |
  *   | `writeSettleMs`      | `poller-and-write-queue` (#10)  |
  *   | `noResponseAfterMs`  | `thermostat-and-offline` (#11)  |
  *   | `occupancySource`    | #19                             |
@@ -90,8 +90,11 @@ export const PollIntervalsFieldsSchema = z
       .min(0, { message: 'writeMaxDebounceMs must be non-negative' })
       .optional(),
     /**
-     * Fast-poll interval around a predicted alarm window. Reserved for #16. Default 3000.
-     * Minimum 3000 matches `poller.ts`'s `HARD_FLOOR_MS`.
+     * Consumed starting with `alarm-events` (#16): the `deviceStatus` polling interval used
+     * during a scheduled fast-poll window around a predicted alarm instant
+     * (`AlarmWindowScheduler`, `src/pod/alarmWindowScheduler.ts`). Default 3000. Minimum 3000
+     * matches `poller.ts`'s `HARD_FLOOR_MS` — the module floor no configured interval can go
+     * below.
      */
     alarmPollIntervalMs: z
       .number()
@@ -261,6 +264,16 @@ export const FreeSleepConfigSchema = z.object({
    * free (a real SQLite round-trip on every call upstream, `hub-accessory` design.md's Context).
    */
   serverFaultSensor: z.boolean().default(false),
+
+  /**
+   * Consumed starting with `alarm-events` (#16, tech-lead resolution 2): gates the per-side
+   * alarm-press `StatelessProgrammableSwitch` and "Dismiss Alarm" `Switch`, and the
+   * `AlarmWindowScheduler` that requests fast-poll windows around each predicted alarm instant.
+   * Default `true` — unlike the hub's opt-in extras, the fast-poll load this adds is bounded and
+   * purposeful (only near actually-enabled alarms; zero impact on alarm-free Pods), so default-on
+   * is right; the flag exists for opt-out and for keeping a soak profile frozen.
+   */
+  alarmEvents: z.boolean().default(true),
 }).superRefine((data, ctx) => {
   if (data.keepAliveThresholdMs >= data.keepAliveMs) {
     ctx.addIssue({

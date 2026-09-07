@@ -41,6 +41,13 @@
  * the write mutex for its entire async lifetime (see `pumpMutex` below) — so no separate
  * `runExclusive` call is needed to make the check atomic against another in-flight dispatch.
  *
+ * **Alarm-only exemption (`alarm-events` change, tech-lead resolution 1):** a reduced side patch
+ * whose only field is `isAlarmVibrating` bypasses `awayModeGuard.decide()` entirely — see
+ * `isAlarmOnlySidePatch`'s doc below. Upstream never away-scopes this field and never mirrors it
+ * either, so this exemption is parity, not a carve-out — without it, the Dismiss-Alarm switch
+ * (`src/services/alarm.ts`) would be silently non-functional under the `'block'` policy whenever
+ * either side is away, a real regression against issue #16's own "done when" bar.
+ *
  * **User-intent priority (`keep-alive`'s design.md, tech-lead resolution 5):** `submitSide`
  * takes an `origin` (`'user'` by default, `'keepAlive'` for `KeepAlive`'s re-arm writes),
  * tracked per field for the lane's currently-accumulating cycle. If that cycle's merged patch
@@ -237,6 +244,20 @@ function applyOriginPriority(patch: SidePatch, fieldOrigin: ReadonlyMap<string, 
 
 function isSideLane(lane: LaneId): lane is Side {
   return lane === 'left' || lane === 'right';
+}
+
+/**
+ * `alarm-events` (#16, tech-lead resolution 1): whether a reduced side patch's only field is
+ * `isAlarmVibrating` — upstream's own `updateSide` never consults `controlBothSides`/
+ * `updateLeft`/`updateRight` for this field at all; it always targets the addressed `side`
+ * unconditionally (`test/mockPod.ts`'s `updateSide`, mirroring `server/src/routes/deviceStatus/
+ * updateDeviceStatus.ts`). A patch whose only field is `isAlarmVibrating` therefore bypasses the
+ * away-mode guard entirely — never blocked, never mirrored — exactly matching that unconditional
+ * upstream behavior. Anything else in the patch keeps full guard semantics.
+ */
+function isAlarmOnlySidePatch(patch: SidePatch): boolean {
+  const keys = Object.keys(patch);
+  return keys.length === 1 && keys[0] === 'isAlarmVibrating';
 }
 
 function describeError(error: unknown): string {
@@ -487,16 +508,62 @@ export class WriteQueue {
     if (isSideLane(lane)) {
       sideReduced = reduceDurationFields(applyOriginPriority(patch as SidePatch, fieldOrigin));
       this.logger.debug(`writeQueue: ${lane} submitted ${JSON.stringify(patch)}, dispatching ${JSON.stringify(sideReduced)}`);
+
+      // N8 (alarm-events PR #45 review, tech-lead ruling): a dismiss (`isAlarmVibrating`)
+      // coalesced with *any* other field in the same debounce window must not inherit that other
+      // field's guard outcome — the `isAlarmOnlySidePatch` bypass below only ever fires when the
+      // *whole* reduced patch is alarm-only, so a merged patch like `{isAlarmVibrating, isOn}`
+      // previously fell through to `decide()` and got blocked wholesale under `'block'`+away,
+      // silently defeating the alarm-only exemption whenever a dismiss happened to land in the
+      // same debounce window as any other field. Peeled into its own dispatch cycle — evaluated
+      // and settled independently of `awayModeGuard.decide()`, *before* that decision is ever
+      // made for the rest of the patch — so "dismiss always lands; the guarded remainder gets
+      // normal treatment," exactly as it would if the two fields had never coalesced at all.
+      if (sideReduced.isAlarmVibrating !== undefined && Object.keys(sideReduced).length > 1) {
+        const alarmValue = sideReduced.isAlarmVibrating;
+        const alarmKey = `${lane}:isAlarmVibrating`;
+        const alarmOwnership = new Map<string, OverlayHandle>();
+        const alarmHandle = ownership.get(alarmKey);
+        if (alarmHandle) {
+          ownership.delete(alarmKey);
+          alarmOwnership.set(alarmKey, alarmHandle);
+        }
+        this.liveOverlayBatches.add(alarmOwnership);
+        const remainder = { ...sideReduced };
+        delete remainder.isAlarmVibrating;
+        sideReduced = remainder;
+        try {
+          await this.settleWrite(
+            alarmOwnership,
+            'deviceStatus',
+            () => this.client.postDeviceStatus({ [lane]: { isAlarmVibrating: alarmValue } } as DeviceStatusPatch),
+            'clear',
+          );
+        } catch (error) {
+          this.logger.debug(`writeQueue: peeled alarm-only write to ${lane} failed: ${describeError(error)}`);
+        }
+      }
+
       body = { [lane]: sideReduced };
 
-      // Away-mode guard consultation (see the module doc's "Away-mode guard" section): a
-      // synchronous decision, made and acted on before any request for this write is issued.
-      awayDecision = this.awayModeGuard.decide();
-      if (awayDecision === 'block') {
-        if (!this.stopped) this.clearOwnership(ownership);
-        this.liveOverlayBatches.delete(ownership);
-        waiters.forEach((w) => w.reject(new AwayModeBlockedError()));
-        return;
+      if (isAlarmOnlySidePatch(sideReduced)) {
+        // alarm-events (#16, tech-lead resolution 1): an alarm-only patch bypasses `decide()`
+        // entirely — see `isAlarmOnlySidePatch`'s doc. `awayDecision` stays `'plain'`, so the
+        // `'mirror'` branch below never fires for it either. After the N8 peel above, `sideReduced`
+        // can only still satisfy this when the *original* submitted patch was alarm-only to begin
+        // with (the peel requires more than one field) — the coalesced case is handled entirely
+        // above instead.
+        awayDecision = 'plain';
+      } else {
+        // Away-mode guard consultation (see the module doc's "Away-mode guard" section): a
+        // synchronous decision, made and acted on before any request for this write is issued.
+        awayDecision = this.awayModeGuard.decide();
+        if (awayDecision === 'block') {
+          if (!this.stopped) this.clearOwnership(ownership);
+          this.liveOverlayBatches.delete(ownership);
+          waiters.forEach((w) => w.reject(new AwayModeBlockedError()));
+          return;
+        }
       }
     } else if (lane === 'device') {
       // hub-accessory's widening: the device-wide lane now carries a bare `isPriming` field
@@ -617,16 +684,23 @@ export class WriteQueue {
    * method itself creates; this method sidesteps that by never routing its own write back
    * through the guarded path at all — it only ever installs the overlay and dispatches once.
    *
-   * Only the overlayable fields (`targetTemperatureF`, `isOn`, `isAlarmVibrating`) are mirrored —
-   * `secondsRemaining` is never overlayable (`snapshot.ts`'s `OverlayableField`) and is not a
-   * "user-visible field" the away-mode-guard spec asks to be reflected.
+   * Only `targetTemperatureF`/`isOn` are ever mirrored — `secondsRemaining` is never overlayable
+   * (`snapshot.ts`'s `OverlayableField`) and is not a "user-visible field" the away-mode-guard
+   * spec asks to be reflected, and `isAlarmVibrating` (S6, alarm-events PR #45 review) is never
+   * mirrored either: upstream's own `updateSide` never consults `controlBothSides` for this
+   * field at all (`isAlarmOnlySidePatch`'s doc), so mirroring it here would be a plugin-specific
+   * behavior with no upstream counterpart. In practice `reduced` can no longer even carry
+   * `isAlarmVibrating` by the time it reaches this method — N8 (same review) peels it into its
+   * own, always-addressed-only dispatch cycle in `dispatch()` before `awayDecision` is ever
+   * computed, and a patch whose *only* field is `isAlarmVibrating` never reaches `'mirror'` at
+   * all (`isAlarmOnlySidePatch` forces `awayDecision = 'plain'`) — this omission is kept as an
+   * explicit, self-documenting invariant rather than relying on that upstream call site alone.
    */
   private mirrorToOtherSide(side: Side, reduced: SidePatch): void {
     const otherSide: Side = side === 'left' ? 'right' : 'left';
     const mirrorPatch: SidePatch = {};
     if (reduced.targetTemperatureF !== undefined) mirrorPatch.targetTemperatureF = reduced.targetTemperatureF;
     if (reduced.isOn !== undefined) mirrorPatch.isOn = reduced.isOn;
-    if (reduced.isAlarmVibrating !== undefined) mirrorPatch.isAlarmVibrating = reduced.isAlarmVibrating;
     if (Object.keys(mirrorPatch).length === 0) return;
 
     const ownership = new Map<string, OverlayHandle>();
@@ -735,6 +809,15 @@ export class WriteQueue {
       this.clearOwnership(ownership);
     }
     this.liveOverlayBatches.clear();
+    // CI regression (alarm-events PR #45 review): `liveOverlayBatches` only ever tracks a write
+    // cycle's overlay while it is still in flight — `settleWrite`'s own tail removes a cycle
+    // from it the moment that cycle settles, success or failure, since from *this* queue's
+    // perspective it is done. A cycle that already settled successfully before `stop()` runs
+    // still has a live overlay sitting in `SnapshotStore` with its own pending `writeSettleMs`
+    // expiry timer, which the loop above therefore never reaches — this blanket call is what
+    // actually clears it. See `clearAllOverlaysForShutdown`'s own doc for why this lives on
+    // `SnapshotStore` rather than being reconstructed here from `WriteQueue`'s own bookkeeping.
+    this.snapshot.clearAllOverlaysForShutdown();
   }
 }
 

@@ -8,10 +8,11 @@
  * restore with prune-on-restore, unregistering the unused side when `sides !== 'both'`,
  * one-time display-name seeding from `GET /api/settings`, the bail-without-host startup
  * guard, and constructing and owning the snapshot store, poller, write queue, (as of the
- * away-mode-guard change) away-mode guard, and (as of the `keep-alive` change, #12) the
- * keep-alive component for the whole platform's lifetime, bootstrapping before any HAP handler
- * is registered, routing snapshot change events to the services that publish them, and stopping
- * everything on Homebridge shutdown (design.md, "Platform wiring").
+ * away-mode-guard change) away-mode guard, (as of the `keep-alive` change, #12) the keep-alive
+ * component, and (as of the `alarm-events` change, #16) the alarm-window scheduler for the whole
+ * platform's lifetime, bootstrapping before any HAP handler is registered, routing snapshot
+ * change events to the services that publish them, and stopping everything on Homebridge
+ * shutdown (design.md, "Platform wiring").
  *
  * Per docs/HOMEKIT.md's Homebridge 2.x API notes: HAP **types** come from `homebridge`;
  * runtime enums/classes always come from `api.hap`, never a direct `@homebridge/hap-nodejs`
@@ -43,12 +44,14 @@ import type {
   Side,
   VitalsResponse,
 } from './pod/types.ts';
+import { AlarmWindowScheduler } from './pod/alarmWindowScheduler.ts';
 import { AwayModeGuard } from './pod/awayModeGuard.ts';
 import { DEFAULT_TIMEOUT_MS, PodClient, RETRY_BASE_DELAY_MS, RETRY_JITTER_MS } from './pod/client.ts';
 import { KeepAlive } from './pod/keepAlive.ts';
 import { PodPoller } from './pod/poller.ts';
 import { defaultTimerApi, SnapshotStore, type Change, type TimerApi } from './pod/snapshot.ts';
 import { WriteQueue } from './pod/writeQueue.ts';
+import { ALARM_DISMISS_SUBTYPE, ALARM_PRESS_SUBTYPE, AlarmService, isAlarmChange } from './services/alarm.ts';
 import { CONNECTION_SUBTYPE, ConnectionService } from './services/connection.ts';
 import { LED_SUBTYPE, LedService } from './services/led.ts';
 import { isOccupancyChange, OCCUPANCY_SUBTYPE, OccupancySensorService } from './services/occupancy.ts';
@@ -71,6 +74,10 @@ export type Role = 'left' | 'right' | 'hub';
  * because nothing in `poller.ts` exports it; kept in sync by `pollIntervals.fastPollIntervalMs`
  * overriding both call sites identically when configured. */
 const DEFAULT_FAST_POLL_INTERVAL_MS = 5000;
+
+/** `AlarmWindowScheduler`'s own fast-poll interval, matching `src/config.ts`'s
+ * `alarmPollIntervalMs` schema default (`3000`) — used only when that override is omitted. */
+const DEFAULT_ALARM_POLL_INTERVAL_MS = 3000;
 
 /**
  * The subset of `PodClient`'s public interface this change calls — now the full read/write
@@ -197,6 +204,13 @@ function enabledServiceKeysFor(hap: HAP, role: Role, config: FreeSleepConfig): R
   if (config.occupancySource !== 'none') {
     keys.push(`${hap.Service.OccupancySensor.UUID}:${OCCUPANCY_SUBTYPE}`);
   }
+  // alarm-events (#16, tech-lead resolution 2): gated by `alarmEvents` (default true).
+  if (config.alarmEvents) {
+    keys.push(
+      `${hap.Service.StatelessProgrammableSwitch.UUID}:${ALARM_PRESS_SUBTYPE}`,
+      `${hap.Service.Switch.UUID}:${ALARM_DISMISS_SUBTYPE}`,
+    );
+  }
   return new Set(keys);
 }
 
@@ -232,11 +246,18 @@ export class FreeSleepPlatform implements DynamicPlatformPlugin {
    * unlike `poller`/`writeQueue`, it is still constructed (inert) when `keepAlive` is `false`;
    * its own constructor schedules nothing at all in that case (design.md). */
   private readonly keepAlive: KeepAlive | undefined;
+  /** alarm-events (#16). `undefined` when `config.alarmEvents` is `false` (or `config` itself
+   * failed to parse) — no timer is ever scheduled and no `deviceStatus` fast-poll window is ever
+   * requested in that case (tech-lead resolution 2's opt-out). Stopped alongside `poller`/
+   * `writeQueue`/`keepAlive` on shutdown. */
+  private readonly alarmWindowScheduler: AlarmWindowScheduler | undefined;
   private unsubscribeSnapshot: (() => void) | undefined;
 
   private readonly thermostats = new Map<Side, ThermostatService>();
   /** Occupancy change (#19). Populated only when `config.occupancySource !== 'none'`. */
   private readonly occupancySensors = new Map<Side, OccupancySensorService>();
+  /** alarm-events (#16). Populated only when `config.alarmEvents` is `true` (the default). */
+  private readonly alarmServices = new Map<Side, AlarmService>();
   private connectionService: ConnectionService | undefined;
   private waterLowService: WaterLowService | undefined;
   private primeService: PrimeService | undefined;
@@ -360,6 +381,19 @@ export class FreeSleepPlatform implements DynamicPlatformPlugin {
       enabled: parsed.data.keepAlive,
     });
 
+    // One `AlarmWindowScheduler` per launch (#16), sharing the same snapshot and poller — reads
+    // the already-cached `schedules`/`settings` documents and calls only `poller.requestMode`,
+    // never `writeQueue` (design.md, "A new peer module"). `undefined` entirely when
+    // `alarmEvents` is `false` (tech-lead resolution 2): no timer, no fast-poll request, ever.
+    this.alarmWindowScheduler = parsed.data.alarmEvents
+      ? new AlarmWindowScheduler({
+          snapshot,
+          poller,
+          timers: this.timers,
+          alarmPollIntervalMs: pollOptions.alarmPollIntervalMs ?? DEFAULT_ALARM_POLL_INTERVAL_MS,
+        })
+      : undefined;
+
     // Subscribed exactly once (specs/platform/spec.md, tasks.md 7.3); each service call is
     // individually wrapped so one throwing service does not stop the others from being
     // notified.
@@ -378,12 +412,16 @@ export class FreeSleepPlatform implements DynamicPlatformPlugin {
       this.poller?.stop();
       this.writeQueue?.stop();
       this.keepAlive?.stop();
+      this.alarmWindowScheduler?.stop();
       for (const thermostat of this.thermostats.values()) {
         thermostat.stop();
       }
       this.primeService?.stop();
       for (const testAlarmService of this.testAlarmServices.values()) {
         testAlarmService.stop();
+      }
+      for (const alarmService of this.alarmServices.values()) {
+        alarmService.stop();
       }
       this.unsubscribeSnapshot?.();
       this.unsubscribeSnapshot = undefined;
@@ -412,6 +450,9 @@ export class FreeSleepPlatform implements DynamicPlatformPlugin {
         if (isOccupancyChange(change)) {
           this.occupancySensors.get(change.side)?.refresh();
         }
+        if (isAlarmChange(change)) {
+          this.alarmServices.get(change.side)?.handleChange(change);
+        }
         if (change.scope === 'device' && change.field === 'connectionOnline') {
           this.connectionService?.refresh();
         } else if (change.scope === 'device' && change.field === 'waterLevelState') {
@@ -428,8 +469,9 @@ export class FreeSleepPlatform implements DynamicPlatformPlugin {
           // S2 fix (PR #44 review): an externally-changed brightness/on-off must reach the tile.
           this.ledService?.refresh();
         }
-        // isAlarmVibrating, awayMode: no published service watches these fields yet — ignored,
-        // without error (design.md's routing table; #13/#16/#19/#20).
+        // awayMode: no published service watches this field yet — ignored, without error
+        // (design.md's routing table; #13/#19/#20). isAlarmVibrating now routes to that side's
+        // AlarmService above (#16).
       } catch (error) {
         this.log.warn(`FreeSleep: a service failed to handle a snapshot change: ${describeError(error)}`);
       }
@@ -492,6 +534,10 @@ export class FreeSleepPlatform implements DynamicPlatformPlugin {
       // two can never observe a different value from each other.
       if (this.occupancySource() !== 'none') {
         this.occupancySensors.set(role, new OccupancySensorService(ctx, role));
+      }
+      // alarm-events (#16, tech-lead resolution 2): gated by `alarmEvents` (default true).
+      if (ctx.config.alarmEvents) {
+        this.alarmServices.set(role, new AlarmService(ctx, role, this.platformStartedAt));
       }
     }
   }
@@ -577,6 +623,14 @@ export class FreeSleepPlatform implements DynamicPlatformPlugin {
     // wiring"). A bootstrap that fails or times out still resolves — `PodPoller.bootstrap()`
     // races every enabled class against its own deadline — so this never blocks publishing.
     await bootstrapSettled;
+
+    // alarm-events (#16): the scheduler was constructed before this bootstrap ever ran (it sits
+    // alongside poller/writeQueue/keepAlive in the constructor), so its own construction-time
+    // tick necessarily saw an empty snapshot. This explicit recompute is its first real look at
+    // whatever schedules/settings the bootstrap just observed — without it, a same-day alarm due
+    // shortly after a restart would wait for this module's own timer (up to
+    // `RECOMPUTE_CEILING_MS`, 5 minutes) to notice.
+    this.alarmWindowScheduler?.recomputeNow();
 
     // Construct services after the bootstrap settles and before `registerPlatformAccessories`
     // — every `setProps` call inside a service's constructor must happen before the accessory

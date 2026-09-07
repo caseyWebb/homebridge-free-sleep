@@ -14,8 +14,20 @@ export default tseslint.config(
     // "Timer, clock and randomness injection"). `globalThis.setTimeout` etc. are still the
     // escape hatch the default `TimerApi` implementation itself needs — this rule only
     // forbids the bare identifiers. `src/pod/keepAlive.ts` joined this set at `keep-alive`
-    // (tasks.md 2.5) — same discipline, same injected-timer pattern.
-    files: ['src/pod/snapshot.ts', 'src/pod/poller.ts', 'src/pod/writeQueue.ts', 'src/pod/keepAlive.ts'],
+    // (tasks.md 2.5) — same discipline, same injected-timer pattern. `src/pod/
+    // alarmWindowScheduler.ts` and `src/pod/alarmSchedule.ts` joined at `alarm-events`
+    // (tasks.md 4.5): the scheduler's own timer/clock reads go through `TimerApi` like every
+    // sibling module, and the pure derivation module's own date arithmetic goes through
+    // `globalThis.Date` (the same escape hatch `poller.ts`'s vitals class already uses) rather
+    // than the bare `Date` identifier, since it never reads the ambient clock itself.
+    files: [
+      'src/pod/snapshot.ts',
+      'src/pod/poller.ts',
+      'src/pod/writeQueue.ts',
+      'src/pod/keepAlive.ts',
+      'src/pod/alarmWindowScheduler.ts',
+      'src/pod/alarmSchedule.ts',
+    ],
     rules: {
       'no-restricted-globals': [
         'error',
