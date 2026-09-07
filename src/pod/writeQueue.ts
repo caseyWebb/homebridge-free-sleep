@@ -181,6 +181,10 @@ function applyOriginPriority(patch: SidePatch, fieldOrigin: ReadonlyMap<string, 
   if (patch.isOn === undefined || patch.secondsRemaining === undefined) return patch;
   const isOnOrigin = fieldOrigin.get('isOn') ?? 'user';
   const secondsRemainingOrigin = fieldOrigin.get('secondsRemaining') ?? 'user';
+  // N6: this drops the keep-alive re-arm the same way whether the user's `isOn` is `false` or
+  // `true` — a user turning a side back *on* in the same window also wins outright, deliberately:
+  // the Pod's own `isOn: true` already gets the full 12h duration (module doc above), so the
+  // keep-alive re-arm's more precise duration has nothing to add here either.
   if (isOnOrigin === 'user' && secondsRemainingOrigin === 'keepAlive') {
     const reduced = { ...patch };
     delete reduced.secondsRemaining;

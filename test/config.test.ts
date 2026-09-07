@@ -290,24 +290,42 @@ describe('FreeSleepConfigSchema — keepAlive, keepAliveMs, keepAliveThresholdMs
     }
   });
 
+  // F3 (PR #40 review): keepAliveThresholdMs's own minimum rose from 1000ms to 120_000ms (2 min)
+  // — see src/config.ts's doc comment for why (the derived check-interval guarantee only holds
+  // once keepAliveThresholdMs / 2 reaches the 60_000ms check-interval floor on its own). Pinned
+  // exactly at the new boundary, one below it, so a future accidental revert of the bound fails
+  // this test rather than only the vaguer "999" case above.
+  it('rejects keepAliveThresholdMs one below its new 120000ms minimum, naming that key', () => {
+    const result = FreeSleepConfigSchema.safeParse({
+      host: 'pod.local',
+      keepAliveMs: 200_000,
+      keepAliveThresholdMs: 119_999,
+    });
+    expect(result.success).toBe(false);
+    if (!result.success) {
+      expect(result.error.issues.some((issue) => issue.path.join('.') === 'keepAliveThresholdMs')).toBe(true);
+    }
+  });
+
   it('accepts keepAliveThresholdMs exactly at its minimum, given a large-enough keepAliveMs', () => {
     const result = FreeSleepConfigSchema.safeParse({
       host: 'pod.local',
-      keepAliveMs: 2000,
-      keepAliveThresholdMs: 1000,
+      keepAliveMs: 200_000,
+      keepAliveThresholdMs: 120_000,
     });
     expect(result.success).toBe(true);
   });
 
   // keepAliveMs cannot be accepted at its own literal minimum (1000): keepAliveThresholdMs's
-  // own minimum is also 1000, and the cross-field check requires it strictly less than
-  // keepAliveMs — so no valid threshold exists at that boundary. This is exercised instead by
-  // the "one below keepAliveMs" test further below, at a keepAliveMs comfortably above 1000.
+  // own minimum is now 120_000 (F3), and the cross-field check requires it strictly less than
+  // keepAliveMs — so no valid threshold exists anywhere near keepAliveMs's own floor. This is
+  // exercised instead by the "one below keepAliveMs" test further below, at a keepAliveMs
+  // comfortably above keepAliveThresholdMs's own 120_000 minimum.
   it('accepts keepAliveMs one above the combined floor (keepAliveThresholdMs at its own minimum)', () => {
     const result = FreeSleepConfigSchema.safeParse({
       host: 'pod.local',
-      keepAliveMs: 1001,
-      keepAliveThresholdMs: 1000,
+      keepAliveMs: 120_001,
+      keepAliveThresholdMs: 120_000,
     });
     expect(result.success).toBe(true);
   });
@@ -339,8 +357,8 @@ describe('FreeSleepConfigSchema — keepAlive, keepAliveMs, keepAliveThresholdMs
   it('rejects keepAliveThresholdMs equal to keepAliveMs, identifying the conflict', () => {
     const result = FreeSleepConfigSchema.safeParse({
       host: 'pod.local',
-      keepAliveMs: 100_000,
-      keepAliveThresholdMs: 100_000,
+      keepAliveMs: 200_000,
+      keepAliveThresholdMs: 200_000,
     });
     expect(result.success).toBe(false);
     if (!result.success) {
@@ -351,8 +369,8 @@ describe('FreeSleepConfigSchema — keepAlive, keepAliveMs, keepAliveThresholdMs
   it('rejects keepAliveThresholdMs greater than keepAliveMs, identifying the conflict', () => {
     const result = FreeSleepConfigSchema.safeParse({
       host: 'pod.local',
-      keepAliveMs: 100_000,
-      keepAliveThresholdMs: 200_000,
+      keepAliveMs: 200_000,
+      keepAliveThresholdMs: 300_000,
     });
     expect(result.success).toBe(false);
     if (!result.success) {
@@ -363,10 +381,34 @@ describe('FreeSleepConfigSchema — keepAlive, keepAliveMs, keepAliveThresholdMs
   it('accepts keepAliveThresholdMs one below keepAliveMs', () => {
     const result = FreeSleepConfigSchema.safeParse({
       host: 'pod.local',
-      keepAliveMs: 100_000,
-      keepAliveThresholdMs: 99_999,
+      keepAliveMs: 200_000,
+      keepAliveThresholdMs: 199_999,
     });
     expect(result.success).toBe(true);
+  });
+});
+
+// F3 (PR #40 review): config.schema.json's own `minimum` for keepAliveThresholdMs must track
+// the zod boundary exactly, not merely "close enough" — a UI-side minimum lower than the zod
+// minimum would let a value through the config UI that the plugin then refuses at startup.
+describe('config.schema.json <-> FreeSleepConfigSchema parity — keepAliveThresholdMs minimum (F3)', () => {
+  it("config.schema.json's keepAliveThresholdMs.minimum is exactly 120000, matching the zod boundary", () => {
+    const property = readConfigSchemaJson().schema.properties.keepAliveThresholdMs;
+    expect(property, 'config.schema.json is missing keepAliveThresholdMs').toBeDefined();
+    expect(property?.minimum).toBe(120_000);
+
+    const oneBelow = FreeSleepConfigSchema.safeParse({
+      host: 'pod.local',
+      keepAliveMs: 200_000,
+      keepAliveThresholdMs: (property?.minimum ?? 0) - 1,
+    });
+    const at = FreeSleepConfigSchema.safeParse({
+      host: 'pod.local',
+      keepAliveMs: 200_000,
+      keepAliveThresholdMs: property?.minimum,
+    });
+    expect(oneBelow.success).toBe(false);
+    expect(at.success).toBe(true);
   });
 });
 

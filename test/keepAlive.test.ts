@@ -10,6 +10,7 @@
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
+import { AwayModeGuard } from '../src/pod/awayModeGuard.js';
 import { PodClient } from '../src/pod/client.js';
 import { KeepAlive } from '../src/pod/keepAlive.js';
 import { SnapshotStore } from '../src/pod/snapshot.js';
@@ -75,6 +76,40 @@ function deviceStatusWith(side: 'left' | 'right', secondsRemaining: number, isOn
   const status = structuredClone(deviceStatusFixture);
   status[side] = { ...status[side], isOn, secondsRemaining };
   return status;
+}
+
+/**
+ * Simulates `PodPoller`'s own independent background polling continuing to succeed, on a normal
+ * cadence (default 30_000ms — `pollIntervalMs`'s production default, deliberately smaller than
+ * `checkIntervalMs`'s 60_000ms floor). Every test in this file other than the ones in the F1
+ * describe block below constructs only `SnapshotStore` + `WriteQueue` + `KeepAlive` directly, with
+ * no `PodPoller` in the loop at all, and seeds the snapshot with a single manual
+ * `observeDeviceStatus` call — which is enough for a test that only spans one `checkIntervalMs`,
+ * but not for one (4.5) that spans many: without something re-affirming a successful observation,
+ * the F1 observation-freshness guard would eventually see `connection.lastSuccessAt` age out and
+ * treat an otherwise-healthy long-running test as if reads had stopped succeeding. This helper
+ * closes that gap the same way a real `PodPoller` would, by re-observing the exact same,
+ * otherwise-unchanged `deviceStatus` doc — refreshing only `connection.lastSuccessAt`, never any
+ * substantive field a test asserts against (mockPod.ts's own "no decay" behavior is unaffected).
+ * The F1 tests below deliberately do *not* use this — an absent or interrupted background poll is
+ * exactly what they're proving `KeepAlive` now protects against.
+ */
+function keepConnectionFresh(
+  timers: TimerHarness,
+  snapshot: SnapshotStore,
+  deviceStatus: DeviceStatus,
+  intervalMs = 30_000,
+): () => void {
+  let stopped = false;
+  const poll = (): void => {
+    if (stopped) return;
+    snapshot.observeDeviceStatus(structuredClone(deviceStatus));
+    timers.setTimeout(poll, intervalMs);
+  };
+  timers.setTimeout(poll, intervalMs);
+  return () => {
+    stopped = true;
+  };
 }
 
 beforeEach(() => {
@@ -173,9 +208,13 @@ describe('KeepAlive: a redundant re-arm is suppressed until it would matter agai
   it('no second write until the cooldown elapses, then a second re-arm fires', async () => {
     // keepAliveMs=600_000, keepAliveThresholdMs=120_000 -> checkIntervalMs=60_000,
     // cooldown = keepAliveMs - keepAliveThresholdMs = 480_000 (8 check intervals).
-    const { fake, keepAlive } = setup({
-      deviceStatus: deviceStatusWith('left', 60), // below threshold
-    });
+    const deviceStatus = deviceStatusWith('left', 60); // below threshold
+    const { timers, snapshot, fake, keepAlive } = setup({ deviceStatus });
+    // This test spans well over a keepAliveMs-minus-threshold cooldown (480_000ms) with no
+    // further writes confirming the connection in between — the F1 observation-freshness guard
+    // (checkSide's `isObservationFresh`) needs an ongoing background poll to stay satisfied for
+    // that whole span, exactly as a real PodPoller would provide (see `keepConnectionFresh`'s doc).
+    const stopPolling = keepConnectionFresh(timers, snapshot, deviceStatus);
 
     // First tick: fires the re-arm.
     await vi.advanceTimersByTimeAsync(keepAlive.checkIntervalMs);
@@ -194,6 +233,191 @@ describe('KeepAlive: a redundant re-arm is suppressed until it would matter agai
     await vi.advanceTimersByTimeAsync(600_000);
     expect(fake.postDeviceStatusCalls).toHaveLength(2);
     expect(fake.postDeviceStatusCalls[1]).toEqual({ left: { secondsRemaining: 600 } });
+    stopPolling();
+    keepAlive.stop();
+  });
+});
+
+// ---------------------------------------------------------------------------------------
+// F1 (PR #40 review, BLOCKER) — checkSide never acts on a cache it cannot currently trust
+// ---------------------------------------------------------------------------------------
+
+describe('KeepAlive: F1 — an observation-freshness guard on checkSide', () => {
+  it(
+    "reviewer's reproduction: an off write, followed by failing reads, never lets the stale raw " +
+      'cache re-arm the side once the off overlay expires',
+    async () => {
+      const onLowRemaining = deviceStatusWith('left', 60); // on, well under the 120_000ms threshold
+      const { snapshot, fake, writeQueue, keepAlive } = setup({ deviceStatus: onLowRemaining });
+
+      // The user turns the side off. `submitSide` installs a synchronous `isOn: false` overlay
+      // (`writeSettleMs`, default 15_000ms) the instant this is called, before the write even
+      // dispatches (writeQueue.ts's `submit`).
+      const off = writeQueue.submitSide('left', { isOn: false });
+      await vi.advanceTimersByTimeAsync(400); // flush the debounce so the off write actually dispatches
+      await off;
+      expect(fake.postDeviceStatusCalls).toEqual([{ left: { isOn: false } }]);
+      expect(snapshot.get().left.isOn).toBe(false); // the overlay is in effect
+
+      // Reads start failing from here on — a reboot, a stretch of dropped connections, anything
+      // that stops a real `PodPoller` from ever landing another successful `deviceStatus`
+      // observation. `raw.deviceStatus.left.isOn` was never touched by the off write itself
+      // (only the overlay was) and is still the pre-off `true` / `secondsRemaining: 60` from
+      // `setup()`'s initial seed.
+      snapshot.recordDeviceStatusFailure('network');
+      expect(snapshot.get().connection.online).toBe(false);
+
+      // The overlay expires (writeSettleMs, 15_000ms) with no confirming read having landed in
+      // between — the effective view now falls back to the still-stale raw cache, which still
+      // says `isOn: true` with a low `secondsRemaining`. Before F1, this is exactly what
+      // re-armed the side.
+      await vi.advanceTimersByTimeAsync(15_000);
+      expect(snapshot.get().left.isOn).toBe(true); // confirms the trap: the stale raw view is back
+
+      // An hour and a half of check ticks pass — comfortably past the reviewer's own "acts on a
+      // cache an hour stale" reproduction — with reads still failing throughout.
+      for (let i = 0; i < 12; i++) {
+        await vi.advanceTimersByTimeAsync(keepAlive.checkIntervalMs);
+      }
+
+      // No re-arm was ever posted — only the original off write.
+      expect(fake.postDeviceStatusCalls).toEqual([{ left: { isOn: false } }]);
+      keepAlive.stop();
+      writeQueue.stop();
+    },
+  );
+
+  it('control: with reads healthy throughout, the re-arm still fires normally — the guard adds no false negative', async () => {
+    const deviceStatus = deviceStatusWith('left', 60); // on, well under the 120_000ms threshold
+    const { timers, snapshot, fake, keepAlive } = setup({ deviceStatus });
+    const stopPolling = keepConnectionFresh(timers, snapshot, deviceStatus);
+
+    await vi.advanceTimersByTimeAsync(keepAlive.checkIntervalMs);
+    await vi.advanceTimersByTimeAsync(400); // let the re-arm's own debounce flush and dispatch
+
+    expect(fake.postDeviceStatusCalls).toEqual([{ left: { secondsRemaining: 600 } }]);
+    stopPolling();
+    keepAlive.stop();
+  });
+
+  it('an hour-stale cache is never acted on, even if connection.online happens to still read true', async () => {
+    // Built manually rather than through `setup()`, so an hour can pass *before* `KeepAlive`
+    // exists at all: `setup()` observes and constructs everything in the same synchronous tick,
+    // which would leave the very first check tick still inside the freshness window (see the
+    // boundary case `4.2` already exercises) — the point here is a cache that is already stale
+    // by the time the *first* tick ever runs.
+    const timers = createTimerHarness();
+    const snapshot = new SnapshotStore({ timers });
+    const deviceStatus = deviceStatusWith('left', 60); // on, well under the 120_000ms threshold
+    snapshot.observeDeviceStatus(structuredClone(deviceStatus));
+    snapshot.observeSettings(structuredClone(settingsFixture));
+    const fake = createFakePodClient({
+      deviceStatus,
+      settings: settingsFixture,
+      schedules: schedulesFixture,
+      services: servicesFixture,
+    });
+    const writeQueue = new WriteQueue({ client: fake.client, snapshot, requestFastPoll: () => {}, timers });
+
+    // No further observation and no recorded failure at all: `connection.online` stays whatever
+    // that single observation left it (`true`), but `lastSuccessAt` just sits there aging — a
+    // poller that has simply stopped landing successful reads, without an explicit failure yet
+    // recorded, is exactly the backstop case `isObservationFresh` also guards against (the
+    // module doc's "Observation-freshness guard" section).
+    await vi.advanceTimersByTimeAsync(3_600_000); // an hour, comfortably past checkIntervalMs (60_000ms)
+    expect(snapshot.get().connection.online).toBe(true); // still (incorrectly) reads online
+
+    const keepAlive = new KeepAlive({
+      snapshot,
+      writeQueue,
+      timers,
+      keepAliveMs: 600_000,
+      keepAliveThresholdMs: 120_000,
+      enabled: true,
+    });
+    for (let i = 0; i < 5; i++) {
+      await vi.advanceTimersByTimeAsync(keepAlive.checkIntervalMs);
+    }
+    expect(fake.postDeviceStatusCalls).toHaveLength(0);
+    keepAlive.stop();
+    writeQueue.stop();
+  });
+});
+
+// ---------------------------------------------------------------------------------------
+// F2 (PR #40 review) — a blocked away-mode re-arm produces no Pod traffic, and is logged
+// ---------------------------------------------------------------------------------------
+
+describe('KeepAlive: F2 — away mode + the \'block\' policy refuses a re-arm before it reaches the Pod', () => {
+  it('a side below threshold under away mode + block is not re-armed, and the rejection is debug-logged', async () => {
+    const timers = createTimerHarness();
+    const snapshot = new SnapshotStore({ timers });
+    const deviceStatus = deviceStatusWith('left', 60); // on, well under the 120_000ms threshold
+    snapshot.observeDeviceStatus(structuredClone(deviceStatus));
+    snapshot.observeSettings({ ...structuredClone(settingsFixture), left: { ...settingsFixture.left, awayMode: true } });
+    const fake = createFakePodClient({
+      deviceStatus,
+      settings: settingsFixture,
+      schedules: schedulesFixture,
+      services: servicesFixture,
+    });
+    const awayModeGuard = new AwayModeGuard({ snapshot, policy: 'block' });
+    const writeQueue = new WriteQueue({ client: fake.client, snapshot, requestFastPoll: () => {}, timers, awayModeGuard });
+    const debugMessages: string[] = [];
+    const keepAlive = new KeepAlive({
+      snapshot,
+      writeQueue,
+      timers,
+      logger: { debug: (message) => debugMessages.push(message), warn: () => {} },
+      keepAliveMs: 600_000,
+      keepAliveThresholdMs: 120_000,
+      enabled: true,
+    });
+
+    await vi.advanceTimersByTimeAsync(keepAlive.checkIntervalMs);
+    await vi.advanceTimersByTimeAsync(400); // let the rejected attempt settle
+
+    expect(fake.postDeviceStatusCalls).toHaveLength(0);
+    expect(debugMessages.some((message) => message.includes('away-mode write policy is "block"'))).toBe(true);
+    keepAlive.stop();
+    writeQueue.stop();
+  });
+});
+
+// ---------------------------------------------------------------------------------------
+// N4 (PR #40 review) — a stalled dispatch does not accumulate duplicate re-arms
+// ---------------------------------------------------------------------------------------
+
+describe('KeepAlive: N4 — an in-flight re-arm is not resubmitted by every tick while it settles', () => {
+  it('several ticks against a gated dispatch produce exactly one POST once it is released', async () => {
+    const deviceStatus = deviceStatusWith('left', 60); // on, well under the 120_000ms threshold
+    const { fake, keepAlive } = setup({ deviceStatus });
+
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const originalPost = fake.client.postDeviceStatus;
+    fake.client.postDeviceStatus = (async (patch) => {
+      await gate;
+      return originalPost(patch);
+    }) as typeof fake.client.postDeviceStatus;
+
+    // Several check ticks pass while the very first re-arm's dispatch is stuck behind the gate.
+    // Nothing here ever resolves to update `nextDueAtMs`, and nothing re-observes `deviceStatus`
+    // either — before N4, each of these ticks would see the same still-qualifying, unconfirmed
+    // snapshot and queue one more `submitSide` call apiece, each dispatching its own POST the
+    // moment the mutex frees up.
+    for (let i = 0; i < 6; i++) {
+      await vi.advanceTimersByTimeAsync(keepAlive.checkIntervalMs);
+    }
+    expect(fake.postDeviceStatusCalls).toHaveLength(0); // still gated — nothing has dispatched yet
+
+    release();
+    await vi.advanceTimersByTimeAsync(1000); // let the mutex drain whatever is queued
+
+    expect(fake.postDeviceStatusCalls).toHaveLength(1);
+    expect(fake.postDeviceStatusCalls[0]).toEqual({ left: { secondsRemaining: 600 } });
     keepAlive.stop();
   });
 });

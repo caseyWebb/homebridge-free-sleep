@@ -116,14 +116,15 @@
         "title": "Keep-alive re-arm duration (ms)",
         "type": "integer",
         "default": 43200000,
-        "minimum": 1000
+        "minimum": 1000,
+        "description": "Must be strictly greater than the re-arm threshold below. This UI cannot enforce that relationship between two separate fields — an invalid combination is caught by the plugin at Homebridge startup, which fails to load rather than silently accepting it."
       },
       "keepAliveThresholdMs": {
         "title": "Keep-alive re-arm threshold (ms)",
         "type": "integer",
         "default": 1800000,
-        "minimum": 1000,
-        "description": "A side is re-armed once its remaining time drops below this. Must be less than the re-arm duration above."
+        "minimum": 120000,
+        "description": "A side is re-armed once its remaining time drops below this. Must be strictly less than the re-arm duration above — this UI cannot enforce that cross-field relationship, so an invalid combination is instead caught loudly at Homebridge startup. Minimum 120000ms (2 min): below that, the plugin's internally-derived check cadence can no longer catch every side before it expires (see src/config.ts)."
       },
       "awayModeWritePolicy": {
         "title": "Away-mode write policy — governs a write to either side while one side has away mode on: mirror the change with a second real POST /api/deviceStatus to the other side (updating its cached state to match), or block the write",
