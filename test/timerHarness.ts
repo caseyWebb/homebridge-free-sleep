@@ -13,7 +13,7 @@
 
 import { vi } from 'vitest';
 
-import type { TimerApi } from '../src/pod/snapshot.js';
+import type { TimerApi, TimerHandle } from '../src/pod/snapshot.js';
 
 /**
  * Captured at module load — before any test calls `vi.useFakeTimers()` — so this keeps
@@ -51,14 +51,51 @@ export interface TimerHarness extends TimerApi {
   random: () => number;
   /** Number of timers vitest's fake-timer system still has scheduled. */
   pendingCount(): number;
+  /**
+   * Diagnostic-only (CI regression investigation, alarm-events PR #45 review): a label — the
+   * call-site of whichever `this.timers.setTimeout(...)` scheduled it — for every timer this
+   * harness itself has scheduled and not yet cleared or fired, in scheduling order. Only ever
+   * covers timers scheduled *through this harness* — i.e. everything this plugin's own code
+   * schedules via the injected `TimerApi` (`snapshot.ts`/`poller.ts`/`writeQueue.ts`/
+   * `alarmWindowScheduler.ts`/`keepAlive.ts`, and every service that threads the same shared
+   * `timers` object through `ServiceContext`). A timer some *other* library schedules directly
+   * against the bare global (HAP-NodeJS's own per-accessory `configurationChangeDebounceTimeout`
+   * is exactly this) never appears here even though `pendingCount()`/`vi.getTimerCount()` still
+   * counts it — which is precisely what makes this a decisive diagnostic: if `pendingCount()`
+   * exceeds the expected baseline but `pendingLabels()` is empty (or unchanged), the excess is
+   * provably not this plugin's own doing.
+   */
+  pendingLabels(): string[];
+}
+
+/** The call-site inside *this plugin's own source* that invoked `timers.setTimeout(...)`, or the
+ * raw first stack line if none is found (e.g. called directly from a test). Skips this module's
+ * own frame and vitest/node internals so the label points at the actual caller. */
+function callSiteLabel(): string {
+  const stack = new Error().stack ?? '';
+  const lines = stack.split('\n').slice(1); // drop the "Error" header line
+  const appFrame = lines.find((line) => /\/(src|test)\//.test(line) && !line.includes('/test/timerHarness.ts'));
+  return (appFrame ?? lines[0] ?? '<unknown>').trim();
 }
 
 export function createTimerHarness(initialRandom: () => number = () => 0.5): TimerHarness {
   let randomImpl = initialRandom;
+  const labels = new Map<TimerHandle, string>();
 
   const harness: TimerHarness = {
-    setTimeout: (fn, ms) => globalThis.setTimeout(fn, ms),
-    clearTimeout: (handle) => globalThis.clearTimeout(handle),
+    setTimeout: (fn, ms) => {
+      const label = callSiteLabel();
+      const handle = globalThis.setTimeout(() => {
+        labels.delete(handle);
+        fn();
+      }, ms);
+      labels.set(handle, label);
+      return handle;
+    },
+    clearTimeout: (handle) => {
+      labels.delete(handle);
+      globalThis.clearTimeout(handle);
+    },
     now: () => Date.now(),
     get random() {
       return randomImpl;
@@ -67,6 +104,7 @@ export function createTimerHarness(initialRandom: () => number = () => 0.5): Tim
       randomImpl = fn;
     },
     pendingCount: () => vi.getTimerCount(),
+    pendingLabels: () => [...labels.values()],
   };
 
   return harness;

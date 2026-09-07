@@ -1283,17 +1283,7 @@ describe('shutdown clears each AlarmService\'s pending revert timer (tasks.md 7.
   it('no pending timer remains after shutdown with an on-write\'s accept-then-revert timer outstanding', async () => {
     vi.useFakeTimers();
     // Pinned rather than left at whatever real "now" happened to be at call time (unlike most of
-    // this file's other fake-timer tests). Investigating a CI flake report against this test
-    // during the alarm-events PR #45 review (see the "successful dismiss" test below for the
-    // *fixed* root cause it actually found) surfaced that this pre-existing, unmodified test is
-    // itself occasionally flaky when run as part of the full file — reproduced back to before
-    // this change too (`3aa9590`, unrelated to alarm-events), and reduced but not eliminated by
-    // pinning the clock here. The residual is consistent with HAP-NodeJS's own internal
-    // per-accessory timer (this file's own "hap-nodejs's own `Accessory` constructor schedules
-    // one timer per accessory" note, `describe('shutdown stops polling...')` above) occasionally
-    // interacting with this test's own characteristic write in a way outside this plugin's code
-    // to control; left here as a documented, pre-existing, out-of-scope-for-this-PR flake rather
-    // than silently worked around.
+    // this file's other fake-timer tests) — see this test's own assertion doc below for why.
     vi.setSystemTime(Date.UTC(2024, 0, 1));
     try {
       const timers = createTimerHarness();
@@ -1318,17 +1308,36 @@ describe('shutdown clears each AlarmService\'s pending revert timer (tasks.md 7.
       const platform = new FreeSleepPlatform(log, baseConfig(), api.asApi(), client, timers);
       await api.fireDidFinishLaunching();
       setSpy.mockRestore();
-      const perAccessoryOverhead = api.registeredAccessories.length;
 
       const onSet = setHandlers.get(api.hap.Characteristic.On.UUID)!;
+      const beforeWrite = timers.pendingLabels().length;
       const pending = onSet(true, {} as never, undefined);
       if (pending instanceof Promise) pending.catch(() => undefined);
       await vi.advanceTimersByTimeAsync(0);
 
-      expect(timers.pendingCount()).toBeGreaterThan(perAccessoryOverhead);
+      // Exactly one new timer this plugin's own code scheduled — the revert.
+      expect(timers.pendingLabels().length).toBe(beforeWrite + 1);
 
       await api.fireShutdown();
-      expect(timers.pendingCount()).toBe(perAccessoryOverhead);
+      // CI flake investigation (alarm-events PR #45 review): comparing raw `pendingCount()`
+      // (`vi.getTimerCount()`, every fake timer regardless of who scheduled it) against
+      // `api.registeredAccessories.length` as a stand-in for "hap-nodejs's own fixed per-
+      // accessory overhead" is what this test used to do, and it was genuinely flaky — CI hit
+      // "expected 5 to be 3" a few times on this exact test, on an unmodified copy of it that
+      // reproduces identically on `3aa9590` (before any alarm-events change). Bisecting with
+      // `timers.pendingLabels()` (labels the call-site of every `timers.setTimeout(...)` this
+      // harness itself schedules — `test/timerHarness.ts`'s own doc) proved the extra pending
+      // timer(s) on every captured failure were *not* scheduled through this plugin's injected
+      // `TimerApi` at all (the label list was empty both times a failure was reproduced locally)
+      // — so this was never a `stop()`-path bug in this plugin's own code; it is HAP-NodeJS's own
+      // internal per-accessory/per-bridge configuration-change debounce state, whose exact
+      // pending-timer footprint is not fully deterministic under `vi.useFakeTimers()` and is
+      // outside this plugin's own code to control. Asserting on `pendingLabels()` instead of raw
+      // `pendingCount()` targets exactly what `AlarmService.stop()` (and everything else this
+      // plugin's shutdown touches) is actually responsible for, with no dependency on HAP-NodeJS's
+      // own unrelated internal timer bookkeeping — a real timer this plugin's own code left
+      // dangling would still show up here and still fail this assertion.
+      expect(timers.pendingLabels()).toEqual([]);
       void platform;
     } finally {
       vi.useRealTimers();
@@ -1344,18 +1353,15 @@ describe('shutdown clears each AlarmService\'s pending revert timer (tasks.md 7.
   // `SnapshotStore`'s own overlay-expiry timer for the settled `isAlarmVibrating` overlay, which
   // `WriteQueue`'s own `liveOverlayBatches` bookkeeping stops tracking the moment a write cycle
   // settles (`writeQueue.ts`'s `settleWrite`), leaving nothing to clear it before shutdown except
-  // `SnapshotStore.clearAllOverlaysForShutdown()` (now called from `WriteQueue.stop()`). Whether
-  // this second timer survived shutdown depended on timing beyond this test's own control —
-  // reliably reproduced running the full file, deterministically fixed and pinned in
-  // `test/writeQueue.test.ts`'s own unit-level regression for the same bug ("a write that
-  // already settled successfully before stop() still has its own overlay timer cleared"), which
-  // is the authoritative, always-reproducing proof this fix is correct; this platform-level test
-  // is the integration-level confirmation, kept deliberately even though (see the on-write test
-  // above) this describe block turned out to sit on a pre-existing, unrelated flake of its own.
+  // `SnapshotStore.clearAllOverlaysForShutdown()` (now called from `WriteQueue.stop()`) — the
+  // fix this test is really here to pin. It asserts via `pendingLabels()`, not raw `pendingCount()`
+  // (see the on-write test above's own assertion doc for why): the authoritative,
+  // always-reproducing proof this fix is correct is `test/writeQueue.test.ts`'s own unit-level
+  // regression for the same bug ("a write that already settled successfully before stop() still
+  // has its own overlay timer cleared"); this platform-level test is the integration confirmation.
   it("no pending timer remains after shutdown with a successful dismiss's writeSettleMs guard timer outstanding", async () => {
     vi.useFakeTimers();
-    // Pinned for the same reason as the on-write test above — eliminates real sub-second jitter
-    // in exactly how many background poll cycles are already due at test start as a variable.
+    // Pinned for the same reason as the on-write test above.
     vi.setSystemTime(Date.UTC(2024, 0, 1));
     try {
       const timers = createTimerHarness();
@@ -1378,7 +1384,6 @@ describe('shutdown clears each AlarmService\'s pending revert timer (tasks.md 7.
       const platform = new FreeSleepPlatform(log, baseConfig(), api.asApi(), client, timers);
       await api.fireDidFinishLaunching();
       setSpy.mockRestore();
-      const perAccessoryOverhead = api.registeredAccessories.length;
 
       const hap = api.hap;
       // `resolvedFakeClient()` returns real fixture settings, so each side accessory is named
@@ -1388,24 +1393,23 @@ describe('shutdown clears each AlarmService\'s pending revert timer (tasks.md 7.
       const dismissChar = left.getServiceById(hap.Service.Switch, ALARM_DISMISS_SUBTYPE)!.getCharacteristic(hap.Characteristic.On);
       const dismissOnSet = setHandlers.get(dismissChar)!;
 
+      const beforeWrite = timers.pendingLabels().length;
+
       // Off-write: submits, debounces, dispatches, and — since `resolvedFakeClient`'s
       // `postDeviceStatus` always resolves — succeeds, arming the guard timer for `writeSettleMs`.
       const pending = dismissOnSet(false, {} as never, undefined);
       const settled = pending instanceof Promise ? pending : Promise.resolve();
       settled.catch(() => undefined);
-      // `advanceFakeTime` (smaller steps, each followed by a real yield — `timerHarness.ts`'s own
-      // doc) rather than one raw `vi.advanceTimersByTimeAsync(400)` call: this also lets any
-      // background poll whose own next tick lands inside this same 400ms window fully settle
-      // before this test takes its own pending-timer-count snapshot, rather than possibly
-      // catching it mid-flight.
       await advanceFakeTime(400, 50); // the write-queue's own debounce -> dispatch -> success
       await settled;
 
-      expect(timers.pendingCount()).toBeGreaterThan(perAccessoryOverhead); // the guard timer is armed
+      // Two new timers this plugin's own code scheduled: the settled overlay's own expiry
+      // (`SnapshotStore`) and `AlarmService`'s `dismissOverlayGuardTimer` (B2).
+      expect(timers.pendingLabels().length).toBe(beforeWrite + 2);
 
       // Shut down well before writeSettleMs (15000ms default) would otherwise clear it itself.
       await api.fireShutdown();
-      expect(timers.pendingCount()).toBe(perAccessoryOverhead);
+      expect(timers.pendingLabels()).toEqual([]);
       void platform;
     } finally {
       vi.useRealTimers();
