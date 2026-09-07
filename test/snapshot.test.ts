@@ -189,6 +189,7 @@ describe('snapshot store: change notifications (3.1-3.5)', () => {
         case 'isOn':
         case 'isAlarmVibrating':
         case 'awayMode':
+        case 'alarmSkipExpiresAt':
         case 'presencePresent':
         case 'presenceActive':
         case 'vitalsOccupied':

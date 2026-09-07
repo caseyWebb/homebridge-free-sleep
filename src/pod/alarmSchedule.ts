@@ -234,19 +234,56 @@ export function nextOccurrenceOfTime(timeZone: string, hhmm: string, nowMs: numb
  *     (noonToday)`) — then add 2 minutes. Upstream resolves that one `HH:mm` value once and reuses
  *     it unconditionally for both the today and tomorrow branches; it does not re-look-up a
  *     different weekday's `alarm.time` when the target date shifts to tomorrow. This port
- *     preserves that exactly (a faithful port, not an idealized fix) — the only claim this
- *     project can verify is parity with upstream's actual, checked-in behavior.
+ *     preserves that exactly (a faithful port, not an idealized fix).
+ *
+ * **N2 (settings-switches PR #46 review) — where this port deliberately does *not* claim parity:**
+ * the `HH:mm` string this function reads is `sideSchedule[...].alarm.time` directly — the raw
+ * schedule value, verbatim. Upstream's own `scheduledAlarmTimeHhMm` (the value it actually passes
+ * into `AlarmDisabledDialog.handleSave`) is *not* that raw value: `AlarmNotification.tsx` first
+ * round-trips it through `moment(alarm.time, 'HH:mm').format('hh:mm')` — `'hh:mm'` is moment's
+ * **12-hour** format token, emitted with no AM/PM indicator at all — before `handleSave`'s own
+ * `scheduledAlarmTimeHhMm.split(':').map(Number)` parses that already-12-hour string as if it
+ * were still 24-hour. Any alarm time in the 13:00-23:59 range is therefore silently corrupted
+ * upstream before it ever reaches the date-picking logic this function otherwise mirrors (e.g. an
+ * `18:00` alarm becomes the string `"06:00"`, parsed as `06:00`, six hours off). This function
+ * skips that reformatting step entirely and parses the schedule's own 24-hour value once — a
+ * deliberate, strictly-better divergence from upstream's actual checked-in behavior on this one
+ * point, not an unverified claim of parity with it. Every other rule this function ports (the
+ * sleep-day weekday lookup, the noon-based target-date rule, the fixed +2 minutes) has no such
+ * divergence and is preserved exactly, per the paragraph above.
+ *
+ * **N4 (settings-switches PR #46 review) — hardened like `deriveUpcomingAlarms`'s own B1 guards:**
+ * a malformed `timeZone` (an unrecognized IANA name reaching `Intl.DateTimeFormat`'s constructor),
+ * a malformed `alarm.time` (an unparseable `HH:mm`, making every downstream `Date.UTC`/`Intl`
+ * computation `NaN`, which `Intl.DateTimeFormat.formatToParts` itself then throws on), or a
+ * missing weekday entry (a structurally incomplete `sideSchedule`) all resolve to `NaN` — this
+ * function itself never throws for any of these three vectors. `SkipAlarmService.flush()` is the
+ * one caller, and maps a non-finite result to `HapStatusError(SERVICE_COMMUNICATION_FAILURE)`,
+ * per the skip-alarm-switch spec's own "fail loudly rather than guess" requirement — the mapping
+ * lives there, not here, so this function stays a pure, always-returns-a-number derivation like
+ * every other export in this module.
  */
 export function nextAlarmSkipInstant(timeZone: string, sideSchedule: SideSchedule, nowMs: number): number {
-  const sleepDayFields = wallClockFieldsInZone(nowMs - 12 * 60 * 60 * 1000, timeZone);
-  const { hour, minute } = parseHhMm(sideSchedule[sleepDayFields.weekday].alarm.time);
+  try {
+    const sleepDayFields = wallClockFieldsInZone(nowMs - 12 * 60 * 60 * 1000, timeZone);
+    const daily = sideSchedule[sleepDayFields.weekday];
+    if (!daily) return NaN; // N4: a structurally incomplete `sideSchedule` — missing weekday.
+    const { hour, minute } = parseHhMm(daily.alarm.time);
+    if (!Number.isFinite(hour) || !Number.isFinite(minute)) return NaN; // N4: malformed `alarm.time`.
 
-  const now = wallClockFieldsInZone(nowMs, timeZone);
-  const noonInstant = zonedTimeToInstant(timeZone, { ...now, hour: 12, minute: 0, second: 0 });
-  const targetDate = nowMs < noonInstant ? { year: now.year, month: now.month, day: now.day } : addCalendarDays(now, 1);
+    const now = wallClockFieldsInZone(nowMs, timeZone);
+    const noonInstant = zonedTimeToInstant(timeZone, { ...now, hour: 12, minute: 0, second: 0 });
+    const targetDate = nowMs < noonInstant ? { year: now.year, month: now.month, day: now.day } : addCalendarDays(now, 1);
 
-  const base = zonedTimeToInstant(timeZone, { ...targetDate, hour, minute, second: 0 });
-  return base + 2 * 60 * 1000;
+    const base = zonedTimeToInstant(timeZone, { ...targetDate, hour, minute, second: 0 });
+    const result = base + 2 * 60 * 1000;
+    return Number.isFinite(result) ? result : NaN;
+  } catch {
+    // N4: a malformed `timeZone` throws inside `wallClockFieldsInZone`'s `Intl.DateTimeFormat`
+    // constructor — caught here rather than left to propagate, matching `deriveUpcomingAlarms`'
+    // own B1 per-entry try/catch for the identical cause.
+    return NaN;
+  }
 }
 
 function parseTimestamp(raw: string | undefined): number | undefined {

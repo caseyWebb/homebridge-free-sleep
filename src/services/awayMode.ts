@@ -27,11 +27,17 @@
  * not apply here"):** `AwayModeGuard`'s `AwayModeBlockedError` -> `NOT_ALLOWED_IN_CURRENT_STATE`
  * mapping gates `submitSide` (side-lane writes) only. This switch's own write —
  * `writeQueue.submitSettings` — is never gated by that guard, so a `submitSettings` failure of
- * any kind maps uniformly to `SERVICE_COMMUNICATION_FAILURE`. The one place `AwayModeBlockedError`
- * *can* legitimately surface here is the optional `awayModeTurnsSideOff` pre-step below, which
- * calls `submitSide` — a genuinely guarded side-lane write — so that specific failure *does* map
- * to `NOT_ALLOWED_IN_CURRENT_STATE`, same as `ThermostatService`'s own handling of a blocked
- * `submitSide` call.
+ * any kind maps uniformly to `SERVICE_COMMUNICATION_FAILURE`.
+ *
+ * **`awayModeTurnsSideOff`'s pre-step, and the S2 ruling (settings-switches PR #46 review):** the
+ * optional pre-step below calls `submitSide` — a genuinely guarded side-lane write — but an
+ * `AwayModeBlockedError` from *that specific call* is no longer treated as fatal to the toggle.
+ * The only way this pre-step can be blocked is the partner side already being away, and the Pod
+ * applies a settings write to both sides whenever either is away anyway (`docs/POD-API.md`) — so
+ * aborting here would make Away Mode itself unreachable for as long as the partner stays away.
+ * `flush()` logs this case at `info` and proceeds to the `awayMode: true` write regardless. Any
+ * *other* error from the pre-step (a genuine communication failure, not a guard block) still
+ * aborts the toggle and maps to `SERVICE_COMMUNICATION_FAILURE`, same as before.
  */
 
 import type { Service } from 'homebridge';
@@ -193,6 +199,18 @@ export class AwayModeService {
     const pending = this.pending;
     if (!pending) return;
     this.pending = undefined;
+
+    // S3 (settings-switches PR #46 review): a double-tap within the debounce window that
+    // coalesces back to the value already observed on the cached snapshot produces no write at
+    // all — nothing would actually change on the Pod. Resolved immediately, without touching
+    // `lastSubmittedAtMs` (no submission happened, so the rate-limit floor must not advance) and
+    // without the `awayModeTurnsSideOff` pre-step (there is nothing to sequence a power-off
+    // ahead of).
+    if (pending.value === this.observedValue()) {
+      pending.waiters.forEach((w) => w.resolve());
+      return;
+    }
+
     this.lastSubmittedAtMs = this.ctx.timers.now();
 
     const hap = this.ctx.api.hap;
@@ -204,13 +222,29 @@ export class AwayModeService {
           await this.ctx.writeQueue.submitSide(this.side, { isOn: false });
         } catch (error) {
           if (error instanceof AwayModeBlockedError) {
-            this.ctx.log.debug(
-              `FreeSleep: ${this.side} away-mode-turns-off power write refused by the away-mode guard: ${describeError(error)}`,
+            // TECH-LEAD RULING (settings-switches PR #46 review, S2): the *only* way this
+            // specific pre-step can be blocked is the guard's `'block'` policy refusing it
+            // because the *partner* side is already away (`awayModeGuard.decide()`: "either side
+            // away" gates every side write). Aborting the whole toggle here — as this used to —
+            // makes Away Mode permanently unreachable for this side for as long as the partner
+            // stays away: turning Away Mode on is exactly the action that should always still be
+            // possible. The Pod applies a `settings` write to *both* sides whenever either is
+            // away already (`docs/POD-API.md`, `controlBothSides`), so skipping this side's own
+            // `isOn: false` pre-step and proceeding straight to the `awayMode: true` write below
+            // does not lose the intended effect — it is simply subsumed by the guard's own
+            // "block/mirror" semantics acting on the settings write itself. Logged at `info`, not
+            // `debug`, since this is a real behavioral divergence from what was requested (the
+            // power-off pre-step silently did not happen), not routine chatter. Any *other*
+            // pre-step failure (a genuine communication failure) still aborts, unchanged.
+            this.ctx.log.info(
+              `FreeSleep: ${this.side} away-mode-turns-off power write was refused by the away-mode guard ` +
+                `(the partner side is already away) — proceeding with the away-mode write itself, which the ` +
+                `Pod applies to both sides regardless: ${describeError(error)}`,
             );
-            throw new hap.HapStatusError(hap.HAPStatus.NOT_ALLOWED_IN_CURRENT_STATE);
+          } else {
+            this.ctx.log.debug(`FreeSleep: ${this.side} away-mode-turns-off power write failed: ${describeError(error)}`);
+            throw new hap.HapStatusError(hap.HAPStatus.SERVICE_COMMUNICATION_FAILURE);
           }
-          this.ctx.log.debug(`FreeSleep: ${this.side} away-mode-turns-off power write failed: ${describeError(error)}`);
-          throw new hap.HapStatusError(hap.HAPStatus.SERVICE_COMMUNICATION_FAILURE);
         }
       }
 

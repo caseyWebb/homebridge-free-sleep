@@ -286,13 +286,113 @@ describe('awayModeTurnsSideOff sequencing (4.3)', () => {
   });
 
   it('turning off never touches power, regardless of the flag', async () => {
-    const { ctx, fake } = setup({ config: { awayModeTurnsSideOff: true } });
+    const { ctx, fake, snapshot } = setup({ config: { awayModeTurnsSideOff: true } });
+    // S3 (settings-switches PR #46 review): away mode must actually start *on* here, or turning
+    // it off is a no-op the new no-op suppression correctly skips before this test ever gets to
+    // observe whether power was touched — this test's own point is a real off transition.
+    snapshot.observeSettings({ ...structuredClone(settingsFixture), left: { ...settingsFixture.left, awayMode: true } });
     const { onSet } = build(ctx, 'left');
     const p = onSet(false, {} as never);
     await vi.advanceTimersByTimeAsync(2500);
     await p;
     expect(fake.postDeviceStatusCalls).toHaveLength(0);
     expect(fake.postSettingsCalls).toEqual([{ left: { awayMode: false } }]);
+  });
+});
+
+// ---------------------------------------------------------------------------------------
+// S2 (settings-switches PR #46 review): the awayModeTurnsSideOff pre-step's own
+// AwayModeBlockedError ruling — the partner side already being away must not make Away Mode
+// itself unreachable.
+// ---------------------------------------------------------------------------------------
+
+describe('S2: awayModeTurnsSideOff pre-step guard-block ruling (settings-switches PR #46 review)', () => {
+  it('flag on + partner already away under \'block\': the guard-blocked pre-step is logged and the away-mode write still proceeds', async () => {
+    const { ctx, fake, snapshot, order } = setup({ config: { awayModeTurnsSideOff: true, awayModeWritePolicy: 'block' } });
+    // The *right* side is already away — the guard's 'block' policy therefore refuses left's own
+    // isOn:false pre-step too ("either side away" gates every side write).
+    snapshot.observeSettings({ ...structuredClone(settingsFixture), right: { ...settingsFixture.right, awayMode: true } });
+    const { onSet } = build(ctx, 'left');
+
+    const p = onSet(true, {} as never);
+    await vi.advanceTimersByTimeAsync(2000); // service debounce
+    await vi.advanceTimersByTimeAsync(500); // writeQueue's own side-lane debounce + dispatch (blocked)
+    await vi.advanceTimersByTimeAsync(500); // then the settings-lane debounce + dispatch
+    await expect(p).resolves.toBeUndefined(); // executed scenario: completes, does not abort
+
+    expect(fake.postDeviceStatusCalls).toHaveLength(0); // the pre-step never reached the Pod
+    expect(fake.postSettingsCalls).toEqual([{ left: { awayMode: true } }]);
+    expect(order).toEqual(['settings']);
+  });
+
+  it('flag on + a genuine (non-guard) pre-step failure still aborts the whole toggle', async () => {
+    const { ctx, fake, api } = setup({ config: { awayModeTurnsSideOff: true } });
+    fake.postDeviceStatusOutcome = { kind: 'error', error: new Error('network down') };
+    const { onSet } = build(ctx, 'left');
+
+    const p = onSet(true, {} as never);
+    const assertion = expect(p).rejects.toMatchObject({ hapStatus: api.hap.HAPStatus.SERVICE_COMMUNICATION_FAILURE });
+    await vi.advanceTimersByTimeAsync(2500);
+    await assertion;
+
+    // Aborted before ever attempting the settings write — unchanged from the pre-existing
+    // (non-guard-failure) abort behavior.
+    expect(fake.postSettingsCalls).toHaveLength(0);
+  });
+});
+
+// ---------------------------------------------------------------------------------------
+// S3 (settings-switches PR #46 review): no-op suppression — a coalesced value that already
+// matches the observed one produces zero settings writes.
+// ---------------------------------------------------------------------------------------
+
+describe('S3: a double-tap within the debounce window that nets out to no change produces zero writes', () => {
+  it('on then off, starting (and ending) observed-off: zero POST /api/settings, waiters still resolve', async () => {
+    const { ctx, fake } = setup(); // default fixture: left's awayMode is already false
+    const { onGet, onSet } = build(ctx, 'left');
+    const p1 = onSet(true, {} as never);
+    await vi.advanceTimersByTimeAsync(500);
+    const p2 = onSet(false, {} as never);
+    await vi.advanceTimersByTimeAsync(2500);
+    await Promise.all([p1, p2]); // resolves, not rejects — a no-op is still a successful toggle
+    expect(fake.postSettingsCalls).toHaveLength(0);
+    expect(onGet({} as never)).toBe(false);
+  });
+
+  it('off then on, starting (and ending) observed-on: zero POST /api/settings', async () => {
+    const { ctx, fake, snapshot } = setup();
+    snapshot.observeSettings({ ...structuredClone(settingsFixture), left: { ...settingsFixture.left, awayMode: true } });
+    const { onGet, onSet } = build(ctx, 'left');
+    const p1 = onSet(false, {} as never);
+    await vi.advanceTimersByTimeAsync(500);
+    const p2 = onSet(true, {} as never);
+    await vi.advanceTimersByTimeAsync(2500);
+    await Promise.all([p1, p2]);
+    expect(fake.postSettingsCalls).toHaveLength(0);
+    expect(onGet({} as never)).toBe(true);
+  });
+
+  it('control case: a single toggle that is a real transition still produces exactly one write', async () => {
+    const { ctx, fake } = setup(); // default fixture: left's awayMode is already false
+    const { onSet } = build(ctx, 'left');
+    const p = onSet(true, {} as never);
+    await vi.advanceTimersByTimeAsync(2500);
+    await p;
+    expect(fake.postSettingsCalls).toEqual([{ left: { awayMode: true } }]);
+  });
+
+  it('a no-op toggle does not advance the rate-limit floor — a genuine toggle right after is not delayed by it', async () => {
+    const { ctx, fake } = setup();
+    const { onSet } = build(ctx, 'left');
+    const noOp = onSet(false, {} as never); // already false — suppressed, no submission
+    await vi.advanceTimersByTimeAsync(2500);
+    await noOp;
+    expect(fake.postSettingsCalls).toHaveLength(0);
+
+    const real = onSet(true, {} as never); // a real transition, immediately after
+    await vi.advanceTimersByTimeAsync(2500); // just the plain 2s debounce — no 10s floor to wait out
+    await real;
+    expect(fake.postSettingsCalls).toEqual([{ left: { awayMode: true } }]);
   });
 });
 

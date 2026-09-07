@@ -493,6 +493,50 @@ describe('nextAlarmSkipInstant (settings-switches, tasks.md 1.1)', () => {
   });
 });
 
+// ---------------------------------------------------------------------------------------
+// N4 (settings-switches PR #46 review): `nextAlarmSkipInstant` hardened like
+// `deriveUpcomingAlarms`'s own B1 guards — malformed `alarm.time`, an unrecognized `timeZone`,
+// and a missing weekday entry all resolve to `NaN`, never throw. `SkipAlarmService.flush()` is
+// the one caller, and maps a non-finite result to `HapStatusError(SERVICE_COMMUNICATION_FAILURE)`
+// per the skip-alarm-switch spec — covered by that service's own unit tests, not here.
+// ---------------------------------------------------------------------------------------
+
+describe('nextAlarmSkipInstant — N4: hardened against malformed inputs (settings-switches PR #46 review)', () => {
+  const nowMs = Date.UTC(2026, 0, 7, 0, 0, 0); // Wednesday 09:00 JST-ish; irrelevant to these cases
+
+  it('a malformed alarm.time ("6:45 AM", an un-parseable minute) resolves to NaN, does not throw', () => {
+    const sideSchedule = inertSideSchedule({
+      tuesday: dailySchedule({ alarm: { time: '6:45 AM' } }),
+    });
+    expect(() => nextAlarmSkipInstant('Asia/Tokyo', sideSchedule, nowMs)).not.toThrow();
+    expect(Number.isNaN(nextAlarmSkipInstant('Asia/Tokyo', sideSchedule, nowMs))).toBe(true);
+  });
+
+  it('an unrecognized time zone resolves to NaN, does not throw', () => {
+    const sideSchedule = inertSideSchedule({ tuesday: dailySchedule({ alarm: { time: '06:45' } }) });
+    expect(() => nextAlarmSkipInstant('Not/A_Real_Zone', sideSchedule, nowMs)).not.toThrow();
+    expect(Number.isNaN(nextAlarmSkipInstant('Not/A_Real_Zone', sideSchedule, nowMs))).toBe(true);
+  });
+
+  it('a missing weekday entry (a structurally incomplete sideSchedule) resolves to NaN, does not throw', () => {
+    const sideSchedule = inertSideSchedule();
+    // Simulates a malformed/partial schedule object reaching this function at runtime, despite
+    // `SideSchedule`'s own type guaranteeing every weekday statically — the same defensive
+    // posture `deriveUpcomingAlarms`'s own B1 guards take against data that doesn't actually
+    // match its declared type.
+    delete (sideSchedule as Partial<SideSchedule>).tuesday;
+    // now-12h from `nowMs` (Wed 09:00 JST) lands on Tuesday — the very entry just deleted.
+    expect(() => nextAlarmSkipInstant('Asia/Tokyo', sideSchedule, nowMs)).not.toThrow();
+    expect(Number.isNaN(nextAlarmSkipInstant('Asia/Tokyo', sideSchedule, nowMs))).toBe(true);
+  });
+
+  it('control case: a well-formed schedule/time zone still resolves to a finite instant', () => {
+    const sideSchedule = inertSideSchedule({ tuesday: dailySchedule({ alarm: { time: '06:45' } }) });
+    const instant = nextAlarmSkipInstant('Asia/Tokyo', sideSchedule, nowMs);
+    expect(Number.isFinite(instant)).toBe(true);
+  });
+});
+
 describe('deriveUpcomingAlarms — B1: a bad entry is skipped, not thrown, and does not affect siblings', () => {
   const nowMs = Date.UTC(2026, 0, 7, 0, 0, 0); // Wed 09:00 JST
 

@@ -58,7 +58,7 @@ import { LED_SUBTYPE, LedService } from './services/led.ts';
 import { isOccupancyChange, OCCUPANCY_SUBTYPE, OccupancySensorService } from './services/occupancy.ts';
 import { PRIME_SUBTYPE, PrimeService } from './services/prime.ts';
 import { SERVER_FAULT_SUBTYPE, ServerFaultService } from './services/serverFault.ts';
-import { SKIP_ALARM_SUBTYPE, SkipAlarmService } from './services/skipAlarm.ts';
+import { isSkipAlarmChange, SKIP_ALARM_SUBTYPE, SkipAlarmService } from './services/skipAlarm.ts';
 import { TEST_ALARM_LEFT_SUBTYPE, TEST_ALARM_RIGHT_SUBTYPE, TestAlarmService } from './services/testAlarm.ts';
 import { isThermostatChange, THERMOSTAT_SUBTYPE, ThermostatService } from './services/thermostat.ts';
 import type { ServiceContext } from './services/types.ts';
@@ -470,10 +470,17 @@ export class FreeSleepPlatform implements DynamicPlatformPlugin {
         }
         // settings-switches (#18): a settings-driven awayMode change (e.g. an out-of-band toggle
         // via free-sleep's own web UI, or this switch's own write settling) reaches the Away Mode
-        // switch's own push logic. Skip Next Alarm has no equivalent — `scheduleOverrides.alarm.
-        // expiresAt` has no watched Change field (src/services/skipAlarm.ts's own module doc).
+        // switch's own push logic.
         if (isAwayModeChange(change)) {
           this.awayModeServices.get(change.side)?.refresh();
+        }
+        // S6 (settings-switches PR #46 review): same routing for a settings-driven
+        // `scheduleOverrides.alarm.expiresAt` change — an out-of-band override (free-sleep's own
+        // web UI, or this switch's own write settling) reaches `SkipAlarmService.refresh()`,
+        // which also (re-)arms its own expiry timer against the newly-observed value (src/
+        // services/skipAlarm.ts's own module doc, "Snapshot-change routing").
+        if (isSkipAlarmChange(change)) {
+          this.skipAlarmServices.get(change.side)?.refresh();
         }
         if (change.scope === 'device' && change.field === 'connectionOnline') {
           this.connectionService?.refresh();

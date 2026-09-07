@@ -54,6 +54,15 @@ sequenced writes — the power-off SHALL be confirmed (or fail) before the `away
 submitted. When `awayModeTurnsSideOff` is disabled (the default), enabling Away Mode SHALL
 NOT itself change the side's power state.
 
+S2 (settings-switches PR #46 review, tech-lead ruling): if the power-off pre-step fails
+*specifically* because the away-mode write policy's `'block'` guard refuses it — which can only
+happen because the *partner* side is already in away mode — that failure SHALL NOT abort the
+toggle. The `awayMode: true` settings write SHALL still be submitted (the Pod applies a
+settings write to both sides whenever either side is already away, so the intended effect is
+not lost); the omitted power-off SHALL be logged. Any other power-off failure (a genuine
+communication failure, not a guard refusal) SHALL still abort the toggle without submitting the
+`awayMode` write, as before.
+
 Turning Away Mode off SHALL NEVER itself change the side's power state, regardless of
 `awayModeTurnsSideOff`.
 
@@ -69,6 +78,21 @@ Turning Away Mode off SHALL NEVER itself change the side's power state, regardle
 - **WHEN** `awayModeTurnsSideOff` is disabled (the default) and a user turns a side's Away
   Mode switch on
 - **THEN** only the `awayMode: true` settings write is made; no power-state write is issued
+
+#### Scenario: A power-off pre-step blocked by the away-mode guard does not abort enabling away mode
+
+- **WHEN** `awayModeTurnsSideOff` is enabled, a user turns a side's Away Mode switch on, and the
+  power-off pre-step is refused because the away-mode write policy is `'block'` and the
+  *partner* side is already away
+- **THEN** the `awayMode: true` settings write is still submitted and the toggle completes
+  successfully, rather than aborting
+
+#### Scenario: A non-guard power-off pre-step failure still aborts enabling away mode
+
+- **WHEN** `awayModeTurnsSideOff` is enabled, a user turns a side's Away Mode switch on, and the
+  power-off pre-step fails for a reason other than the away-mode guard (e.g. a communication
+  failure)
+- **THEN** the toggle aborts and no `awayMode` settings write is submitted
 
 #### Scenario: Disabling away mode never touches power
 

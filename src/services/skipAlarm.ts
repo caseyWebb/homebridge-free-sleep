@@ -10,8 +10,24 @@
  * `{disabled: false, timeOverride: '', expiresAt: ''}`. Both are `POST /api/settings` — the
  * expensive write class — debounced locally (>= 2s, via the shared `ctx.timers`) above
  * `WriteQueue`'s own much shorter per-lane debounce, mirroring `AwayModeService`'s own two-layer
- * debounce discipline (minus that service's additional 10s rate limit, which issue #17 does not
- * ask for).
+ * debounce discipline — including that service's 10s-per-side rate limit (S4, settings-switches
+ * PR #46 review). Issue #17's own text does ask for this: "debounce >= 2s, rate-limit, and
+ * re-read settings ~250ms after" — a previous version of this doc comment misread that sentence
+ * as *not* asking for one; `RATE_LIMIT_MS` below closes that gap using the same 10s window
+ * `AwayModeService` already uses, for the same "at most one job-rebuilding write per window per
+ * side" reason.
+ *
+ * **No-op suppression (S3, settings-switches PR #46 review):** `flush()` skips the write (and
+ * resolves the waiters immediately) whenever the coalesced `pending.on` already equals the
+ * currently-observed on/off state — a double-tap within the debounce window that nets out to no
+ * change produces zero `POST /api/settings` requests, not a redundant one.
+ *
+ * **The post-alarm-to-noon dead window (S5, settings-switches PR #46 review):** turning the
+ * switch on when `nextAlarmSkipInstant` computes an instant that is already at or before "now"
+ * — the window between an alarm firing and the following noon, when the noon rule still targets
+ * *today's* (already-elapsed) alarm time — refuses the write outright rather than making an
+ * expensive settings write that would skip nothing. See `flush()`'s own comment for the exact
+ * guard.
  *
  * **Local optimistic shadow, not a new overlayable field (design.md, "The Skip Next Alarm switch
  * keeps a local optimistic shadow instead of extending `SnapshotStore`"):**
@@ -39,19 +55,22 @@
  * with no `NOT_ALLOWED_IN_CURRENT_STATE` special case (unlike `AwayModeService`, this switch has
  * no `submitSide` pre-step that could ever be guarded).
  *
- * **Snapshot-change routing (task 5.5's own honest scope note):** `scheduleOverrides.alarm.
- * expiresAt` has no watched `Change` field in `snapshot.ts` (only `awayMode`, `isOn`,
- * `targetTemperatureF`, `isAlarmVibrating` are watched per side) — adding one is out of this
- * change's scope (proposal.md's Impact: "Not modified: `src/pod/snapshot.ts`"). This service is
- * therefore never routed a proactive snapshot-change push; its only push trigger is its own
- * accept-then-revert timer after a failed write, mirroring `ThermostatService`'s established
- * pattern. The self-clearing-on-read requirement is satisfied by `onGet`'s own live computation,
- * not by a push — see point 2 above.
+ * **Snapshot-change routing (S6, settings-switches PR #46 review — supersedes task 5.5's earlier
+ * honest scope note):** `scheduleOverrides.alarm.expiresAt` is now a watched `Change` field
+ * (`snapshot.ts`'s `alarmSkipExpiresAt`, diffed as the raw string) — added specifically so this
+ * service learns of an out-of-band change (e.g. free-sleep's own web UI, or another client
+ * entirely) without waiting for its own local shadow to lapse. The platform routes it to
+ * `refresh()` (`isSkipAlarmChange`, mirroring `awayMode.ts`'s own `isAwayModeChange`), same as
+ * every other settings-driven push. `refresh()` also (re-)arms a one-shot timer at the raw
+ * `expiresAt` instant on every call, so the tile drops back to off at the exact moment an
+ * override lapses with no read/push involved at all — see `armExpiryTimer`'s own doc. The
+ * self-clearing-on-read requirement (spec) is still independently satisfied by `onGet`'s own
+ * live computation regardless of whether either push path above ever fires.
  */
 
 import type { Service } from 'homebridge';
 
-import type { TimerHandle } from '../pod/snapshot.ts';
+import type { Change, TimerHandle } from '../pod/snapshot.ts';
 import type { Side } from '../pod/types.ts';
 import { nextAlarmSkipInstant } from '../pod/alarmSchedule.ts';
 import type { ServiceContext } from './types.ts';
@@ -65,9 +84,18 @@ const SKIP_ALARM_NAMES: Readonly<Record<Side, string>> = {
 
 /** Issue #17's own ">= 2s" service-level debounce floor (design.md). */
 const DEBOUNCE_MS = 2000;
+/** S4 (settings-switches PR #46 review): issue #17's own "rate-limit" text, given the same 10s
+ * window `AwayModeService.RATE_LIMIT_MS` uses — see module doc's own note on this. */
+const RATE_LIMIT_MS = 10_000;
 /** Mirrors `ThermostatService`'s revert delay — how long after a rejected write to correct the
  * characteristic value HAP applied optimistically ahead of the throw. */
 const REVERT_DELAY_MS = 500;
+
+/** Whether a snapshot `Change` is the `alarmSkipExpiresAt` field this service watches (S6,
+ * settings-switches PR #46 review) — mirrors `awayMode.ts`'s own `isAwayModeChange`. */
+export function isSkipAlarmChange(change: Change): change is Change & { scope: 'side'; field: 'alarmSkipExpiresAt'; side: Side } {
+  return change.scope === 'side' && change.field === 'alarmSkipExpiresAt';
+}
 
 /**
  * The Skip-Next-Alarm on/off boolean derived from `scheduleOverrides.alarm.expiresAt` and a
@@ -112,11 +140,19 @@ export class SkipAlarmService {
   private pending: PendingToggle | undefined;
   private debounceTimer: TimerHandle | null = null;
   private shadow: Shadow | undefined;
+  /** S4 (settings-switches PR #46 review): when the last write for this side was actually
+   * *submitted* (not settled) — mirrors `AwayModeService.lastSubmittedAtMs`. `undefined` until
+   * this side's first submission this launch. Never advanced by an S3 no-op suppression, since
+   * nothing was actually submitted then. */
+  private lastSubmittedAtMs: number | undefined;
 
   /** Mirrors `ThermostatService`'s shadow pattern for pushes — the last value this service
    * pushed via `updateValue`, so a revert only pushes on an actual change. */
   private publishedOn: boolean | undefined;
   private revertTimer: TimerHandle | null = null;
+  /** S6 (settings-switches PR #46 review): fires exactly at the raw, Pod-confirmed `expiresAt`
+   * instant so the tile drops back to off without waiting for a poll — see `armExpiryTimer`. */
+  private expiryTimer: TimerHandle | null = null;
 
   constructor(ctx: ServiceContext, side: Side, platformStartedAt: number) {
     this.ctx = ctx;
@@ -188,18 +224,38 @@ export class SkipAlarmService {
     });
   }
 
+  /**
+   * (Re)computes the next flush time as the *later* of the debounce floor and the S4 rate-limit
+   * floor — the identical `Math.max` computation `AwayModeService.scheduleFlush` uses, for the
+   * same reason (one timer, no mode flag).
+   */
   private scheduleFlush(): void {
     if (this.debounceTimer !== null) this.ctx.timers.clearTimeout(this.debounceTimer);
+    const now = this.ctx.timers.now();
+    const earliestByDebounce = now + DEBOUNCE_MS;
+    const earliestByRateLimit = this.lastSubmittedAtMs === undefined ? 0 : this.lastSubmittedAtMs + RATE_LIMIT_MS;
+    const at = Math.max(earliestByDebounce, earliestByRateLimit);
     this.debounceTimer = this.ctx.timers.setTimeout(() => {
       this.debounceTimer = null;
       void this.flush();
-    }, DEBOUNCE_MS);
+    }, at - now);
   }
 
   private async flush(): Promise<void> {
     const pending = this.pending;
     if (!pending) return;
     this.pending = undefined;
+
+    // S3 (settings-switches PR #46 review): a double-tap within the debounce window that
+    // coalesces back to the value already observed on the cached snapshot produces no write at
+    // all — nothing would actually change on the Pod. Resolved immediately, without touching
+    // `lastSubmittedAtMs` (no submission happened, so the rate-limit floor must not advance).
+    if (pending.on === isSkipAlarmOn(this.rawExpiresAt(), this.ctx.timers.now())) {
+      pending.waiters.forEach((w) => w.resolve());
+      return;
+    }
+
+    this.lastSubmittedAtMs = this.ctx.timers.now();
 
     const hap = this.ctx.api.hap;
     try {
@@ -212,7 +268,37 @@ export class SkipAlarmService {
           // platform's life, before the first successful poll) — fail loudly rather than guess.
           throw new hap.HapStatusError(hap.HAPStatus.SERVICE_COMMUNICATION_FAILURE);
         }
-        const instantMs = nextAlarmSkipInstant(timeZone, schedules[this.side], this.ctx.timers.now());
+        const nowMs = this.ctx.timers.now();
+        const instantMs = nextAlarmSkipInstant(timeZone, schedules[this.side], nowMs);
+        // N4 (settings-switches PR #46 review): `nextAlarmSkipInstant` is hardened like
+        // `deriveUpcomingAlarms`' own B1 guards to return a non-finite result (never throw) for a
+        // malformed `alarm.time`, an unrecognized `timeZone`, or a missing weekday entry — mapped
+        // here to the same communication-failure error every other write failure in this method
+        // uses, per spec, rather than letting a raw, unmapped error reach the HAP layer.
+        if (!Number.isFinite(instantMs)) {
+          this.ctx.log.debug(
+            `FreeSleep: ${this.side} skip-alarm next-instant computation failed (malformed schedule/time zone data)`,
+          );
+          throw new hap.HapStatusError(hap.HAPStatus.SERVICE_COMMUNICATION_FAILURE);
+        }
+        // S5 (settings-switches PR #46 review): the post-alarm-to-noon dead window. The noon rule
+        // (`nextAlarmSkipInstant`'s own doc) targets *today's* alarm time whenever "now" is before
+        // noon — but if today's alarm has already rung (now is between that alarm and noon), the
+        // computed instant is already in the past. Writing it anyway would be a real, expensive
+        // settings write (full node-schedule rebuild on the Pod) that skips nothing at all — the
+        // override it produces is already-expired the instant it lands. Refused outright instead,
+        // with the established revert pattern (this toggle never got as far as installing a
+        // shadow, so `scheduleRevert` below just re-publishes the still-accurate raw/pending-free
+        // state).
+        if (instantMs <= nowMs) {
+          this.ctx.log.info(
+            `FreeSleep: ${this.side} skip-alarm toggle refused — the computed skip instant ` +
+              `(${new Date(instantMs).toISOString()}) is already in the past (the dead window between ` +
+              `today's alarm ringing and noon); the next skippable occurrence is tomorrow's alarm, ` +
+              'available again once "now" is past noon in this side\'s configured time zone.',
+          );
+          throw new hap.HapStatusError(hap.HAPStatus.NOT_ALLOWED_IN_CURRENT_STATE);
+        }
         // `Date.prototype.toISOString()` always includes an explicit UTC designator ("Z") — a
         // complete, unambiguous ISO-8601 instant (spec: "not a bare local time"), the same
         // unambiguity `moment.tz(...).format()`'s own `+HH:MM` offset achieves upstream.
@@ -233,6 +319,9 @@ export class SkipAlarmService {
         throw new hap.HapStatusError(hap.HAPStatus.SERVICE_COMMUNICATION_FAILURE);
       }
 
+      // S6: arm against the just-written value immediately — the tile then drops back to off at
+      // exactly the right instant even before any confirming settings re-read lands.
+      this.armExpiryTimer(expiresAt);
       pending.waiters.forEach((w) => w.resolve());
     } catch (hapError) {
       this.shadow = undefined;
@@ -255,17 +344,49 @@ export class SkipAlarmService {
   // Push
   // ---------------------------------------------------------------------------------------
 
-  /** Idempotent — pushes only when `computedValue()` actually differs from what was last
-   * published. Called at construction (B1-equivalent seed) and after a `scheduleRevert` delay;
-   * see module doc's "Snapshot-change routing" for why nothing else calls this. */
-  refresh(): void {
-    const value = this.computedValue();
-    if (this.publishedOn === value) return;
-    this.publishedOn = value;
-    this.service.getCharacteristic(this.ctx.api.hap.Characteristic.On).updateValue(value);
+  /**
+   * S6 (settings-switches PR #46 review): (re-)arms a one-shot timer at `expiresAt` so the tile
+   * drops back to off at the exact moment an override lapses, rather than only on the next
+   * regular settings poll or the next `onGet` read. Always clears any existing timer first — a
+   * `null`/empty/unparseable/already-past `expiresAt` then arms nothing, leaving the timer
+   * cleared. Called from `refresh()` (every call site: construction, an external
+   * `isSkipAlarmChange` push, and the post-revert refresh) with the raw, Pod-confirmed value, and
+   * directly from `flush()` with a just-written value so this service's own toggles get the
+   * timer armed immediately rather than waiting for the confirming re-read.
+   */
+  private armExpiryTimer(expiresAt: string | undefined): void {
+    if (this.expiryTimer !== null) {
+      this.ctx.timers.clearTimeout(this.expiryTimer);
+      this.expiryTimer = null;
+    }
+    if (!expiresAt) return;
+    const ms = Date.parse(expiresAt);
+    if (Number.isNaN(ms)) return;
+    const delay = ms - this.ctx.timers.now();
+    if (delay <= 0) return;
+    this.expiryTimer = this.ctx.timers.setTimeout(() => {
+      this.expiryTimer = null;
+      this.refresh();
+    }, delay);
   }
 
-  /** Clears any pending debounce/revert timer and rejects any write still waiting on the
+  /** Idempotent push — pushes only when `computedValue()` actually differs from what was last
+   * published — and unconditionally (re-)arms the S6 expiry timer against the raw snapshot value
+   * on every call, whether or not the push itself fired (an external change that extends an
+   * already-on override, e.g., must still re-arm to the new, later instant even though the
+   * published boolean does not change). Called at construction (B1-equivalent seed), after a
+   * `scheduleRevert` delay, and from the platform's `isSkipAlarmChange` routing (module doc's
+   * "Snapshot-change routing"). */
+  refresh(): void {
+    const value = this.computedValue();
+    if (this.publishedOn !== value) {
+      this.publishedOn = value;
+      this.service.getCharacteristic(this.ctx.api.hap.Characteristic.On).updateValue(value);
+    }
+    this.armExpiryTimer(this.rawExpiresAt());
+  }
+
+  /** Clears any pending debounce/revert/expiry timer and rejects any write still waiting on the
    * (now-cancelled) debounce — mirrors `AwayModeService.stop()`'s own shutdown discipline. */
   stop(): void {
     if (this.debounceTimer !== null) {
@@ -275,6 +396,10 @@ export class SkipAlarmService {
     if (this.revertTimer !== null) {
       this.ctx.timers.clearTimeout(this.revertTimer);
       this.revertTimer = null;
+    }
+    if (this.expiryTimer !== null) {
+      this.ctx.timers.clearTimeout(this.expiryTimer);
+      this.expiryTimer = null;
     }
     if (this.pending) {
       const pending = this.pending;

@@ -153,22 +153,29 @@ describe('Skip Next Alarm switch end-to-end (tasks.md 6.1)', () => {
   it('toggling Skip Next Alarm off clears the override', async () => {
     const { pod, api, timers } = await bootSession();
     try {
-      // Live-mutate the mock's own stored state directly (its own doc: "live, readable and
-      // writable by the test directly") — an existing unexpired override, as if a prior toggle
-      // (or free-sleep's own web UI) had already set one; `SideSettingsOverride`'s own
-      // constructor-time override shape has no `scheduleOverrides` field to seed this at boot.
-      pod.state.settings.left.scheduleOverrides.alarm = {
-        disabled: true,
-        timeOverride: '',
-        expiresAt: new Date(Date.now() + 3_600_000).toISOString(),
-      };
       const left = accessoryByName(api, LEFT_NAME);
       const onChar = left
         .getServiceById(api.hap.Service.Switch, SKIP_ALARM_SUBTYPE)!
         .getCharacteristic(api.hap.Characteristic.On);
 
-      const pending = onChar.handleSetRequest(false);
+      // S3 (settings-switches PR #46 review): turning off is a genuine transition only if the
+      // plugin's own cached view is already observed as on — mutating the mock's raw state
+      // directly (as this test used to) never gets observed by this session at all, so the new
+      // no-op suppression would correctly treat the subsequent "off" as a no-op and skip the
+      // write, which is not what this test means to exercise. Going through the switch's own ON
+      // path first (like the sibling test above) is what makes the plugin's cache — not just the
+      // mock's raw state — agree there is an active override before turning it off.
+      const onPending = onChar.handleSetRequest(true);
       await timers.advance(2500);
+      await onPending;
+      expect(pod.state.settings.left.scheduleOverrides.alarm.expiresAt).not.toBe('');
+
+      // S4 (settings-switches PR #46 review): this switch now rate-limits to one settings write
+      // per side per 10s window, mirroring `AwayModeService` — the second toggle's own submission
+      // is floored at `lastSubmittedAtMs + 10s`, not just the 2s debounce, so this needs a longer
+      // advance than the sibling ON-only test above.
+      const pending = onChar.handleSetRequest(false);
+      await timers.advance(10_500);
       await pending;
 
       const alarmOverride = pod.state.settings.left.scheduleOverrides.alarm;

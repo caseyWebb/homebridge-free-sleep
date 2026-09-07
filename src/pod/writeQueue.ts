@@ -571,12 +571,30 @@ export class WriteQueue {
    * does not touch `awayMode` — costs one cheap field check (`settingsLane.pending`) plus an
    * `Array.prototype.findIndex` over whatever is currently in `mutexQueue` (typically empty or
    * very small), with no side effect and no `await` actually suspending anything.
+   *
+   * S1 fix (settings-switches PR #46 review): both checks above run on *every* lap of the `for
+   * (;;)` loop below, not once before it. A submission that lands *while* a previous lap's
+   * `await task.run()` is still outstanding — its `POST /api/settings` in flight — starts a brand
+   * new case-1 cycle in `settingsLane.pending`, invisible to `mutexQueue`'s own `findIndex` until
+   * it is flushed. Checking `pending` only once, before the loop, would let such a write escape
+   * this method entirely: `decide()` would then read its premature, submission-time overlay
+   * straight off the snapshot instead of waiting for it to actually settle, defeating the whole
+   * point of draining. Re-running both checks at the top of every lap is what catches it.
    */
   private async drainAwayModeSettingsIfPending(): Promise<void> {
-    if (this.settingsLane.pending !== null && touchesAwayMode(this.settingsLane.pending)) {
-      this.flush('settings', this.settingsLane);
-    }
     for (;;) {
+      // S1 fix (settings-switches PR #46 review): this pending check must run on *every* lap of
+      // the loop, not once before it — a settings write submitted while a previous lap's
+      // `await task.run()` is still outstanding (its POST in flight) lands in
+      // `settingsLane.pending`, not `mutexQueue` (it has not debounced/flushed yet), so a
+      // pending-only check hoisted above the loop can never see it. Left unflushed, `decide()`
+      // below would then read that new write's premature, un-drained overlay directly off the
+      // snapshot instead of waiting for it to settle — exactly the hazard this whole method
+      // exists to close. Re-checking `pending` at the top of every lap turns that write into a
+      // `mutexQueue` entry the `findIndex` below can find and drain in its own, later lap.
+      if (this.settingsLane.pending !== null && touchesAwayMode(this.settingsLane.pending)) {
+        this.flush('settings', this.settingsLane);
+      }
       const idx = this.mutexQueue.findIndex((t) => t.settingsPatch !== undefined && touchesAwayMode(t.settingsPatch));
       if (idx === -1) return;
       const [task] = this.mutexQueue.splice(idx, 1);

@@ -202,6 +202,16 @@ export interface EffectiveSideStatus {
   isAlarmVibrating: boolean | undefined;
   awayMode: boolean | undefined;
   /**
+   * `settings-switches` S6 (PR #46 review): this side's raw `scheduleOverrides.alarm.expiresAt`
+   * string, watched purely so `SkipAlarmService` learns of an out-of-band change (e.g. free-
+   * sleep's own web UI) without waiting for its own local shadow to lapse — `undefined` until
+   * `settings` has been observed at all, `''` when no override is set. The switch's actual on/off
+   * derivation stays `isSkipAlarmOn`'s job (`src/services/skipAlarm.ts`); this field only ever
+   * feeds a `refresh()` trigger, never a `SideOverlayField` — see that service's own module doc's
+   * "Local optimistic shadow" section for why this value is not itself overlayable.
+   */
+  alarmSkipExpiresAt: string | undefined;
+  /**
    * Occupancy change (#19). The raw, current `present` flag from the presence endpoint —
    * `undefined` until first observed. See `presenceActive` for whether this value has been
    * proven trustworthy (design.md, "Presence `StatusActive`").
@@ -269,6 +279,7 @@ export type SideChangeField =
   | 'isOn'
   | 'isAlarmVibrating'
   | 'awayMode'
+  | 'alarmSkipExpiresAt'
   | 'presencePresent'
   | 'presenceActive'
   | 'vitalsOccupied'
@@ -324,6 +335,7 @@ export type Change =
   | SideChange<'isOn', boolean>
   | SideChange<'isAlarmVibrating', boolean>
   | SideChange<'awayMode', boolean>
+  | SideChange<'alarmSkipExpiresAt', string>
   | SideChange<'presencePresent', boolean>
   | SideChange<'presenceActive', boolean>
   | SideChange<'vitalsOccupied', boolean>
@@ -743,6 +755,7 @@ export class SnapshotStore {
       isOn: (isOn?.value as boolean | undefined) ?? rawSide?.isOn,
       isAlarmVibrating: (alarm?.value as boolean | undefined) ?? rawSide?.isAlarmVibrating,
       awayMode: (away?.value as boolean | undefined) ?? rawSettingsSide?.awayMode,
+      alarmSkipExpiresAt: rawSettingsSide?.scheduleOverrides.alarm.expiresAt,
       presencePresent: this.raw.presence?.[side]?.present,
       // N2: gated on this *side's own* first observation (`presenceBaselineRecorded`), not on
       // whether the presence document has ever been observed at all (`this.raw.presence !==
@@ -770,6 +783,11 @@ function diffWatched(previous: EffectiveSnapshot, current: EffectiveSnapshot): C
     pushSideChange(changes, side, 'isOn', previous[side].isOn, current[side].isOn);
     pushSideChange(changes, side, 'isAlarmVibrating', previous[side].isAlarmVibrating, current[side].isAlarmVibrating);
     pushSideChange(changes, side, 'awayMode', previous[side].awayMode, current[side].awayMode);
+    // S6 (settings-switches PR #46 review): watched purely so an out-of-band
+    // `scheduleOverrides.alarm.expiresAt` change (a different value observed on a settings poll,
+    // not this plugin's own write settling) reaches `SkipAlarmService.refresh()` — see
+    // `EffectiveSideStatus.alarmSkipExpiresAt`'s own doc.
+    pushSideChange(changes, side, 'alarmSkipExpiresAt', previous[side].alarmSkipExpiresAt, current[side].alarmSkipExpiresAt);
     pushSideChange(changes, side, 'presencePresent', previous[side].presencePresent, current[side].presencePresent);
     pushSideChange(changes, side, 'presenceActive', previous[side].presenceActive, current[side].presenceActive);
     pushSideChange(changes, side, 'vitalsOccupied', previous[side].vitalsOccupied, current[side].vitalsOccupied);
@@ -801,7 +819,7 @@ function computeServerFault(serverStatus: ServerStatus | undefined): boolean {
   return Object.values(serverStatus).some((info) => info?.status === 'failed');
 }
 
-function pushSideChange<F extends SideChangeField, V extends number | boolean>(
+function pushSideChange<F extends SideChangeField, V extends number | boolean | string>(
   changes: Change[],
   side: Side,
   field: F,

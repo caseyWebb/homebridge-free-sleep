@@ -1363,3 +1363,116 @@ describe('write queue: drain-before-decide (settings-switches, tech-lead resolut
     });
   });
 });
+
+// ---------------------------------------------------------------------------------------
+// S1 fix (settings-switches PR #46 review): `drainAwayModeSettingsIfPending`'s pending-check
+// must run on every lap of its own loop, not once before it — see writeQueue.ts's own doc on
+// the fix. Reproduction: a *second* `awayMode`-touching settings write submitted synchronously
+// *during* the first one's own in-flight `POST /api/settings` (i.e., while the side write's
+// drain is already `await`ing that first write's `run()`) must itself be drained to full
+// settlement before `decide()` ever runs — not left sitting in `settingsLane.pending`, invisible
+// to a drain loop that only re-checks `mutexQueue`.
+// ---------------------------------------------------------------------------------------
+
+describe('write queue: S1 fix — a settings write submitted mid-drain is itself drained (settings-switches PR #46 review)', () => {
+  it(
+    'mid-drain-submission reproduction: the second write fails after settling, and the side write correctly ' +
+      "proceeds against the fully-drained (not-away) truth — pre-fix this wrongly read the second write's " +
+      'premature overlay and blocked a write that should have passed',
+    async () => {
+      vi.useRealTimers();
+      // Left starts away (true), right does not (false) — chosen so the *first* write (A, left
+      // -> false) and the *injected* second write (B, right -> true) touch independent overlay
+      // slots. Deliberately not the same field: if both touched `left:awayMode`, A's own
+      // rebase-on-success would blindly read back whatever is *currently* live for that key
+      // (`rebaseOwnership`'s own doc: "nothing else can have changed it... since this queue is
+      // the only writer" — an assumption this reproduction would otherwise violate) and adopt
+      // B's still-live premature value itself, muddying which write's overlay decide() actually
+      // reads. Independent slots isolate the one thing this regression test means to prove.
+      const pod = await startMockPod({ state: { settings: { left: { awayMode: true }, right: { awayMode: false } } } });
+      try {
+        const timers = createTimerHarness();
+        const snapshot = new SnapshotStore({ timers });
+        const realClient = clientFor(pod);
+        snapshot.observeSettings(await realClient.getSettings());
+        const awayModeGuard = new AwayModeGuard({ snapshot, policy: 'block' });
+
+        let callCount = 0;
+        let secondWriteP: Promise<void> | undefined;
+        const client = Object.create(realClient) as PodClient;
+        // `queue` isn't constructed yet at this point — `client.postSettings` is reassigned
+        // below, *after* construction, so the closure can still reach it. `WriteQueue` looks up
+        // `this.client.postSettings` dynamically at each dispatch, not once at construction, so
+        // reassigning the property on the same `client` object afterwards still takes effect.
+        const queue = new WriteQueue({ client, snapshot, requestFastPoll: () => {}, timers, awayModeGuard });
+        // Intercepts the *client-level* `postSettings` call the first settings write's (A's) own
+        // dispatch makes — before it ever resolves — and synchronously submits a second,
+        // awayMode-touching settings write (B) right there, reproducing "submitted during the
+        // inline drain's POST" without depending on real network timing. A's own call is
+        // forwarded to the real client (and succeeds, against the mock Pod); B's own eventual
+        // dispatch fails outright, standing in for a settings write whose failure can only be
+        // discovered once it is actually drained to settlement.
+        client.postSettings = (async (patch) => {
+          callCount += 1;
+          if (callCount === 1) {
+            secondWriteP = queue.submitSettings({ right: { awayMode: true } });
+            secondWriteP.catch(() => undefined);
+            return realClient.postSettings(patch); // A: succeeds for real
+          }
+          throw new Error('simulated failure for the injected mid-drain write'); // B: fails
+        }) as typeof realClient.postSettings;
+        try {
+          // Side-first (the same submission order the existing 2.2/2.2-sanity tests use) is
+          // what makes the side write's own dispatch the one running `drainAwayModeSettingsIfPending`.
+          const sideP = queue.submitSide('right', { targetTemperatureF: 70 });
+          const settingsP = queue.submitSettings({ left: { awayMode: false } }); // A
+
+          await expect(settingsP).resolves.toBeUndefined(); // A: succeeds — left is no longer away
+          await expect(secondWriteP).rejects.toThrow(); // B: fails — right was never actually made away
+          // The side write must be decided against the fully-settled truth — left false (A
+          // succeeded), right still false (B failed and its premature overlay was cleared,
+          // reverting to the unchanged raw value) — so *not* away, and this write must go
+          // through, not be wrongly blocked against B's premature, un-drained optimistic overlay.
+          await expect(sideP).resolves.toBeUndefined();
+
+          expect(callCount).toBe(2); // both settings writes actually reached client.postSettings
+          expect(pod.requests.filter((r) => r.method === 'POST' && r.path === '/api/deviceStatus')).toHaveLength(1);
+          expect(snapshot.get().left.awayMode).toBe(false);
+          expect(snapshot.get().right.awayMode).toBe(false);
+          // B's own failed POST never reached the mock's stored state at all.
+          expect(pod.state.settings.right.awayMode).toBe(false);
+        } finally {
+          queue.stop();
+        }
+      } finally {
+        await pod.close();
+      }
+    },
+  );
+
+  it('control case: side-first with no mid-drain submission still drains the single settings write and decides correctly (unaffected by the S1 fix)', async () => {
+    vi.useRealTimers();
+    const pod = await startMockPod({ state: { settings: { left: { awayMode: true } } } });
+    try {
+      const timers = createTimerHarness();
+      const snapshot = new SnapshotStore({ timers });
+      const client = clientFor(pod);
+      snapshot.observeSettings(await client.getSettings());
+      const awayModeGuard = new AwayModeGuard({ snapshot, policy: 'block' });
+      const queue = new WriteQueue({ client, snapshot, requestFastPoll: () => {}, timers, awayModeGuard });
+      try {
+        const sideP = queue.submitSide('right', { targetTemperatureF: 70 });
+        const settingsP = queue.submitSettings({ left: { awayMode: false } });
+
+        await Promise.all([sideP, settingsP]); // hangs forever (past vitest's own test timeout) if deadlocked
+
+        const posts = pod.requests.filter((r) => r.method === 'POST' && (r.path === '/api/settings' || r.path === '/api/deviceStatus'));
+        expect(posts.map((r) => r.path)).toEqual(['/api/settings', '/api/deviceStatus']);
+      } finally {
+        queue.stop();
+      }
+    } finally {
+      await pod.close();
+    }
+  });
+});

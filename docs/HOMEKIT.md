@@ -255,8 +255,12 @@ Both bind a field only reachable through the expensive settings write (`docs/POD
 `settingsDB.json` write makes the Pod cancel and rebuild every scheduled job), so both debounce
 locally (>= 2s, via the shared `TimerApi`) *above* `WriteQueue`'s own much shorter per-lane
 debounce before ever calling `submitSettings` — the service-level timer, not the queue's, is
-what satisfies each issue's own anti-storm requirement. `AwayModeService` additionally
-rate-limits to one settings write per side per 10s.
+what satisfies each issue's own anti-storm requirement. Both also rate-limit to one settings
+write per side per 10s (S4, settings-switches PR #46 review: `SkipAlarmService` originally
+shipped without this; issue #17's own "debounce >= 2s, rate-limit" text already asked for it),
+and both skip the write entirely when a debounce window's coalesced value nets out to no actual
+change (S3, same review) — a double-tap that ends where it started produces zero
+`POST /api/settings` requests, not a redundant one.
 
 - **Away Mode `Switch`** — `settings.{side}.awayMode`. `onGet` reads the cached, overlay-applied
   snapshot directly (the field is already in `snapshot.ts`'s `OverlayableField` union, unshipped
@@ -266,6 +270,21 @@ rate-limits to one settings write per side per 10s.
   reverse order would let the Pod's own `controlBothSides` mirror `isOn: false` onto the *other*
   side too, which enabling away mode alone should not do. Turning Away Mode off never touches
   power, regardless of the flag.
+  - **N1 (settings-switches PR #46 review):** that reverse-order rationale describes the
+    *default* case; it is not airtight against the partner side already being away. Under the
+    default `'mirror'` write policy, if the partner side is already away when the power-off
+    pre-step runs, `awayModeGuard.decide()` still returns `'mirror'` for it (the guard is
+    symmetric in *which* side is away) — so this side's own `isOn: false` pre-step gets mirrored
+    onto the partner side too, turning it off as a side effect of enabling Away Mode. This is
+    upstream `controlBothSides` behavior surfacing through the guard's own already-shipped
+    mirroring, not something `awayModeTurnsSideOff` can special-case away.
+  - **S2 (settings-switches PR #46 review, tech-lead ruling):** under the `'block'` policy
+    instead, that same pre-step is refused outright whenever the partner side is already away —
+    previously this aborted the whole toggle, making Away Mode itself unreachable for as long as
+    the partner stayed away. `AwayModeService.flush()` now treats an `AwayModeBlockedError` from
+    *this specific pre-step* as non-fatal: it logs and proceeds straight to the `awayMode: true`
+    write, which the Pod applies to both sides regardless once either is away. Any other
+    pre-step failure (a genuine communication failure) still aborts the toggle, unchanged.
 - **Skip Next Alarm `Switch`** — reflects whether `settings.{side}.scheduleOverrides.alarm.
   expiresAt` is a non-empty, still-future timestamp; `ON` computes the next occurrence (a direct
   port of `AlarmNotification.tsx`'s "sleep day" convention + `AlarmDisabledDialog.tsx`'s
@@ -276,17 +295,44 @@ rate-limits to one settings write per side per 10s.
   cleanly) — this switch instead keeps a small local optimistic shadow, live for
   `writeSettleMs`, mirroring `ThermostatService`'s own `publishedF` shadow pattern rather than
   extending `snapshot.ts` for one caller.
+  - **S5 (settings-switches PR #46 review) — the post-alarm-to-noon dead window:** the noon rule
+    targets *today's* date whenever "now" is before noon — but if the sleep day's alarm has
+    already rung earlier that same morning, the computed instant (that alarm's time + 2min) is
+    already in the past. Turning the switch on in that window (after the alarm rings, before the
+    following noon) would still succeed as a `POST /api/settings` write, just one whose resulting
+    override is already expired and skips nothing — an expensive write for no effect. `flush()`
+    now checks the computed instant against "now" and refuses with
+    `HapStatusError(NOT_ALLOWED_IN_CURRENT_STATE)` before ever submitting, using the same
+    accept-then-revert pattern a failed write already uses, and logs the reason. A toggle outside
+    that window (any evening skip, or a before-noon toggle before that day's own alarm has rung
+    yet) is unaffected.
+  - **S6 (settings-switches PR #46 review) — learning of expiry/external changes:**
+    `scheduleOverrides.alarm.expiresAt` is now a watched `Change` field (`snapshot.ts`'s
+    `alarmSkipExpiresAt`, diffed as the raw string) routed to `refresh()`
+    (`isSkipAlarmChange`, mirroring `isAwayModeChange`) from the platform's existing
+    snapshot-change routing — so an out-of-band override change (e.g. free-sleep's own web UI)
+    pushes to HomeKit without waiting for a read. `refresh()` also (re-)arms a one-shot timer at
+    the raw `expiresAt` instant on every call, so the tile drops back to off at the exact moment
+    an override lapses, rather than only on the next poll or the next `onGet`. The timer is
+    cleared and re-armed on every `refresh()` call and torn down in `stop()`.
 - **Error mapping**: `AwayModeGuard`'s `AwayModeBlockedError` -> `NOT_ALLOWED_IN_CURRENT_STATE`
   mapping gates `submitSide` only — neither switch's own `submitSettings` write is ever gated by
   it, so a failed settings write always surfaces as plain `SERVICE_COMMUNICATION_FAILURE`. The
   one exception: `awayModeTurnsSideOff`'s power-off pre-step *is* a guarded `submitSide` call, so
-  a block there does map to `NOT_ALLOWED_IN_CURRENT_STATE`, same as `ThermostatService`.
+  a block there does map to `NOT_ALLOWED_IN_CURRENT_STATE`, same as `ThermostatService` — except
+  when the guard specifically blocks that pre-step (S2 above), which no longer aborts at all.
 - **The ordering hazard this change closes** (`src/pod/writeQueue.ts`'s "Drain-before-decide"):
   the first real `submitSettings({awayMode})` caller exposed a race between the settings lane's
   overlay-at-submission behavior and a concurrently-pending side write's away-mode decision —
   closed by draining any pending/queued `awayMode`-touching settings write to full settlement,
   inline, before a side lane ever consults `awayModeGuard.decide()`. See that module's own doc
   for the full mechanism and why draining inline (not merely awaiting) avoids deadlock.
+  - **S1 (settings-switches PR #46 review):** the drain's own pending-check originally ran once,
+    before its loop, rather than on every lap — a settings write submitted while a previous lap's
+    inline `POST /api/settings` was still in flight landed back in `settingsLane.pending`, not
+    `mutexQueue`, invisible to a loop that only re-polled `mutexQueue`. Left un-drained, `decide()`
+    could read that write's premature, un-drained overlay and wrongly block a write that should
+    have passed. Fixed by re-running the pending-check on every lap of the loop, not just once.
 
 ## Other service choices
 
