@@ -26,6 +26,7 @@ import {
   type Schedules,
   type Side,
 } from '../src/pod/types.js';
+import { ALARM_DISMISS_SUBTYPE } from '../src/services/alarm.js';
 import { THERMOSTAT_SUBTYPE, type ThermostatService } from '../src/services/thermostat.js';
 import { CONNECTION_SUBTYPE } from '../src/services/connection.js';
 import { WATER_LOW_SUBTYPE } from '../src/services/waterLow.js';
@@ -1281,6 +1282,19 @@ describe("a side's alarm-vibration change reaches only that side's AlarmService 
 describe('shutdown clears each AlarmService\'s pending revert timer (tasks.md 7.6)', () => {
   it('no pending timer remains after shutdown with an on-write\'s accept-then-revert timer outstanding', async () => {
     vi.useFakeTimers();
+    // Pinned rather than left at whatever real "now" happened to be at call time (unlike most of
+    // this file's other fake-timer tests). Investigating a CI flake report against this test
+    // during the alarm-events PR #45 review (see the "successful dismiss" test below for the
+    // *fixed* root cause it actually found) surfaced that this pre-existing, unmodified test is
+    // itself occasionally flaky when run as part of the full file — reproduced back to before
+    // this change too (`3aa9590`, unrelated to alarm-events), and reduced but not eliminated by
+    // pinning the clock here. The residual is consistent with HAP-NodeJS's own internal
+    // per-accessory timer (this file's own "hap-nodejs's own `Accessory` constructor schedules
+    // one timer per accessory" note, `describe('shutdown stops polling...')` above) occasionally
+    // interacting with this test's own characteristic write in a way outside this plugin's code
+    // to control; left here as a documented, pre-existing, out-of-scope-for-this-PR flake rather
+    // than silently worked around.
+    vi.setSystemTime(Date.UTC(2024, 0, 1));
     try {
       const timers = createTimerHarness();
       const api = new FakeHomebridgeApi();
@@ -1313,6 +1327,83 @@ describe('shutdown clears each AlarmService\'s pending revert timer (tasks.md 7.
 
       expect(timers.pendingCount()).toBeGreaterThan(perAccessoryOverhead);
 
+      await api.fireShutdown();
+      expect(timers.pendingCount()).toBe(perAccessoryOverhead);
+      void platform;
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  // B2 (alarm-events PR #45 review): a successful dismiss (off-write) is this suite's first
+  // "shutdown clears X" scenario built on a write that actually *settles* successfully before
+  // shutdown, rather than a blocked/failed one (whose overlay clears immediately) or one given
+  // time to settle naturally first. It exercises two timers at once: `AlarmService`'s own
+  // `dismissOverlayGuardTimer` (B2, `writeSettleMs`, distinct from the on-write's `revertTimer`
+  // the test above exercises), *and* — the actual CI-flaky regression this test caught —
+  // `SnapshotStore`'s own overlay-expiry timer for the settled `isAlarmVibrating` overlay, which
+  // `WriteQueue`'s own `liveOverlayBatches` bookkeeping stops tracking the moment a write cycle
+  // settles (`writeQueue.ts`'s `settleWrite`), leaving nothing to clear it before shutdown except
+  // `SnapshotStore.clearAllOverlaysForShutdown()` (now called from `WriteQueue.stop()`). Whether
+  // this second timer survived shutdown depended on timing beyond this test's own control —
+  // reliably reproduced running the full file, deterministically fixed and pinned in
+  // `test/writeQueue.test.ts`'s own unit-level regression for the same bug ("a write that
+  // already settled successfully before stop() still has its own overlay timer cleared"), which
+  // is the authoritative, always-reproducing proof this fix is correct; this platform-level test
+  // is the integration-level confirmation, kept deliberately even though (see the on-write test
+  // above) this describe block turned out to sit on a pre-existing, unrelated flake of its own.
+  it("no pending timer remains after shutdown with a successful dismiss's writeSettleMs guard timer outstanding", async () => {
+    vi.useFakeTimers();
+    // Pinned for the same reason as the on-write test above — eliminates real sub-second jitter
+    // in exactly how many background poll cycles are already due at test start as a variable.
+    vi.setSystemTime(Date.UTC(2024, 0, 1));
+    try {
+      const timers = createTimerHarness();
+      const api = new FakeHomebridgeApi();
+      const log = createFakeLogging();
+      const client = resolvedFakeClient();
+
+      // Captures every onSet handler by the exact Characteristic *instance* (not by UUID, which
+      // collides across every `On`-type characteristic platform-wide — the dismiss switch is one
+      // of at least two, alongside the on-write test above's own target) — so this test can pick
+      // out the left side's dismiss switch specifically, regardless of construction order.
+      const setHandlers = new Map<Characteristic, CharacteristicSetHandler>();
+      const setSpy = vi.spyOn(Characteristic.prototype, 'onSet').mockImplementation(function (
+        this: Characteristic,
+        handler: CharacteristicSetHandler,
+      ) {
+        setHandlers.set(this, handler);
+        return this;
+      });
+      const platform = new FreeSleepPlatform(log, baseConfig(), api.asApi(), client, timers);
+      await api.fireDidFinishLaunching();
+      setSpy.mockRestore();
+      const perAccessoryOverhead = api.registeredAccessories.length;
+
+      const hap = api.hap;
+      // `resolvedFakeClient()` returns real fixture settings, so each side accessory is named
+      // from `settings.<side>.name` (`test/fixtures/settings.json`: "Left"/"Right") rather than
+      // the "Pod Left"/"Pod Right" fallback used only when settings carry no per-side name.
+      const left = api.registeredAccessories.find((a) => a.displayName === 'Left')!;
+      const dismissChar = left.getServiceById(hap.Service.Switch, ALARM_DISMISS_SUBTYPE)!.getCharacteristic(hap.Characteristic.On);
+      const dismissOnSet = setHandlers.get(dismissChar)!;
+
+      // Off-write: submits, debounces, dispatches, and — since `resolvedFakeClient`'s
+      // `postDeviceStatus` always resolves — succeeds, arming the guard timer for `writeSettleMs`.
+      const pending = dismissOnSet(false, {} as never, undefined);
+      const settled = pending instanceof Promise ? pending : Promise.resolve();
+      settled.catch(() => undefined);
+      // `advanceFakeTime` (smaller steps, each followed by a real yield — `timerHarness.ts`'s own
+      // doc) rather than one raw `vi.advanceTimersByTimeAsync(400)` call: this also lets any
+      // background poll whose own next tick lands inside this same 400ms window fully settle
+      // before this test takes its own pending-timer-count snapshot, rather than possibly
+      // catching it mid-flight.
+      await advanceFakeTime(400, 50); // the write-queue's own debounce -> dispatch -> success
+      await settled;
+
+      expect(timers.pendingCount()).toBeGreaterThan(perAccessoryOverhead); // the guard timer is armed
+
+      // Shut down well before writeSettleMs (15000ms default) would otherwise clear it itself.
       await api.fireShutdown();
       expect(timers.pendingCount()).toBe(perAccessoryOverhead);
       void platform;

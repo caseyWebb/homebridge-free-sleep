@@ -1048,6 +1048,31 @@ describe('write queue: stop() (9.7)', () => {
     expect(snapshot.get().left.targetTemperatureF).not.toBe(82);
     expect(timers.pendingCount()).toBe(0);
   });
+
+  // CI regression (alarm-events PR #45 review, found via a platform-level B2 test): a write
+  // cycle's overlay is only tracked in `liveOverlayBatches` — and therefore only cleared by the
+  // loop above — while that cycle is still *in flight*. `settleWrite`'s own tail removes a cycle
+  // from `liveOverlayBatches` the instant it settles, success or failure, since from this queue's
+  // own perspective it is done with it; a *successfully settled* write's overlay is still live in
+  // `SnapshotStore` with its own pending `writeSettleMs` expiry timer, which nothing previously
+  // cleared if `stop()` ran before that timer's natural expiry (or before a later poll confirmed
+  // `raw` agreement). Every other `stop()`/shutdown test in this file exercises a write that never
+  // settles (still pending, still queued) or one that fails (whose overlay clears immediately) —
+  // this is the first to settle a write successfully and then stop() before its own settle window
+  // elapses, which is exactly the gap `SnapshotStore.clearAllOverlaysForShutdown()` (called from
+  // this method) now closes.
+  it('a write that already settled successfully before stop() still has its own overlay timer cleared', async () => {
+    const { queue, snapshot, timers } = setup();
+    const p = queue.submitSide('left', { targetTemperatureF: 82 });
+    await vi.advanceTimersByTimeAsync(400); // debounce -> dispatch -> success
+    await p;
+
+    expect(snapshot.get().left.targetTemperatureF).toBe(82); // overlay still live, settled successfully
+    expect(timers.pendingCount()).toBeGreaterThan(0); // its own writeSettleMs expiry timer is pending
+
+    queue.stop();
+    expect(timers.pendingCount()).toBe(0);
+  });
 });
 
 // ---------------------------------------------------------------------------------------

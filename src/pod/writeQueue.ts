@@ -809,6 +809,15 @@ export class WriteQueue {
       this.clearOwnership(ownership);
     }
     this.liveOverlayBatches.clear();
+    // CI regression (alarm-events PR #45 review): `liveOverlayBatches` only ever tracks a write
+    // cycle's overlay while it is still in flight — `settleWrite`'s own tail removes a cycle
+    // from it the moment that cycle settles, success or failure, since from *this* queue's
+    // perspective it is done. A cycle that already settled successfully before `stop()` runs
+    // still has a live overlay sitting in `SnapshotStore` with its own pending `writeSettleMs`
+    // expiry timer, which the loop above therefore never reaches — this blanket call is what
+    // actually clears it. See `clearAllOverlaysForShutdown`'s own doc for why this lives on
+    // `SnapshotStore` rather than being reconstructed here from `WriteQueue`'s own bookkeeping.
+    this.snapshot.clearAllOverlaysForShutdown();
   }
 }
 
