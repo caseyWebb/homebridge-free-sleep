@@ -4,7 +4,7 @@
     "access": "public"
   },
   "displayName": "Free Sleep",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "description": "Control an Eight Sleep Pod running free-sleep from Apple Home, locally and without the Eight Sleep cloud.",
   "license": "MIT",
   "type": "module",
