@@ -6,7 +6,12 @@
  * power/duration reduction → one global FIFO mutex across every lane and both write endpoints
  * → dispatch → settle (design.md, "Write queue pipeline"). The optimistic overlay is installed
  * on the snapshot at submission (not dispatch) so the cached view never goes stale while a
- * write is queued, re-based to the settle time on success, and cleared immediately on failure.
+ * write is queued, re-based to the settle time on success, and cleared immediately on failure —
+ * *except* the away-mode-guard mirror's own dispatch (`mirrorToOtherSide` below), whose overlay
+ * is kept and rebased even when its POST fails, since the addressed write it followed already
+ * succeeded and free-sleep's `controlBothSides` already applied it to both sides server-side
+ * (see `settleWrite`'s doc, the shared tail both dispatches share, parameterized by this
+ * distinction — F1 fix).
  *
  * Each write cycle (one lane's accumulating patch, from its first submission through its
  * dispatch settling) owns its overlay handles in a Map private to that cycle — never a
@@ -368,29 +373,68 @@ export class WriteQueue {
       body = patch;
     }
 
+    const fastPollLane: FastPollLane = lane === 'settings' ? 'settings' : 'deviceStatus';
     try {
-      if (lane === 'settings') {
-        await this.client.postSettings(body as SettingsPatch);
-      } else {
-        await this.client.postDeviceStatus(body as DeviceStatusPatch);
-      }
-      if (!this.stopped) {
-        this.rebaseOwnership(ownership);
-        const fastPollLane: FastPollLane = lane === 'settings' ? 'settings' : 'deviceStatus';
-        this.requestFastPoll(fastPollLane, this.timers.now() + this.fastPollDurationMs);
-        if (isSideLane(lane) && awayDecision === 'mirror' && sideReduced) {
-          this.mirrorToOtherSide(lane, sideReduced);
-        }
+      await this.settleWrite(
+        ownership,
+        fastPollLane,
+        () =>
+          lane === 'settings'
+            ? this.client.postSettings(body as SettingsPatch)
+            : this.client.postDeviceStatus(body as DeviceStatusPatch),
+        'clear',
+      );
+      if (!this.stopped && isSideLane(lane) && awayDecision === 'mirror' && sideReduced) {
+        this.mirrorToOtherSide(lane, sideReduced);
       }
       waiters.forEach((w) => w.resolve());
     } catch (error) {
-      if (!this.stopped) {
+      waiters.forEach((w) => w.reject(error));
+    }
+  }
+
+  /**
+   * The shared post → rebase/clear → requestFastPoll tail every dispatch (addressed or
+   * mirrored) ends with, parameterized by what a *failed* POST should do to `ownership`'s
+   * overlay (F1 fix):
+   *
+   * - `'clear'` (the addressed dispatch): if the Pod never received this write, its overlay is
+   *   the only record of an intent that never took effect — keeping it would show the caller a
+   *   value the Pod doesn't have, so it is cleared immediately, reverting `get()` to raw truth.
+   * - `'rebase'` (the mirror's own one-shot dispatch, see `mirrorToOtherSide` below): the mirror
+   *   only ever runs *after* the addressed POST already succeeded, and free-sleep's
+   *   `controlBothSides` applies that addressed write to **both** sides server-side (`docs/
+   *   POD-API.md`) — so even when this second, mirrored POST itself fails, the overlay's value
+   *   is still more truthful than falling back to the stale raw cache. It is kept and rebased
+   *   exactly like a success, rather than cleared.
+   *
+   * Success always rebases and requests the fast poll, regardless of policy — `onFailure` only
+   * changes what happens when `post()` rejects. `liveOverlayBatches` bookkeeping happens here
+   * once, for every caller, instead of being duplicated at each call site.
+   */
+  private async settleWrite(
+    ownership: Map<string, OverlayHandle>,
+    fastPollLane: FastPollLane,
+    post: () => Promise<void>,
+    onFailure: 'clear' | 'rebase',
+  ): Promise<void> {
+    let error: unknown;
+    try {
+      await post();
+    } catch (caught) {
+      error = caught;
+    }
+    const succeeded = error === undefined;
+    if (!this.stopped) {
+      if (succeeded || onFailure === 'rebase') {
+        this.rebaseOwnership(ownership);
+        this.requestFastPoll(fastPollLane, this.timers.now() + this.fastPollDurationMs);
+      } else {
         this.clearOwnership(ownership);
       }
-      waiters.forEach((w) => w.reject(error));
-    } finally {
-      this.liveOverlayBatches.delete(ownership);
     }
+    this.liveOverlayBatches.delete(ownership);
+    if (!succeeded) throw error;
   }
 
   /**
@@ -430,16 +474,17 @@ export class WriteQueue {
     const task: MutexTask = {
       run: async () => {
         try {
-          await this.client.postDeviceStatus({ [otherSide]: mirrorPatch } as DeviceStatusPatch);
-          if (!this.stopped) {
-            this.rebaseOwnership(ownership);
-            this.requestFastPoll('deviceStatus', this.timers.now() + this.fastPollDurationMs);
-          }
+          await this.settleWrite(
+            ownership,
+            'deviceStatus',
+            () => this.client.postDeviceStatus({ [otherSide]: mirrorPatch } as DeviceStatusPatch),
+            // F1 fix: a failed mirror POST keeps (rebases) the overlay rather than clearing it —
+            // see `settleWrite`'s doc for why the overlay is still more truthful than raw cache
+            // here, unlike the addressed dispatch's 'clear' policy.
+            'rebase',
+          );
         } catch (error) {
-          if (!this.stopped) this.clearOwnership(ownership);
           this.logger.debug(`writeQueue: mirrored away-mode write to ${otherSide} failed: ${describeError(error)}`);
-        } finally {
-          this.liveOverlayBatches.delete(ownership);
         }
       },
       abandon: () => {

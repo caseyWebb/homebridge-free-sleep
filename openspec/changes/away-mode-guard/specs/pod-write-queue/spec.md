@@ -18,7 +18,13 @@ unaffected — only the away-mode clause of this one requirement changes.
 
 The queue SHALL dispatch the intent it is given, for every lane other than a side write. It
 SHALL NOT originate a write of its own on behalf of a caller, and SHALL NOT read the schedules
-endpoint. Those two guarantees are unchanged from before this requirement's modification.
+endpoint. Those two guarantees are unchanged from before this requirement's modification, with
+one narrow exception introduced by this change: under the `'mirror'` policy, the queue itself
+SHALL originate exactly one additional side write — the mirrored write to the other side,
+carrying the same overlayable fields as the addressed write — for every side write it dispatches
+while either side is in away mode. This is the one write the queue originates that is not "on
+behalf of a caller" in the sense the rest of this requirement means; every other guarantee in
+this requirement (no write beyond that one exception, no schedules read) is unmodified.
 
 For a side write specifically, the queue SHALL consult the configured away-mode write policy at
 dispatch — after debounce, immediately before issuing the request — for every side write

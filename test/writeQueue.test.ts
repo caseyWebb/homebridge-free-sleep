@@ -682,6 +682,36 @@ describe('write queue: away-mode guard (9.6)', () => {
     queue.stop();
   });
 
+  it("a failed mirror POST keeps the mirrored side's overlay instead of clearing it, since the addressed write already succeeded and free-sleep's controlBothSides already applied it to both sides (F1 regression)", async () => {
+    const { queue, fake, snapshot } = setup();
+    snapshot.observeSettings({ ...structuredClone(settingsFixture), left: { ...settingsFixture.left, awayMode: true } });
+
+    // The addressed (right) POST succeeds; every POST after it (the mirror, to left) fails —
+    // reproducing the reviewer's probe: before the F1 fix this cleared the mirror's overlay,
+    // leaving `snapshot.get().left.targetTemperatureF` at the stale raw fixture value (90)
+    // instead of the value the addressed write actually caused free-sleep to apply there too.
+    fake.client.postDeviceStatus = (async (patch) => {
+      fake.postDeviceStatusCalls.push(patch);
+      if (fake.postDeviceStatusCalls.length > 1) {
+        throw new Error('mirror POST failed');
+      }
+    }) as typeof fake.client.postDeviceStatus;
+
+    const p = queue.submitSide('right', { targetTemperatureF: 68 });
+    await vi.advanceTimersByTimeAsync(400);
+    await p;
+
+    expect(fake.postDeviceStatusCalls).toEqual([
+      { right: { targetTemperatureF: 68 } },
+      { left: { targetTemperatureF: 68 } },
+    ]);
+    // Reviewer probe showed left=90 (stale raw cache) / right=68 before the fix; both must now
+    // read 68 — the mirrored side's overlay is kept, not cleared, on a failed mirror POST.
+    expect(snapshot.get().right.targetTemperatureF).toBe(68);
+    expect(snapshot.get().left.targetTemperatureF).toBe(68);
+    queue.stop();
+  });
+
   it("with the real mock, the Pod's own away-mode mirroring and this queue's own mirrored write agree", async () => {
     // Real timers only — see the note on the 8.2 describe block above.
     vi.useRealTimers();

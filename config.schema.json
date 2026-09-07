@@ -112,7 +112,7 @@
         "default": true
       },
       "awayModeWritePolicy": {
-        "title": "Away-mode write policy — governs a write to either side while one side has away mode on: mirror the change to the other side's cached state, or block the write",
+        "title": "Away-mode write policy — governs a write to either side while one side has away mode on: mirror the change with a second real POST /api/deviceStatus to the other side (updating its cached state to match), or block the write",
         "type": "string",
         "default": "mirror",
         "oneOf": [

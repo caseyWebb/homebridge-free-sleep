@@ -53,13 +53,23 @@
       side-lane dispatch (resolution 2), re-entering `submitSide`/`dispatch()` for the mirrored
       side would consult the guard again there too and — since neither the policy nor the away
       state changed — decide `'mirror'` again, mirroring back to the originating side forever.
-      `mirrorToOtherSide` reuses the queue's own overlay-install/rebase/clear/fast-poll machinery
-      (preserving the "one overlay writer" invariant and every guarantee `submitSide` already
-      makes) via a dedicated one-shot mutex task that never re-enters the guarded dispatch path.
-      Only the addressed side's own promise is affected by the guard's outcome; the mirror is
-      fire-and-forget from the addressed dispatch's point of view. Verified in
-      `test/writeQueue.test.ts` (both fake-client and real-mock-Pod cases) and in the full-stack
-      `test/awayModeGuard.integration.test.ts`.
+      `mirrorToOtherSide` reuses the queue's own overlay-install/rebase/fast-poll machinery
+      (preserving the "one overlay writer" invariant) via a dedicated one-shot mutex task that
+      never re-enters the guarded dispatch path. Only the addressed side's own promise is
+      affected by the guard's outcome; the mirror is fire-and-forget from the addressed
+      dispatch's point of view. Verified in `test/writeQueue.test.ts` (both fake-client and
+      real-mock-Pod cases) and in the full-stack `test/awayModeGuard.integration.test.ts`.
+      **Post-review fix (F1):** the mirror's failure handling deliberately does *not* reuse
+      `submitSide`'s on-failure behavior unchanged — a failed mirror POST used to clear the
+      mirrored side's overlay, which was wrong: the mirror only ever runs after the addressed
+      POST already succeeded, and free-sleep's `controlBothSides` already applied that write to
+      both sides server-side, so the overlay is more truthful than falling back to raw cache.
+      Both dispatches now share one `WriteQueue.settleWrite` helper for the
+      post → rebase/clear → requestFastPoll tail, parameterized by an `onFailure` policy:
+      `'clear'` for the addressed dispatch (unchanged), `'rebase'` for the mirror (new — keeps
+      and rebases the overlay on failure instead of clearing it). Regression test in
+      `test/writeQueue.test.ts`'s "away-mode guard (9.6)" section: addressed POST succeeds, the
+      mirror POST fails, both sides' cached views still read the written value.
 - [x] 1.6 Verify the exclusive-section boundary design.md specifies: the decision closure passed
       to `runExclusive` never itself calls or awaits `submitSide` — write a unit test using fake
       timers that submits an unrelated write via `writeQueue.runExclusive`/mutex queuing
@@ -103,6 +113,20 @@
       Confirmed true a fortiori under the adapted design: `AwayModeGuard` no longer calls into
       `writeQueue` at all (it is the other way around), owns no timers, and needs no stop() of its
       own. `platform.wiring.test.ts`'s existing shutdown test passes unmodified.
+      **Post-review fix (F2):** `AwayModeGuard` itself was never the gap — the leak the review
+      found was one hop over, in `ThermostatService` (group 3, task 3.3): its
+      `scheduleAwayModeRevert` ~500ms corrective-refresh timer was never retained or cleared, so
+      it survived platform shutdown (reproduced: 1 pending timer after `fireShutdown` with a
+      blocked write in flight). The pre-existing "existing shutdown assertion continues to pass
+      unmodified" claim above was true but incomplete — that assertion never exercised a blocked
+      write, so it could not have caught this. Fixed by retaining the timer handle on
+      `ThermostatService` (cleared and rescheduled on each new block, so repeated blocks never
+      stack up more than one pending revert), adding `ThermostatService.stop()` to clear it, and
+      calling `stop()` on every thermostat from the platform's `shutdown` handler alongside
+      `poller.stop()`/`writeQueue.stop()` (`src/platform.ts`). The shutdown-with-a-blocked-write
+      test this task always claimed existed is now actually in
+      `test/platform.wiring.test.ts` ("a blocked write's pending away-mode-revert timer is
+      cleared by shutdown").
 
 ## 3. Thermostat write-path rewiring
 
@@ -146,6 +170,13 @@
       test also wiring `ctx.snapshot.subscribe(() => service.refresh())`, to isolate this specific
       mechanism from the pre-existing (unrelated) snapshot-subscription-driven revert that a real
       `FreeSleepPlatform` provides via `handleSnapshotChanges`.
+      **Post-review fix (F2):** the original implementation fired-and-forgot the timer handle
+      returned by `this.ctx.timers.setTimeout(...)`, so it was never retained and could not be
+      cleared — it survived platform shutdown (see 2.3's post-review note). Now retained in a
+      private `awayModeRevertTimer` field, cleared before each reschedule (a second blocked write
+      before the first revert fires replaces, rather than stacks, the pending timer), and cleared
+      by the new `ThermostatService.stop()`, which `src/platform.ts`'s `shutdown` handler calls
+      for every thermostat.
 
 ## 4. Cross-cutting and integration tests
 
@@ -215,13 +246,18 @@
       "Reserved — no effect yet," state what `'mirror'` and `'block'` now each do, and document
       the residual out-of-band-change race in one sentence pointing at the settings poll
       interval. Verify: manual read-through; no automated check, since README prose isn't tested.
-      Done.
+      Done. **Post-review fix (N3):** the `'mirror'` clause originally said only "updates the
+      other side's cached state to match," which named an effect but not the mechanism —
+      reworded to name the second real `POST /api/deviceStatus` the mirror issues.
 - [x] 5.3 Update `config.schema.json`'s `awayModeWritePolicy` title from "Away-mode write policy
       (reserved, no effect yet)" to a description of the live behavior. Verify: `npm test` still
       passes (schema JSON structure/enum values are unchanged, only `title` text) and the
       Homebridge UI's config form (manual check, not automatable in this repo) renders the
       updated copy.
       Done; `npm test` confirmed passing with the JSON structure otherwise unchanged.
+      **Post-review fix (N3):** same wording gap as 5.2 — the title now also names the second
+      real `POST /api/deviceStatus` the `'mirror'` policy issues, not just "the other side's
+      cached state."
 
 ## 6. Full verification
 
@@ -241,3 +277,9 @@ was added at `openspec/changes/away-mode-guard/specs/pod-write-queue/spec.md`, n
 requirement to describe the queue's own no-policy-on-keep-alive/schedules guarantees plus its new
 away-mode consultation. `openspec validate away-mode-guard --type change --strict` passes with
 this delta in place.
+
+**Post-review fix (N4):** that MODIFIED requirement's body ("SHALL NOT originate a write of its
+own on behalf of a caller") contradicted its own third scenario (:51, "the one additional
+mirrored write that policy's own requirement describes"), which the queue very much does
+originate itself under `'mirror'`. The requirement body now carries the mirrored-write exception
+explicitly, so the body and the scenario agree instead of one silently overriding the other.

@@ -18,7 +18,7 @@ import type { Characteristic, Service } from 'homebridge';
 
 import { AwayModeBlockedError } from '../pod/awayModeGuard.ts';
 import { clampTargetF, cToF, fToC, TARGET_TEMP_PROPS } from '../pod/temperature.ts';
-import type { Change, EffectiveSideStatus } from '../pod/snapshot.ts';
+import type { Change, EffectiveSideStatus, TimerHandle } from '../pod/snapshot.ts';
 import type { Side } from '../pod/types.ts';
 import type { ServiceContext } from './types.ts';
 
@@ -74,6 +74,10 @@ export class ThermostatService {
   /** The moment this launch started — the escalation predicate's fallback `since` when the
    * Pod has never been observed reachable this launch (design.md, "No Response"). */
   private readonly platformStartedAt: number;
+  /** The pending `scheduleAwayModeRevert` timer, if any — retained (F2 fix) so `stop()` can
+   * clear it on platform shutdown instead of leaving it to fire (or sit pending forever) after
+   * teardown. `null` whenever no revert is currently scheduled. */
+  private awayModeRevertTimer: TimerHandle | null = null;
 
   constructor(ctx: ServiceContext, side: Side, platformStartedAt: number) {
     this.ctx = ctx;
@@ -295,9 +299,33 @@ export class ThermostatService {
    * here it doesn't, so it pushes the reversion exactly like any other genuinely divergent
    * observation. Scheduled via the shared injected `TimerApi`, not a bare `setTimeout` (design.md;
    * `src/services/types.ts`'s module doc) — deterministic under a test's fake/manual timers.
+   *
+   * F2 fix: the handle is retained in `awayModeRevertTimer` rather than fired-and-forgotten, and
+   * any previously-scheduled revert is cleared first — a second blocked write before the first
+   * revert fires gets exactly one pending timer, not two independent `refresh()` calls racing
+   * each other. `stop()` clears this same handle on platform shutdown.
    */
   private scheduleAwayModeRevert(): void {
-    this.ctx.timers.setTimeout(() => this.refresh(), AWAY_MODE_BLOCKED_REVERT_DELAY_MS);
+    if (this.awayModeRevertTimer !== null) {
+      this.ctx.timers.clearTimeout(this.awayModeRevertTimer);
+    }
+    this.awayModeRevertTimer = this.ctx.timers.setTimeout(() => {
+      this.awayModeRevertTimer = null;
+      this.refresh();
+    }, AWAY_MODE_BLOCKED_REVERT_DELAY_MS);
+  }
+
+  /**
+   * Clears any pending away-mode-revert timer (F2 fix) — wired into the platform's `shutdown`
+   * teardown (`src/platform.ts`) alongside `poller.stop()`/`writeQueue.stop()`, so a blocked
+   * write's ~500ms corrective `refresh()` never fires (and never shows up as a leaked pending
+   * timer) after the platform has already torn down.
+   */
+  stop(): void {
+    if (this.awayModeRevertTimer !== null) {
+      this.ctx.timers.clearTimeout(this.awayModeRevertTimer);
+      this.awayModeRevertTimer = null;
+    }
   }
 
   // ---------------------------------------------------------------------------------------

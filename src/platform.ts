@@ -274,12 +274,15 @@ export class FreeSleepPlatform implements DynamicPlatformPlugin {
       });
     });
 
-    // Stop polling, stop the write path, and drop the snapshot subscription — no pending
-    // timer, no in-flight work that could still touch HomeKit (specs/platform/spec.md,
-    // tasks.md 7.4).
+    // Stop polling, stop the write path, drop the snapshot subscription, and clear any pending
+    // per-thermostat away-mode-revert timer (F2 fix) — no pending timer, no in-flight work that
+    // could still touch HomeKit (specs/platform/spec.md, tasks.md 7.4 and 2.3).
     this.api.on('shutdown', () => {
       this.poller?.stop();
       this.writeQueue?.stop();
+      for (const thermostat of this.thermostats.values()) {
+        thermostat.stop();
+      }
       this.unsubscribeSnapshot?.();
       this.unsubscribeSnapshot = undefined;
     });
