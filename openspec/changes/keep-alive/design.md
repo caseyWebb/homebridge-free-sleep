@@ -191,6 +191,23 @@ design with no code changes needed here:
 This is the one interaction that genuinely needs a second set of eyes before implementation —
 see Open Questions.
 
+**Note (recorded per a PR #39 review comment on issue #12, executed 2026-09-06):** under the
+`'mirror'` policy specifically, a bare `secondsRemaining` re-arm is *not* mirrored to the other
+side by this plugin's own `mirrorToOtherSide` — `WriteQueue` only ever mirrors the overlayable
+fields (`targetTemperatureF`, `isOn`, `isAlarmVibrating`), and `secondsRemaining` is neither one
+of those nor itself overlayable (`snapshot.ts`'s `OverlayableField`). This is symmetric with the
+*addressed* side's own duration writes, which likewise install no overlay — `secondsRemaining`
+stays honest only via the next poll, for either side, by design. But free-sleep's own
+`updateSide` applies the posted duration to **both** sides server-side whenever either side is
+away (`controlBothSides`), regardless of what this plugin mirrors. Concretely: an away-mode
+keep-alive re-arm silently drives both sides' remaining time on the Pod, with nothing telling
+HomeKit until the next `deviceStatus` poll observes it. **Accepted, poll-corrected** — not fixed
+here: the cached view is only ever briefly stale (one `pollIntervalMs`, 30s by default), and this
+is not a regression keep-alive introduces so much as the pre-existing "`secondsRemaining` is
+never reflected optimistically for any caller" behavior extended to a caller (`KeepAlive`) that
+happens to write only that field. No mechanism change follows from this note; it exists so the
+gap is documented rather than rediscovered.
+
 ## Risks / Trade-offs
 
 - **[Risk] The opposite-order debounce race.** If `KeepAlive` submits `{secondsRemaining: N}`

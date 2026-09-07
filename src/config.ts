@@ -153,8 +153,39 @@ export const FreeSleepConfigSchema = z.object({
     })
     .default('contact'),
 
-  /** Reserved — see module doc. */
+  /**
+   * Consumed starting with `keep-alive` (#12): `false` disables the whole component (no timer,
+   * no writes); `true` (the default) runs it, re-posting `keepAliveMs` as a side's
+   * `secondsRemaining` once its remaining time drops below `keepAliveThresholdMs`, but only
+   * while that side is currently observed on (`src/pod/keepAlive.ts`).
+   */
   keepAlive: z.boolean().default(true),
+
+  /**
+   * Consumed starting with `keep-alive` (#12). The duration (ms) re-posted as a side's
+   * `secondsRemaining` when it is re-armed. Default 43_200_000 (12h), matching the Pod's own
+   * `isOn: true` duration (`server/src/routes/deviceStatus/updateDeviceStatus.ts`). Minimum
+   * 1000ms (design.md Open Question 3 / tech-lead resolution 3) — enough to reject nonsensical
+   * configuration without a more specific bound.
+   */
+  keepAliveMs: z
+    .number()
+    .int()
+    .min(1000, { message: 'keepAliveMs must be at least 1000ms' })
+    .default(43_200_000),
+
+  /**
+   * Consumed starting with `keep-alive` (#12). A side is re-armed once its observed remaining
+   * time drops below this. Default 1_800_000 (30 min). Minimum 1000ms, same rationale as
+   * `keepAliveMs`. Must be strictly less than `keepAliveMs` — enforced by the object-level
+   * `.superRefine` below, since a threshold at or above the duration would either never fire or
+   * fire immediately on every re-arm.
+   */
+  keepAliveThresholdMs: z
+    .number()
+    .int()
+    .min(1000, { message: 'keepAliveThresholdMs must be at least 1000ms' })
+    .default(1_800_000),
 
   /** Reserved — see module doc. */
   awayModeWritePolicy: z
@@ -162,6 +193,17 @@ export const FreeSleepConfigSchema = z.object({
       message: "awayModeWritePolicy must be one of 'mirror' or 'block'",
     })
     .default('mirror'),
+}).superRefine((data, ctx) => {
+  if (data.keepAliveThresholdMs >= data.keepAliveMs) {
+    ctx.addIssue({
+      code: 'custom',
+      path: ['keepAliveThresholdMs'],
+      message:
+        'keepAliveThresholdMs must be strictly less than keepAliveMs — a threshold at or above ' +
+        'the duration would either never fire or fire immediately on every re-arm ' +
+        `(got keepAliveThresholdMs=${data.keepAliveThresholdMs}, keepAliveMs=${data.keepAliveMs}).`,
+    });
+  }
 });
 
 export type FreeSleepConfig = z.infer<typeof FreeSleepConfigSchema>;

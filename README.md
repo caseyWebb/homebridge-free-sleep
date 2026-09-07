@@ -98,7 +98,9 @@ Minimal config — everything but `host` is optional:
 | `noResponseAfterMs` | number (ms) | `600000` | How long the Pod must be unreachable before thermostat reads start throwing instead of serving last-known values. `0` disables escalation. |
 | `occupancySource` | `'none'` \| `'presence'` \| `'vitals'` | `'none'` | **Reserved — no effect yet.** Planned for M4 (#19). |
 | `waterLowSensorType` | `'contact'` \| `'leak'` | `'contact'` | **Reserved — no effect yet.** Planned for M4 (#20). |
-| `keepAlive` | boolean | `true` | **Reserved — no effect yet.** Planned for M3 (#12). |
+| `keepAlive` | boolean | `true` | While a side is on, periodically re-posts its remaining time so the Pod's 12-hour `isOn` duration never silently expires. `false` disables the component entirely — no timer, no writes. |
+| `keepAliveMs` | number (ms) | `43200000` (12h) | The duration re-posted as a side's remaining time when it is re-armed, matching the Pod's own 12-hour duration. |
+| `keepAliveThresholdMs` | number (ms) | `1800000` (30min) | A side is re-armed once its remaining time drops below this. Must be strictly less than `keepAliveMs`. |
 | `awayModeWritePolicy` | `'mirror'` \| `'block'` | `'mirror'` | Governs a write to one side while either side has away mode on (the Pod itself always applies such a write to both sides). `'mirror'` (default) lets the write through and issues a second real `POST /api/deviceStatus` to the other side, updating its cached state to match, so HomeKit shows the truth immediately. `'block'` refuses the write before it reaches the Pod, surfacing "not allowed" in the Home app instead. Either way, an away-mode change made outside this plugin (e.g. free-sleep's own web UI) is only detected on the next settings poll (default every 300s), not sooner. |
 
 Reserved keys are validated now (a typo fails loudly) so a future release can start reading

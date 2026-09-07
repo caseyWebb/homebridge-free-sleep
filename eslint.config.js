@@ -9,12 +9,13 @@ export default tseslint.config(
   ...tseslint.configs.recommended,
   {
     // poller-and-write-queue (openspec/changes/poller-and-write-queue/tasks.md, 1.3): every
-    // timing decision in these three modules must flow through the injected `TimerApi`, never
+    // timing decision in these modules must flow through the injected `TimerApi`, never
     // a global, or fake-timer tests can't make jitter and the clock deterministic (design.md,
     // "Timer, clock and randomness injection"). `globalThis.setTimeout` etc. are still the
     // escape hatch the default `TimerApi` implementation itself needs — this rule only
-    // forbids the bare identifiers.
-    files: ['src/pod/snapshot.ts', 'src/pod/poller.ts', 'src/pod/writeQueue.ts'],
+    // forbids the bare identifiers. `src/pod/keepAlive.ts` joined this set at `keep-alive`
+    // (tasks.md 2.5) — same discipline, same injected-timer pattern.
+    files: ['src/pod/snapshot.ts', 'src/pod/poller.ts', 'src/pod/writeQueue.ts', 'src/pod/keepAlive.ts'],
     rules: {
       'no-restricted-globals': [
         'error',
