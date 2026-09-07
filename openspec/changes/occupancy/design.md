@@ -195,13 +195,25 @@ observed."
 
 **Decision:** `SnapshotStore.observePresence(data)` records, per side, the `lastUpdatedAt` from
 its **first-ever observation this launch** as a baseline. `presenceActive[side]` becomes `true`
-the first time a *later* observation's `lastUpdatedAt` differs from that baseline, and stays
-`true` from then on (sticky — the same non-regressing shape `ConnectionState.lastSuccessAt`
-already uses, and for the same reason: a value the plugin has already proven trustworthy once
-does not become untrustworthy again just because the signal happens to repeat). `presencePresent`
-itself is always just the raw, current `present` boolean, regardless of `presenceActive` — the
-service, not the snapshot, decides whether to trust it (mirroring how `connection.online` is
-stored unconditionally and `ConnectionService` alone decides what to do with it).
+the first time a *later* observation's `lastUpdatedAt` differs from that baseline **and** that
+same observation reports `present === true`, and stays `true` from then on (sticky — the same
+non-regressing shape `ConnectionState.lastSuccessAt` already uses, and for the same reason: a
+value the plugin has already proven trustworthy once does not become untrustworthy again just
+because the signal happens to repeat). `presencePresent` itself is always just the raw, current
+`present` boolean, regardless of `presenceActive` — the service, not the snapshot, decides
+whether to trust it (mirroring how `connection.online` is stored unconditionally and
+`ConnectionService` alone decides what to do with it).
+
+**Tightened (tech-lead ruling, occupancy code review, S1):** a differing `lastUpdatedAt` alone is
+not sufficient proof. The Pod reboots daily (`CLAUDE.md`'s hard constraints), and a reboot
+re-initialises the in-memory presence store to `{ present: false, lastUpdatedAt: <restart
+time> }` — a *fresh* `lastUpdatedAt` with no real transition behind it. Without the `present ===
+true` requirement, a dead detection stream (biometrics reporting, sensor hardware, whatever) that
+never produces a real transition would still get re-baselined and then "proven" by the very next
+reboot alone, within at most 24h, and would report confident, permanent, wrong Not-Occupied data
+forever after — precisely the failure this whole feature exists to prevent, just reached via a
+different path than "never observed." A real get-into-bed transition always reports `present:
+true`, so this closes the gap with no cost to the intended case.
 
 This baseline is **per plugin launch, not persisted** — a restart re-baselines and briefly
 re-enters "inactive" until the next real transition. Accepted: the alternative (persisting the
@@ -307,7 +319,11 @@ state" rule, with no new failure-kind bookkeeping needed.
 unknown for up to that long after a fresh launch. Until the first successful `services` poll,
 `documents.services` is `undefined` and the `enabled` predicate above reads that as `false` —
 "assume disabled until proven enabled" is the same conservative default this codebase already
-applies elsewhere (e.g. `ConnectionService`'s pre-first-success `StatusActive: false`).
+applies elsewhere (e.g. `ConnectionService`'s pre-first-success `StatusActive: false`). The same
+lag applies symmetrically in the other direction (N3): disabling biometrics on the Pod itself
+takes up to `slowPollIntervalMs` (~5 minutes by default) for this plugin to notice via its next
+`services` poll and stop polling `presence`/`vitals` — the stale `enabled: true` observation
+already cached keeps those classes firing until then.
 
 ## Risks / Trade-offs
 
@@ -370,3 +386,11 @@ would flap on every legitimately empty bed, given upstream only inserts rows whi
 reset makes mere data non-evidence; (3) occupancySource 'none' omits the service entirely;
 (4) StatusActive only, no StatusFault. The design honors the prime directive from
 docs/HOMEKIT.md: a permanently-wrong "Not Occupied" is worse than no sensor.
+
+**Further tightened (tech lead, occupancy code review, S1):** resolution (2) above, as originally
+implemented, proved on a bare `lastUpdatedAt` change from baseline alone. Because the Pod's daily
+reboot itself produces a fresh `lastUpdatedAt` under the reset default (`present: false`), that
+implementation could — and in review, did — get "proven" by nothing more than a reboot, with no
+real transition ever occurring, defeating the whole point of the trust flag. The proving
+observation now must additionally report `present === true`; see the "Presence `StatusActive`"
+section above.

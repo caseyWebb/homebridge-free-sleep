@@ -7,6 +7,13 @@ const deviceStatusFixture = loadFixture('deviceStatus.json');
 const settingsFixture = loadFixture('settings.json') as { id: string };
 const schedulesFixture = loadFixture('schedules.json');
 const servicesFixture = loadFixture('services.json');
+const presenceFixture = loadFixture('metricsPresence.json');
+const vitalsFixture = loadFixture('metricsVitals.json') as Array<{
+  id: number;
+  side: string;
+  timestamp: string;
+  heart_rate: number | null;
+}>;
 
 let pods: MockPod[] = [];
 
@@ -164,12 +171,114 @@ describe('transport', () => {
         'GET /api/settings',
         'GET /api/schedules',
         'GET /api/services',
+        'GET /api/metrics/presence',
+        'GET /api/metrics/vitals',
         'POST /api/deviceStatus',
         'POST /api/settings',
       ]) {
         expect(() => pod.fault(endpoint, { kind: 'status', times: 1 })).not.toThrow();
       }
     });
+  });
+});
+
+// ---------------------------------------------------------------------------------------
+// Occupancy change (#19): presence and vitals endpoints (tasks.md 6.1-6.4)
+// ---------------------------------------------------------------------------------------
+
+async function getVitals(pod: MockPod, query: Record<string, string> = {}): Promise<unknown> {
+  const qs = new URLSearchParams(query).toString();
+  const response = await fetch(`${pod.url}/api/metrics/vitals${qs.length > 0 ? `?${qs}` : ''}`);
+  return response.json();
+}
+
+describe('presence and vitals endpoints (6.1-6.4)', () => {
+  it('a fresh read of presence and vitals equals their fixtures', async () => {
+    const pod = await start();
+    const presence = await fetch(`${pod.url}/api/metrics/presence`).then((r) => r.json());
+    const vitals = await getVitals(pod);
+    expect(presence).toEqual(presenceFixture);
+    expect(vitals).toEqual(vitalsFixture);
+  });
+
+  it('a side filter returns only that side\'s rows', async () => {
+    const pod = await start();
+    const left = (await getVitals(pod, { side: 'left' })) as Array<{ side: string }>;
+    expect(left.every((r) => r.side === 'left')).toBe(true);
+    expect(left.length).toBeGreaterThan(0);
+  });
+
+  it('a time-range filter excludes rows outside it, both bounds and each alone', async () => {
+    const pod = await start();
+    // The fixture's two rows are 2026-09-06T16:34:24-05:00 (right) and T16:34:31-05:00 (left).
+    const bothBounds = (await getVitals(pod, {
+      startTime: '2026-09-06T16:34:20-05:00',
+      endTime: '2026-09-06T16:34:26-05:00',
+    })) as Array<{ side: string }>;
+    expect(bothBounds).toHaveLength(1);
+    expect(bothBounds[0]?.side).toBe('right');
+
+    const startOnly = (await getVitals(pod, { startTime: '2026-09-06T16:34:28-05:00' })) as Array<{
+      side: string;
+    }>;
+    expect(startOnly).toHaveLength(1);
+    expect(startOnly[0]?.side).toBe('left');
+
+    const endOnly = (await getVitals(pod, { endTime: '2026-09-06T16:34:26-05:00' })) as Array<{
+      side: string;
+    }>;
+    expect(endOnly).toHaveLength(1);
+    expect(endOnly[0]?.side).toBe('right');
+  });
+
+  it('side and time range combined narrow to the intersection', async () => {
+    const pod = await start();
+    const result = (await getVitals(pod, {
+      side: 'left',
+      startTime: '2026-09-06T16:34:20-05:00',
+      endTime: '2026-09-06T16:34:26-05:00',
+    })) as unknown[];
+    expect(result).toHaveLength(0); // left's row is outside this window
+  });
+
+  it('no filters returns every seeded row for both sides', async () => {
+    const pod = await start();
+    const result = (await getVitals(pod)) as Array<{ side: string }>;
+    expect(result).toHaveLength(2);
+    expect(new Set(result.map((r) => r.side))).toEqual(new Set(['left', 'right']));
+  });
+
+  it('an overridden presence/vitals seed is reflected in reads', async () => {
+    const pod = await start({
+      state: {
+        presence: { left: { present: true, lastUpdatedAt: '2026-09-06T23:00:00-05:00' } },
+        vitals: [{ id: 1, side: 'left', timestamp: '2026-09-06T23:00:00-05:00', heart_rate: 60, hrv: 40, breathing_rate: 14 }],
+      },
+    });
+    const presence = (await fetch(`${pod.url}/api/metrics/presence`).then((r) => r.json())) as {
+      left: { present: boolean };
+    };
+    expect(presence.left.present).toBe(true);
+    const vitals = (await getVitals(pod)) as Array<{ heart_rate: number }>;
+    expect(vitals).toHaveLength(1);
+    expect(vitals[0]?.heart_rate).toBe(60);
+  });
+
+  it('reset() restores the seeded presence and vitals after an override', async () => {
+    const pod = await start({
+      state: {
+        presence: { left: { present: true, lastUpdatedAt: '2026-09-06T23:00:00-05:00' } },
+        vitals: [],
+      },
+    });
+    pod.reset();
+    const presence = await fetch(`${pod.url}/api/metrics/presence`).then((r) => r.json());
+    const vitals = await getVitals(pod);
+    // reset() restores the *seed* (the override baked in at startup), not the raw fixture — the
+    // override here was itself the seed, so restoring it looks identical to no further writes
+    // having happened, mirroring reset()'s existing contract for the other four documents.
+    expect(presence).toEqual({ left: { present: true, lastUpdatedAt: '2026-09-06T23:00:00-05:00' } });
+    expect(vitals).toEqual([]);
   });
 });
 

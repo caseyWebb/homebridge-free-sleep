@@ -188,6 +188,10 @@ describe('snapshot store: change notifications (3.1-3.5)', () => {
         case 'isOn':
         case 'isAlarmVibrating':
         case 'awayMode':
+        case 'presencePresent':
+        case 'presenceActive':
+        case 'vitalsOccupied':
+        case 'vitalsActive':
           return `${change.side}:${change.field}=${change.current}`;
         case 'waterLevelState':
         case 'isPriming':
@@ -331,6 +335,202 @@ describe('snapshot store: change notifications (3.1-3.5)', () => {
 
     store.clearOverlay(handles[1]!); // current handle — actually clears it
     expect(store.get().left.targetTemperatureF).toBe(64); // reverts to the raw value
+  });
+});
+
+// ---------------------------------------------------------------------------------------
+// Occupancy change (#19): observePresence / observeVitals (tasks.md 5.3-5.6)
+// ---------------------------------------------------------------------------------------
+
+describe('snapshot store: observePresence (5.3, 5.5, 5.6)', () => {
+  let store: SnapshotStore;
+
+  beforeEach(() => {
+    store = new SnapshotStore();
+  });
+
+  it('presencePresent and presenceActive read as unknown before any observation', () => {
+    expect(store.get().left.presencePresent).toBeUndefined();
+    expect(store.get().left.presenceActive).toBeUndefined();
+  });
+
+  it('the first observation never proves; presencePresent reflects it immediately', () => {
+    store.observePresence({ left: { present: false, lastUpdatedAt: 't0' } });
+    expect(store.get().left.presencePresent).toBe(false);
+    expect(store.get().left.presenceActive).toBe(false); // observed, not yet proven
+  });
+
+  it('a second, identical observation still does not prove', () => {
+    store.observePresence({ left: { present: false, lastUpdatedAt: 't0' } });
+    store.observePresence({ left: { present: false, lastUpdatedAt: 't0' } });
+    expect(store.get().left.presenceActive).toBe(false);
+  });
+
+  it('a third, differing observation proves, and stays proven even if a later one reverts to the baseline', () => {
+    store.observePresence({ left: { present: false, lastUpdatedAt: 't0' } });
+    store.observePresence({ left: { present: true, lastUpdatedAt: 't1' } });
+    expect(store.get().left.presenceActive).toBe(true);
+    expect(store.get().left.presencePresent).toBe(true);
+
+    store.observePresence({ left: { present: false, lastUpdatedAt: 't0' } }); // reverts to baseline
+    expect(store.get().left.presenceActive).toBe(true); // still proven — sticky
+    expect(store.get().left.presencePresent).toBe(false); // but the raw flag follows the latest observation
+  });
+
+  it('both sides update from a single observation, independently', () => {
+    store.observePresence({
+      left: { present: false, lastUpdatedAt: 't0' },
+      right: { present: false, lastUpdatedAt: 't0' },
+    });
+    expect(store.get().left.presencePresent).toBe(false);
+    expect(store.get().right.presencePresent).toBe(false);
+
+    store.observePresence({
+      left: { present: false, lastUpdatedAt: 't1' }, // differs from baseline, but present: false — S1
+      right: { present: true, lastUpdatedAt: 't1' }, // differs from baseline, and present: true
+    });
+    expect(store.get().left.presenceActive).toBe(false); // still unproven — no present:true observation yet
+    expect(store.get().right.presenceActive).toBe(true); // proven, independently of left
+  });
+
+  // -------------------------------------------------------------------------------------
+  // S1 regression: a reboot-shaped observation (differing lastUpdatedAt, present still false)
+  // must not prove the side live — only an observation carrying present: true may.
+  // -------------------------------------------------------------------------------------
+
+  it('S1: a differing lastUpdatedAt alone does not prove — the Pod\'s daily reboot resets ' +
+    'lastUpdatedAt without ever setting present: true, and a dead detection stream must not ' +
+    'read as permanently, confidently "proven" from that alone', () => {
+    store.observePresence({ left: { present: false, lastUpdatedAt: 't0' } }); // baseline
+    // Simulates a reboot: a fresh lastUpdatedAt, but the reset default is always present: false.
+    store.observePresence({ left: { present: false, lastUpdatedAt: 't1' } });
+    expect(store.get().left.presenceActive).toBe(false);
+    // Any number of further reboot-shaped observations still never prove it.
+    store.observePresence({ left: { present: false, lastUpdatedAt: 't2' } });
+    expect(store.get().left.presenceActive).toBe(false);
+  });
+
+  it('S1: a present: true observation proves the side live, even though a reboot-shaped ' +
+    'observation just before it did not', () => {
+    store.observePresence({ left: { present: false, lastUpdatedAt: 't0' } }); // baseline
+    store.observePresence({ left: { present: false, lastUpdatedAt: 't1' } }); // reboot-shaped — no proof
+    expect(store.get().left.presenceActive).toBe(false);
+    store.observePresence({ left: { present: true, lastUpdatedAt: 't2' } }); // a real get-into-bed
+    expect(store.get().left.presenceActive).toBe(true);
+  });
+
+  // -------------------------------------------------------------------------------------
+  // N1 regression: an absent (undefined) lastUpdatedAt on the first-ever observation must not
+  // re-arm "baseline recording" on every later observation, burning the first real transition.
+  // -------------------------------------------------------------------------------------
+
+  it('N1: an undefined lastUpdatedAt on the first observation still lets the very next ' +
+    'differing, present: true observation prove the side', () => {
+    store.observePresence({ left: { present: false, lastUpdatedAt: undefined } }); // baseline: undefined
+    expect(store.get().left.presenceActive).toBe(false);
+    // Without N1's separate `baselineRecorded` flag, this would be misread as "still the first
+    // observation" (baseline === undefined) and merely re-record the baseline instead of proving.
+    store.observePresence({ left: { present: true, lastUpdatedAt: 't1' } });
+    expect(store.get().left.presenceActive).toBe(true);
+  });
+
+  // -------------------------------------------------------------------------------------
+  // N2 regression: a side absent from every presence document ever observed reads as unknown,
+  // not as observed-but-unproven, merely because the other side has been observed.
+  // -------------------------------------------------------------------------------------
+
+  it('N2: a side never once present in any observed document reads presenceActive as unknown, ' +
+    'not false, even once the other side has been observed', () => {
+    store.observePresence({ left: { present: false, lastUpdatedAt: 't0' } }); // right never mentioned
+    expect(store.get().left.presenceActive).toBe(false); // left: observed, not yet proven
+    expect(store.get().right.presenceActive).toBeUndefined(); // right: never observed at all
+    expect(store.get().right.presencePresent).toBeUndefined();
+  });
+
+  it('an entry absent from a later observation does not un-prove a side already proven', () => {
+    store.observePresence({ left: { present: false, lastUpdatedAt: 't0' } });
+    store.observePresence({ left: { present: true, lastUpdatedAt: 't1' } }); // proves left
+    expect(store.get().left.presenceActive).toBe(true);
+
+    store.observePresence({}); // this observation says nothing about either side
+    expect(store.get().left.presenceActive).toBe(true); // proof-of-life bookkeeping is untouched
+  });
+
+  it('a presencePresent change is a watched field producing exactly one notification', () => {
+    store.observePresence({ left: { present: false, lastUpdatedAt: 't0' } });
+    const received: Array<readonly Change[]> = [];
+    store.subscribe((changes) => received.push(changes));
+    store.observePresence({ left: { present: true, lastUpdatedAt: 't1' } });
+    expect(received).toHaveLength(1);
+    const fields = received[0]!.map((c) => c.field);
+    expect(fields).toContain('presencePresent');
+    expect(fields).toContain('presenceActive');
+  });
+});
+
+describe('snapshot store: observeVitals (5.4, 5.5, 5.6)', () => {
+  let store: SnapshotStore;
+
+  beforeEach(() => {
+    store = new SnapshotStore();
+  });
+
+  it('vitalsOccupied and vitalsActive read as unknown before any observation', () => {
+    expect(store.get().left.vitalsOccupied).toBeUndefined();
+    expect(store.get().left.vitalsActive).toBeUndefined();
+  });
+
+  it('an empty array leaves vitalsProven at its prior value for both sides (never regresses)', () => {
+    store.observeVitals([]);
+    expect(store.get().left.vitalsActive).toBe(false); // observed (empty), not proven
+    expect(store.get().left.vitalsOccupied).toBe(false);
+  });
+
+  it('a non-empty array for one side proves only that side, immediately — no second observation required', () => {
+    store.observeVitals([{ id: 1, side: 'left', timestamp: 't0', heart_rate: 60, hrv: null, breathing_rate: null }]);
+    expect(store.get().left.vitalsActive).toBe(true);
+    expect(store.get().left.vitalsOccupied).toBe(true);
+    expect(store.get().right.vitalsActive).toBe(false);
+    expect(store.get().right.vitalsOccupied).toBe(false);
+  });
+
+  it('a later empty array does not un-prove it; only vitalsOccupied changes', () => {
+    store.observeVitals([{ id: 1, side: 'left', timestamp: 't0', heart_rate: 60, hrv: null, breathing_rate: null }]);
+    store.observeVitals([]);
+    expect(store.get().left.vitalsActive).toBe(true); // still proven
+    expect(store.get().left.vitalsOccupied).toBe(false); // no longer occupied
+  });
+
+  it('a row with a null heart_rate does not count as occupied, but still proves the side live', () => {
+    store.observeVitals([{ id: 1, side: 'left', timestamp: 't0', heart_rate: null, hrv: 40, breathing_rate: 14 }]);
+    expect(store.get().left.vitalsOccupied).toBe(false);
+    expect(store.get().left.vitalsActive).toBe(true);
+  });
+
+  it('a vitalsOccupied change is a watched field producing exactly one notification', () => {
+    store.observeVitals([]);
+    const received: Array<readonly Change[]> = [];
+    store.subscribe((changes) => received.push(changes));
+    store.observeVitals([{ id: 1, side: 'left', timestamp: 't0', heart_rate: 60, hrv: null, breathing_rate: null }]);
+    expect(received).toHaveLength(1);
+    const fields = received[0]!.map((c) => c.field);
+    expect(fields).toContain('vitalsOccupied');
+    expect(fields).toContain('vitalsActive');
+  });
+
+  it('a commit that changes only vitalsOccupied produces exactly one notification carrying that one field', () => {
+    // Prove both sides live first, so a later empty/non-empty transition changes only
+    // vitalsOccupied, not vitalsActive too (pod-snapshot's "one notification per commit").
+    store.observeVitals([
+      { id: 1, side: 'left', timestamp: 't0', heart_rate: 60, hrv: null, breathing_rate: null },
+      { id: 2, side: 'right', timestamp: 't0', heart_rate: 60, hrv: null, breathing_rate: null },
+    ]);
+    const received: Array<readonly Change[]> = [];
+    store.subscribe((changes) => received.push(changes));
+    store.observeVitals([{ id: 3, side: 'right', timestamp: 't1', heart_rate: 60, hrv: null, breathing_rate: null }]);
+    expect(received).toHaveLength(1);
+    expect(received[0]!.map((c) => c.field)).toEqual(['vitalsOccupied']);
+    expect(received[0]![0]).toMatchObject({ side: 'left', current: false });
   });
 });
 

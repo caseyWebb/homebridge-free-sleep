@@ -25,6 +25,7 @@ import {
 } from '../src/pod/types.js';
 import { THERMOSTAT_SUBTYPE, type ThermostatService } from '../src/services/thermostat.js';
 import { CONNECTION_SUBTYPE } from '../src/services/connection.js';
+import { OCCUPANCY_SUBTYPE, type OccupancySensorService } from '../src/services/occupancy.js';
 import { fToC } from '../src/pod/temperature.js';
 import {
   createFakeLogging,
@@ -74,6 +75,7 @@ function factory(podClient?: MinimalPodClient, timers?: TimerHarness): PlatformF
  * `test/platform.test.ts` already uses for `cachedByUuid`. */
 interface PlatformInternals {
   thermostats: Map<Side, ThermostatService>;
+  occupancySensors: Map<Side, OccupancySensorService>;
   connectionService: { refresh: () => void } | undefined;
   handleSnapshotChanges: (changes: readonly Change[]) => void;
 }
@@ -657,4 +659,192 @@ describe('keep-alive wiring (tasks.md 3.1, 3.2)', () => {
       vi.useRealTimers();
     }
   });
+});
+
+// ---------------------------------------------------------------------------------------
+// Occupancy change (#19): platform wiring (tasks.md 8.1, 8.2, 8.3, 8.4)
+// ---------------------------------------------------------------------------------------
+
+describe('occupancy sensor wiring (tasks.md 8.1, 8.2)', () => {
+  it('occupancySource: none (the default) constructs no occupancy sensor for either side', async () => {
+    const client: MinimalPodClient = {
+      getDeviceStatus: () => Promise.reject(new Error('unreachable')),
+      getSettings: () => Promise.reject(new Error('unreachable')),
+      getSchedules: () => Promise.reject(new Error('unreachable')),
+      getServices: () => Promise.reject(new Error('unreachable')),
+      postDeviceStatus: () => Promise.reject(new Error('unreachable')),
+      postSettings: () => Promise.reject(new Error('unreachable')),
+    };
+    const { api, platform } = await simulateRestart(factory(client), baseConfig(), []);
+    expect(internals(platform).occupancySensors.size).toBe(0);
+
+    for (const accessory of api.registeredAccessories) {
+      expect(accessory.services.some((s) => s.UUID === api.hap.Service.OccupancySensor.UUID)).toBe(false);
+    }
+  });
+
+  it("occupancySource: 'presence' constructs exactly one occupancy sensor per side", async () => {
+    const client: MinimalPodClient = {
+      getDeviceStatus: () => Promise.reject(new Error('unreachable')),
+      getSettings: () => Promise.reject(new Error('unreachable')),
+      getSchedules: () => Promise.reject(new Error('unreachable')),
+      getServices: () => Promise.reject(new Error('unreachable')),
+      postDeviceStatus: () => Promise.reject(new Error('unreachable')),
+      postSettings: () => Promise.reject(new Error('unreachable')),
+    };
+    const { api, platform } = await simulateRestart(factory(client), baseConfig({ occupancySource: 'presence' }), []);
+    expect(internals(platform).occupancySensors.size).toBe(2);
+
+    const left = api.registeredAccessories.find((a) => a.displayName === 'Pod Left')!;
+    expect(left.getServiceById(api.hap.Service.OccupancySensor, OCCUPANCY_SUBTYPE)).toBeDefined();
+  });
+
+  it("restarting from 'none' to 'presence' adds the occupancy sensor without duplicating the thermostat", async () => {
+    const client = (): MinimalPodClient => ({
+      getDeviceStatus: () => Promise.reject(new Error('unreachable')),
+      getSettings: () => Promise.reject(new Error('unreachable')),
+      getSchedules: () => Promise.reject(new Error('unreachable')),
+      getServices: () => Promise.reject(new Error('unreachable')),
+      postDeviceStatus: () => Promise.reject(new Error('unreachable')),
+      postSettings: () => Promise.reject(new Error('unreachable')),
+    });
+    const first = await simulateRestart(factory(client()), baseConfig(), []);
+    const previous = first.api.registeredAccessories;
+
+    const second = await simulateRestart(factory(client()), baseConfig({ occupancySource: 'presence' }), previous);
+    expect(second.api.registerPlatformAccessoriesCalls).toHaveLength(0); // no new accessory
+    expect(second.api.unregisterPlatformAccessoriesCalls).toHaveLength(0);
+
+    const left = previous.find((a) => a.displayName === 'Pod Left')!;
+    const hap = second.api.hap;
+    expect(left.getServiceById(hap.Service.Thermostat, THERMOSTAT_SUBTYPE)).toBeDefined();
+    expect(left.getServiceById(hap.Service.OccupancySensor, OCCUPANCY_SUBTYPE)).toBeDefined();
+    expect(left.services.filter((s) => s.UUID === hap.Service.Thermostat.UUID)).toHaveLength(1);
+  });
+
+  it("restarting from 'presence' to 'none' prunes the occupancy sensor, leaving the thermostat untouched", async () => {
+    const client = (): MinimalPodClient => ({
+      getDeviceStatus: () => Promise.reject(new Error('unreachable')),
+      getSettings: () => Promise.reject(new Error('unreachable')),
+      getSchedules: () => Promise.reject(new Error('unreachable')),
+      getServices: () => Promise.reject(new Error('unreachable')),
+      postDeviceStatus: () => Promise.reject(new Error('unreachable')),
+      postSettings: () => Promise.reject(new Error('unreachable')),
+    });
+    const first = await simulateRestart(factory(client()), baseConfig({ occupancySource: 'presence' }), []);
+    const previous = first.api.registeredAccessories;
+    const hap = first.api.hap;
+    expect(previous.find((a) => a.displayName === 'Pod Left')!.getServiceById(hap.Service.OccupancySensor, OCCUPANCY_SUBTYPE)).toBeDefined();
+
+    const second = await simulateRestart(factory(client()), baseConfig({ occupancySource: 'none' }), previous);
+    expect(internals(second.platform).occupancySensors.size).toBe(0);
+
+    const left = previous.find((a) => a.displayName === 'Pod Left')!;
+    expect(left.getServiceById(hap.Service.OccupancySensor, OCCUPANCY_SUBTYPE)).toBeUndefined();
+    expect(left.getServiceById(hap.Service.Thermostat, THERMOSTAT_SUBTYPE)).toBeDefined();
+  });
+
+  it("switching between two non-'none' sources reuses the same occupancy service — no prune/re-add churn", async () => {
+    const client = (): MinimalPodClient => ({
+      getDeviceStatus: () => Promise.reject(new Error('unreachable')),
+      getSettings: () => Promise.reject(new Error('unreachable')),
+      getSchedules: () => Promise.reject(new Error('unreachable')),
+      getServices: () => Promise.reject(new Error('unreachable')),
+      postDeviceStatus: () => Promise.reject(new Error('unreachable')),
+      postSettings: () => Promise.reject(new Error('unreachable')),
+    });
+    const first = await simulateRestart(factory(client()), baseConfig({ occupancySource: 'presence' }), []);
+    const previous = first.api.registeredAccessories;
+    const hap = first.api.hap;
+    const left = previous.find((a) => a.displayName === 'Pod Left')!;
+    const originalService = left.getServiceById(hap.Service.OccupancySensor, OCCUPANCY_SUBTYPE)!;
+
+    const second = await simulateRestart(factory(client()), baseConfig({ occupancySource: 'vitals' }), previous);
+    void second;
+
+    expect(left.services.filter((s) => s.UUID === hap.Service.OccupancySensor.UUID)).toHaveLength(1);
+    expect(left.getServiceById(hap.Service.OccupancySensor, OCCUPANCY_SUBTYPE)).toBe(originalService);
+  });
+});
+
+describe('occupancy snapshot-change routing (tasks.md 8.3)', () => {
+  it("a left-side vitalsOccupied change reaches only the left occupancy sensor", async () => {
+    const client: MinimalPodClient = {
+      getDeviceStatus: () => Promise.reject(new Error('unreachable')),
+      getSettings: () => Promise.reject(new Error('unreachable')),
+      getSchedules: () => Promise.reject(new Error('unreachable')),
+      getServices: () => Promise.reject(new Error('unreachable')),
+      postDeviceStatus: () => Promise.reject(new Error('unreachable')),
+      postSettings: () => Promise.reject(new Error('unreachable')),
+    };
+    const { platform } = await simulateRestart(factory(client), baseConfig({ occupancySource: 'vitals' }), []);
+    const left = internals(platform).occupancySensors.get('left')!;
+    const right = internals(platform).occupancySensors.get('right')!;
+    const thermostatLeft = internals(platform).thermostats.get('left')!;
+    const leftSpy = vi.spyOn(left, 'refresh');
+    const rightSpy = vi.spyOn(right, 'refresh');
+    const thermostatSpy = vi.spyOn(thermostatLeft, 'refresh');
+
+    internals(platform).handleSnapshotChanges([
+      { scope: 'side', field: 'vitalsOccupied', side: 'left', previous: false, current: true },
+    ]);
+
+    expect(leftSpy).toHaveBeenCalledTimes(1);
+    expect(rightSpy).not.toHaveBeenCalled();
+    expect(thermostatSpy).not.toHaveBeenCalled();
+  });
+
+  it('an occupancy change is ignored, without error, when occupancySource is none', async () => {
+    const client: MinimalPodClient = {
+      getDeviceStatus: () => Promise.reject(new Error('unreachable')),
+      getSettings: () => Promise.reject(new Error('unreachable')),
+      getSchedules: () => Promise.reject(new Error('unreachable')),
+      getServices: () => Promise.reject(new Error('unreachable')),
+      postDeviceStatus: () => Promise.reject(new Error('unreachable')),
+      postSettings: () => Promise.reject(new Error('unreachable')),
+    };
+    const { platform } = await simulateRestart(factory(client), baseConfig(), []);
+    expect(internals(platform).occupancySensors.size).toBe(0);
+
+    expect(() =>
+      internals(platform).handleSnapshotChanges([
+        { scope: 'side', field: 'presencePresent', side: 'left', previous: undefined, current: true },
+      ]),
+    ).not.toThrow();
+  });
+});
+
+describe('occupancySource flows through to the poller (tasks.md 8.4)', () => {
+  it("occupancySource: 'presence' with biometrics enabled polls GET /api/metrics/presence; 'none' never does", async () => {
+    vi.useFakeTimers();
+    const podPresence = await startMockPod();
+    const podNone = await startMockPod();
+    try {
+      const timersPresence = createTimerHarness();
+      timersPresence.random = () => 0.5;
+      await simulateRestart(
+        factory(clientFor(podPresence), timersPresence),
+        baseConfig({ occupancySource: 'presence' }),
+        [],
+      );
+      // One presence-poll interval (30s, fixed per design.md) past bootstrap plus the slow-tier
+      // interval that lets `services` observe biometrics.enabled first (default 300s) would be
+      // needlessly slow for a unit test — narrow both to the minimum this schema allows so the
+      // whole sequence (services observes -> presence's `enabled` flips true -> presence polls)
+      // completes well inside a normal test timeout.
+      await advanceFakeTime(35_000, 100);
+      const presenceRequests = podPresence.requests.filter((r) => r.path === '/api/metrics/presence');
+      expect(presenceRequests.length).toBeGreaterThan(0);
+
+      const timersNone = createTimerHarness();
+      timersNone.random = () => 0.5;
+      await simulateRestart(factory(clientFor(podNone), timersNone), baseConfig(), []);
+      await advanceFakeTime(35_000, 100);
+      expect(podNone.requests.filter((r) => r.path === '/api/metrics/presence')).toHaveLength(0);
+    } finally {
+      vi.useRealTimers();
+      await podPresence.close();
+      await podNone.close();
+    }
+  }, 15_000);
 });

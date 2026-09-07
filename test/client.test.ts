@@ -459,6 +459,114 @@ describe('pre-flight rejection of isOn + secondsRemaining (6.9)', () => {
   });
 });
 
+describe('presence and vitals reads (occupancy change, #19, tasks.md 3.1/3.2)', () => {
+  it('getPresence resolves with the seeded fixture', async () => {
+    const pod = await start();
+    const client = clientFor(pod);
+    expect(await client.getPresence()).toEqual(loadFixture('metricsPresence.json'));
+  });
+
+  it('getVitals with no filters returns rows for both sides and sends no query string', async () => {
+    const pod = await start();
+    const client = clientFor(pod);
+    const result = await client.getVitals();
+    expect(result).toEqual(loadFixture('metricsVitals.json'));
+  });
+
+  it('getVitals sends exactly the given filters as query params, omitting the rest', async () => {
+    // `RecordedRequest.path` is the routing pathname only, with no query string (mockPod.ts) —
+    // so the actual URL each call reached the transport with is captured directly off `fetch`
+    // instead, the same technique the per-endpoint-serialisation tests above already use.
+    const pod = await start();
+    const client = clientFor(pod);
+    const urls: string[] = [];
+    const realFetch = globalThis.fetch;
+    globalThis.fetch = ((...args: Parameters<typeof fetch>) => {
+      urls.push(String(args[0]));
+      return realFetch(...args);
+    }) as typeof fetch;
+
+    try {
+      await client.getVitals({ side: 'left' });
+      await client.getVitals({ startTime: '2026-09-06T00:00:00Z', endTime: '2026-09-06T23:59:59Z' });
+      await client.getVitals({ side: 'right', startTime: '2026-09-06T00:00:00Z', endTime: '2026-09-06T23:59:59Z' });
+      await client.getVitals();
+    } finally {
+      globalThis.fetch = realFetch;
+    }
+
+    const searches = urls.map((u) => new URL(u).search);
+
+    expect(new URLSearchParams(searches[0]).get('side')).toBe('left');
+    expect(new URLSearchParams(searches[0]).has('startTime')).toBe(false);
+
+    expect(new URLSearchParams(searches[1]).has('side')).toBe(false);
+    expect(new URLSearchParams(searches[1]).get('startTime')).toBe('2026-09-06T00:00:00Z');
+    expect(new URLSearchParams(searches[1]).get('endTime')).toBe('2026-09-06T23:59:59Z');
+
+    expect(new URLSearchParams(searches[2]).get('side')).toBe('right');
+    expect(new URLSearchParams(searches[2]).get('startTime')).toBe('2026-09-06T00:00:00Z');
+    expect(new URLSearchParams(searches[2]).get('endTime')).toBe('2026-09-06T23:59:59Z');
+
+    expect(searches[3]).toBe('');
+  });
+
+  it('the client offers no write to either endpoint', async () => {
+    const client = new (await import('../src/pod/client.js')).PodClient({ host: '127.0.0.1' });
+    expect((client as unknown as Record<string, unknown>).postPresence).toBeUndefined();
+    expect((client as unknown as Record<string, unknown>).postVitals).toBeUndefined();
+  });
+});
+
+// ---------------------------------------------------------------------------------------
+// B1 regression: the per-endpoint serialisation map must not grow with the query string
+// ---------------------------------------------------------------------------------------
+
+describe('B1: the serialisation chain map is keyed on path only, never the query string', () => {
+  /** Reaches into `PodClient`'s private `chains` map — the same "cast to a plain record" style
+   * already used above for `postPresence`/`postVitals` — because the leak this test guards
+   * against is only observable from inside that map, not from any public return value. */
+  function chainsSizeOf(client: PodClient): number {
+    const chains = (client as unknown as { chains: Map<string, unknown> }).chains;
+    return chains.size;
+  }
+
+  it('N sequential getVitals calls with an ever-advancing rolling window leave exactly one chains entry', async () => {
+    const pod = await start();
+    const client = clientFor(pod);
+
+    // Mirrors the poller's own vitals class: a fixed path, but a `startTime`/`endTime` query
+    // that advances on every call — before B1's fix, each distinct query string minted its own
+    // permanent `chains` entry (26 entries after 25 polls in the reviewer's reproduction; at a
+    // 60s vitals cadence that is ~525k leaked entries a year), because the map was keyed on the
+    // full `pathname` (query included) rather than the path alone.
+    for (let i = 0; i < 25; i++) {
+      const now = Date.parse('2026-09-06T00:00:00Z') + i * 60_000;
+      await client.getVitals({
+        startTime: new Date(now - 180_000).toISOString(),
+        endTime: new Date(now).toISOString(),
+      });
+    }
+
+    expect(chainsSizeOf(client)).toBe(1);
+  });
+
+  it('a GET and a POST to different paths still get their own independent chain entries', async () => {
+    const pod = await start();
+    const client = clientFor(pod);
+
+    await client.getDeviceStatus();
+    await client.getVitals({ side: 'left' });
+    await client.getVitals({ side: 'right' }); // same path, different query — still one entry
+    await client.postDeviceStatus({ left: { isOn: true } });
+
+    // 3 distinct `${method} ${path}` pairs: `GET /api/deviceStatus`, `GET /api/metrics/vitals`,
+    // `POST /api/deviceStatus` — not 4, which is what the pre-fix, query-inclusive key would
+    // have produced for the two differently-queried `getVitals` calls.
+    expect(chainsSizeOf(client)).toBe(3);
+  });
+});
+
 describe('no credentials ever sent (6.10)', () => {
   it('no client method sends an authorization or cookie header, or userinfo in the URL', async () => {
     const pod = await start();

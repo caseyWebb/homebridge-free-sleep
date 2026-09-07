@@ -6,9 +6,11 @@ import { describe, expect, it } from 'vitest';
 import { loadFixture } from './loadFixture.js';
 import {
   DeviceStatusSchema,
+  PresenceSchema,
   SchedulesSchema,
   ServicesSchema,
   SettingsSchema,
+  VitalsResponseSchema,
 } from '../src/pod/types.js';
 
 interface ReadSchema {
@@ -32,6 +34,8 @@ function schemaFor(name: string): ReadSchema {
   if (name === 'settings.json') return SettingsSchema;
   if (name === 'schedules.json') return SchedulesSchema;
   if (name === 'services.json') return ServicesSchema;
+  if (name === 'metricsPresence.json') return PresenceSchema;
+  if (name === 'metricsVitals.json') return VitalsResponseSchema;
   throw new Error(
     `test/fixtures/${name} has no schema mapping in fixtures.test.ts's schemaFor() — add one ` +
       "there before this fixture can be trusted to parse against its intended read schema.",

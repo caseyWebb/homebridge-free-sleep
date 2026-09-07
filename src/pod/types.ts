@@ -7,7 +7,7 @@
  * runtime zod rather than hand-written `interface`s, and for the read-vs-request leniency
  * rule applied throughout this file.
  *
- * Four blocks, one per upstream source file:
+ * Six blocks, one per upstream source file:
  *
  *   | Block         | Upstream source                                                |
  *   |---------------|-----------------------------------------------------------------|
@@ -15,6 +15,8 @@
  *   | settings      | server/src/db/settingsSchema.ts                                  |
  *   | schedules     | server/src/db/schedulesSchema.ts                                 |
  *   | services      | server/src/db/servicesSchema.ts                                  |
+ *   | presence      | server/src/routes/metrics/presence.ts (occupancy change, #19)    |
+ *   | vitals        | server/src/routes/metrics/vitals.ts, prisma/schema.prisma (#19)  |
  *
  * `services` also transitively needs the per-job status shape from
  * server/src/routes/serverStatus/serverStatusSchema.ts (`StatusInfoSchema`); that shape is
@@ -468,6 +470,62 @@ export const ServicesSchema = z.object({
 });
 
 export type Services = z.infer<typeof ServicesSchema>;
+
+// ---------------------------------------------------------------------------------------
+// presence — server/src/routes/metrics/presence.ts
+// (occupancy change, #19: see openspec/changes/occupancy/design.md's "Context" for the
+// in-memory, reset-on-restart backing store this schema's leniency mirrors)
+// ---------------------------------------------------------------------------------------
+
+/**
+ * Read shape: lenient, matching upstream's own `PresenceSideSchema` exactly — both
+ * `lastUpdatedAt` and (below) each side itself are already optional in upstream's schema, not
+ * tightened here. `presenceData`'s module-level default is `{ present: false, lastUpdatedAt:
+ * <process start time> }`, a wholly valid response that carries no information about whether a
+ * real transition has ever occurred — this schema does not (and cannot) distinguish that case;
+ * see `SnapshotStore.observePresence`'s proof-of-life bookkeeping for how that distinction is
+ * made above this layer.
+ */
+export const PresenceSideSchema = z.object({
+  present: z.boolean(),
+  lastUpdatedAt: z.string().optional(),
+});
+
+export const PresenceSchema = z.object({
+  left: PresenceSideSchema.optional(),
+  right: PresenceSideSchema.optional(),
+});
+
+export type PresenceSide = z.infer<typeof PresenceSideSchema>;
+export type PresenceData = z.infer<typeof PresenceSchema>;
+
+// ---------------------------------------------------------------------------------------
+// vitals — server/src/routes/metrics/vitals.ts, prisma/schema.prisma's `model vitals`
+// (occupancy change, #19)
+// ---------------------------------------------------------------------------------------
+
+/**
+ * Read shape: lenient, deliberately without upstream's write-side `vitalsRecordSchema` bounds
+ * (`heart_rate` 30-90, `hrv` 0-200, `breathing_rate` 5-30) — `GET /vitals` never re-validates
+ * against that schema before responding, and a real capture already contains `hrv: 0`/
+ * `breathing_rate: 0`, both outside those bounds (design.md's Context). `side` is a plain
+ * string, not `SideSchema`, mirroring the database column's own plain-`String` type rather than
+ * this client's narrower `'left' | 'right'` enum. Field names are preserved exactly as the wire
+ * reports them (`heart_rate`, not `heartRate`) — vendored, not restyled.
+ */
+export const VitalsRecordSchema = z.object({
+  id: z.number(),
+  side: z.string(),
+  timestamp: z.string(),
+  heart_rate: z.number().nullable(),
+  hrv: z.number().nullable(),
+  breathing_rate: z.number().nullable(),
+});
+
+export const VitalsResponseSchema = z.array(VitalsRecordSchema);
+
+export type VitalsRecord = z.infer<typeof VitalsRecordSchema>;
+export type VitalsResponse = z.infer<typeof VitalsResponseSchema>;
 
 // ---------------------------------------------------------------------------------------
 // waterLevel interpretation
