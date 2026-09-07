@@ -2,7 +2,7 @@
   "pluginAlias": "FreeSleep",
   "pluginType": "platform",
   "singular": true,
-  "headerDisplay": "Exposes an Eight Sleep Pod running the free-sleep firmware to Apple HomeKit. `host` is the only field most installs need. `sides`, the poll/write timing overrides, the No Response delay, keep-alive, the occupancy source, the water-low sensor type, and the four hub-service toggles (prime, LED, test alarm, server fault) are live; the remaining fields are reserved for a future release and have no effect yet.",
+  "headerDisplay": "Exposes an Eight Sleep Pod running the free-sleep firmware to Apple HomeKit. `host` is the only field most installs need. `sides`, the poll/write timing overrides, the No Response delay, keep-alive, the occupancy source, the water-low sensor type, alarm events, and the four hub-service toggles (prime, LED, test alarm, server fault) are live; the remaining fields are reserved for a future release and have no effect yet.",
   "schema": {
     "type": "object",
     "properties": {
@@ -164,6 +164,12 @@
         "type": "boolean",
         "default": false,
         "description": "Publishes a hub sensor reflecting the Pod's own self-reported subsystem health. Polled on the slow cadence, only while enabled — the endpoint is not free. Off by default."
+      },
+      "alarmEvents": {
+        "title": "Alarm events",
+        "type": "boolean",
+        "default": true,
+        "description": "Publishes a per-side alarm-press event and a Dismiss Alarm switch, and runs a scheduler that briefly polls the Pod faster around each predicted alarm so the short-lived vibration event is not missed. On by default — the extra polling only ever runs near an actually-enabled alarm and has no effect on an alarm-free Pod; turn off to opt out or to keep a soak profile's request volume frozen."
       }
     },
     "required": ["host"]

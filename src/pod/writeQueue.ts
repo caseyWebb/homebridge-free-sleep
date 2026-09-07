@@ -41,6 +41,13 @@
  * the write mutex for its entire async lifetime (see `pumpMutex` below) — so no separate
  * `runExclusive` call is needed to make the check atomic against another in-flight dispatch.
  *
+ * **Alarm-only exemption (`alarm-events` change, tech-lead resolution 1):** a reduced side patch
+ * whose only field is `isAlarmVibrating` bypasses `awayModeGuard.decide()` entirely — see
+ * `isAlarmOnlySidePatch`'s doc below. Upstream never away-scopes this field and never mirrors it
+ * either, so this exemption is parity, not a carve-out — without it, the Dismiss-Alarm switch
+ * (`src/services/alarm.ts`) would be silently non-functional under the `'block'` policy whenever
+ * either side is away, a real regression against issue #16's own "done when" bar.
+ *
  * **User-intent priority (`keep-alive`'s design.md, tech-lead resolution 5):** `submitSide`
  * takes an `origin` (`'user'` by default, `'keepAlive'` for `KeepAlive`'s re-arm writes),
  * tracked per field for the lane's currently-accumulating cycle. If that cycle's merged patch
@@ -237,6 +244,20 @@ function applyOriginPriority(patch: SidePatch, fieldOrigin: ReadonlyMap<string, 
 
 function isSideLane(lane: LaneId): lane is Side {
   return lane === 'left' || lane === 'right';
+}
+
+/**
+ * `alarm-events` (#16, tech-lead resolution 1): whether a reduced side patch's only field is
+ * `isAlarmVibrating` — upstream's own `updateSide` never consults `controlBothSides`/
+ * `updateLeft`/`updateRight` for this field at all; it always targets the addressed `side`
+ * unconditionally (`test/mockPod.ts`'s `updateSide`, mirroring `server/src/routes/deviceStatus/
+ * updateDeviceStatus.ts`). A patch whose only field is `isAlarmVibrating` therefore bypasses the
+ * away-mode guard entirely — never blocked, never mirrored — exactly matching that unconditional
+ * upstream behavior. Anything else in the patch keeps full guard semantics.
+ */
+function isAlarmOnlySidePatch(patch: SidePatch): boolean {
+  const keys = Object.keys(patch);
+  return keys.length === 1 && keys[0] === 'isAlarmVibrating';
 }
 
 function describeError(error: unknown): string {
@@ -489,14 +510,21 @@ export class WriteQueue {
       this.logger.debug(`writeQueue: ${lane} submitted ${JSON.stringify(patch)}, dispatching ${JSON.stringify(sideReduced)}`);
       body = { [lane]: sideReduced };
 
-      // Away-mode guard consultation (see the module doc's "Away-mode guard" section): a
-      // synchronous decision, made and acted on before any request for this write is issued.
-      awayDecision = this.awayModeGuard.decide();
-      if (awayDecision === 'block') {
-        if (!this.stopped) this.clearOwnership(ownership);
-        this.liveOverlayBatches.delete(ownership);
-        waiters.forEach((w) => w.reject(new AwayModeBlockedError()));
-        return;
+      if (isAlarmOnlySidePatch(sideReduced)) {
+        // alarm-events (#16, tech-lead resolution 1): an alarm-only patch bypasses `decide()`
+        // entirely — see `isAlarmOnlySidePatch`'s doc. `awayDecision` stays `'plain'`, so the
+        // `'mirror'` branch below never fires for it either.
+        awayDecision = 'plain';
+      } else {
+        // Away-mode guard consultation (see the module doc's "Away-mode guard" section): a
+        // synchronous decision, made and acted on before any request for this write is issued.
+        awayDecision = this.awayModeGuard.decide();
+        if (awayDecision === 'block') {
+          if (!this.stopped) this.clearOwnership(ownership);
+          this.liveOverlayBatches.delete(ownership);
+          waiters.forEach((w) => w.reject(new AwayModeBlockedError()));
+          return;
+        }
       }
     } else if (lane === 'device') {
       // hub-accessory's widening: the device-wide lane now carries a bare `isPriming` field

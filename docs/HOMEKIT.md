@@ -237,6 +237,17 @@ routinely miss the entire alarm.**
 - **Scheduled fast-poll is mandatory**, not an optimisation. Compute upcoming alarm times per
   side from `/api/schedules` + `timeZone`, honour `expiresAt` skips, and poll at ~3 s for
   ±3 min around each. Without it the feature does not work.
+- **`alarmEvents` config flag, default `true`** (tech-lead resolution, `alarm-events` change):
+  unlike the hub's opt-in extras, both services and the fast-poll scheduler are on by default —
+  the extra polling load is bounded and only ever runs near an actually-enabled alarm, so it has
+  no effect on an alarm-free Pod. The flag exists for opt-out and for keeping a soak profile's
+  request volume frozen.
+- **The dismiss write bypasses the away-mode guard entirely** (`alarm-events` change,
+  tech-lead resolution 1): a `WriteQueue` patch whose only field is `isAlarmVibrating` is never
+  blocked and never mirrored, regardless of `awayModeWritePolicy` — upstream's own `updateSide`
+  never consults `controlBothSides` for this field either (`server/src/routes/deviceStatus/
+  updateDeviceStatus.ts`), so this is parity, not a carve-out. Without it, a user could not stop
+  a ringing alarm from HomeKit while either side was away under the `'block'` policy.
 
 ## Other service choices
 

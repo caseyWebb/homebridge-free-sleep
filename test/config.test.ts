@@ -604,6 +604,65 @@ describe('FreeSleepConfigSchema — waterLowSensorType is consumed, stays a two-
   });
 });
 
+// ---------------------------------------------------------------------------------------
+// alarm-events (#16, tech-lead resolution 2): alarmEvents and pollIntervals.alarmPollIntervalMs
+// (tasks.md 5.1, 8.1)
+// ---------------------------------------------------------------------------------------
+
+describe('FreeSleepConfigSchema — alarmEvents (alarm-events, tech-lead resolution 2)', () => {
+  it('defaults to true when omitted', () => {
+    const result = FreeSleepConfigSchema.safeParse({ host: 'pod.local' });
+    expect(result.success).toBe(true);
+    if (result.success) {
+      expect(result.data.alarmEvents).toBe(true);
+    }
+  });
+
+  it('rejects a non-boolean value, naming the key', () => {
+    const result = FreeSleepConfigSchema.safeParse({ host: 'pod.local', alarmEvents: 'yes' });
+    expect(result.success).toBe(false);
+    if (!result.success) {
+      expect(result.error.issues.some((issue) => issue.path.join('.') === 'alarmEvents')).toBe(true);
+    }
+  });
+
+  it('parses an explicit false unchanged', () => {
+    const result = FreeSleepConfigSchema.safeParse({ host: 'pod.local', alarmEvents: false });
+    expect(result.success).toBe(true);
+    if (result.success) {
+      expect(result.data.alarmEvents).toBe(false);
+    }
+  });
+});
+
+// pollIntervals.alarmPollIntervalMs's out-of-range/valid-value/module-floor cases are already
+// covered generically by the "pollIntervals" describe block above (it predates this change,
+// `alarmPollIntervalMs` having been reserved-but-validated since `poller-and-write-queue`). This
+// block adds the two scenarios specific to alarm-events consuming it: the schema itself supplies
+// no default (the runtime default of 3000 is applied downstream, in `src/platform.ts`, exactly
+// like every other pollIntervals override field — module doc in src/config.ts), and its minimum
+// is pinned exactly at 3000.
+describe('FreeSleepConfigSchema — pollIntervals.alarmPollIntervalMs is consumed (alarm-events, #16)', () => {
+  it('is undefined when omitted — the effective 3000ms default is applied where it is consumed, not by this schema', () => {
+    const result = FreeSleepConfigSchema.safeParse({ host: 'pod.local' });
+    expect(result.success).toBe(true);
+    if (result.success) {
+      expect(result.data.pollIntervals.alarmPollIntervalMs).toBeUndefined();
+    }
+  });
+
+  it('accepts exactly its 3000ms minimum, matching poller.ts\'s HARD_FLOOR_MS', () => {
+    const result = FreeSleepConfigSchema.safeParse({
+      host: 'pod.local',
+      pollIntervals: { alarmPollIntervalMs: 3000 },
+    });
+    expect(result.success).toBe(true);
+    if (result.success) {
+      expect(result.data.pollIntervals.alarmPollIntervalMs).toBe(3000);
+    }
+  });
+});
+
 describe('unrecognizedConfigKeys', () => {
   it('ignores Homebridge-injected keys and schema-defined keys', () => {
     expect(

@@ -848,6 +848,110 @@ describe('write queue: away-mode guard (9.6)', () => {
   });
 });
 
+// ---------------------------------------------------------------------------------------
+// alarm-events (#16, tech-lead resolution 1): an isAlarmVibrating-only patch bypasses the
+// away-mode guard entirely — never blocked, never mirrored — matching upstream's own
+// `updateSide`, which never consults `controlBothSides`/`updateLeft`/`updateRight` for this
+// field at all (test/mockPod.ts's `updateSide`, mirroring `updateDeviceStatus.ts`).
+// ---------------------------------------------------------------------------------------
+
+describe("write queue: away-mode guard — alarm-only bypass (alarm-events, tech-lead resolution 1)", () => {
+  it("dismiss under 'block' + away on -> the write lands, exactly one side", async () => {
+    const { queue, fake, snapshot } = setup({ awayModePolicy: 'block' });
+    snapshot.observeSettings({ ...structuredClone(settingsFixture), left: { ...settingsFixture.left, awayMode: true } });
+
+    const p = queue.submitSide('right', { isAlarmVibrating: false });
+    await vi.advanceTimersByTimeAsync(400);
+    await expect(p).resolves.toBeUndefined();
+
+    expect(fake.postDeviceStatusCalls).toEqual([{ right: { isAlarmVibrating: false } }]);
+    queue.stop();
+  });
+
+  it("dismiss under 'block' + both sides away -> still lands, exactly one side", async () => {
+    const { queue, fake, snapshot } = setup({ awayModePolicy: 'block' });
+    snapshot.observeSettings({
+      ...structuredClone(settingsFixture),
+      left: { ...settingsFixture.left, awayMode: true },
+      right: { ...settingsFixture.right, awayMode: true },
+    });
+
+    const p = queue.submitSide('left', { isAlarmVibrating: false });
+    await vi.advanceTimersByTimeAsync(400);
+    await expect(p).resolves.toBeUndefined();
+
+    expect(fake.postDeviceStatusCalls).toEqual([{ left: { isAlarmVibrating: false } }]);
+    queue.stop();
+  });
+
+  it("dismiss under 'mirror' + away on -> lands addressed only, never mirrored to the other side", async () => {
+    const { queue, fake, snapshot } = setup({ awayModePolicy: 'mirror' });
+    snapshot.observeSettings({ ...structuredClone(settingsFixture), left: { ...settingsFixture.left, awayMode: true } });
+
+    const p = queue.submitSide('right', { isAlarmVibrating: false });
+    await vi.advanceTimersByTimeAsync(400);
+    await p;
+
+    // Exactly one POST — the addressed side only. A mirrored policy would otherwise have
+    // produced a second POST to `left` (matching this file's own "the default policy ('mirror')
+    // dispatches the addressed side and mirrors..." test above, for a non-alarm field).
+    expect(fake.postDeviceStatusCalls).toEqual([{ right: { isAlarmVibrating: false } }]);
+    queue.stop();
+  });
+
+  it('with neither side away, the bypass is unobservable — dispatches exactly as submitted, same as the no-away-mode baseline', async () => {
+    const { queue, fake } = setup({ awayModePolicy: 'block' });
+    const p = queue.submitSide('left', { isAlarmVibrating: false });
+    await vi.advanceTimersByTimeAsync(400);
+    await expect(p).resolves.toBeUndefined();
+    expect(fake.postDeviceStatusCalls).toEqual([{ left: { isAlarmVibrating: false } }]);
+    queue.stop();
+  });
+
+  it('a patch carrying isAlarmVibrating alongside another field keeps full guard semantics — blocked under \'block\' + away', async () => {
+    const { queue, fake, snapshot } = setup({ awayModePolicy: 'block' });
+    snapshot.observeSettings({ ...structuredClone(settingsFixture), left: { ...settingsFixture.left, awayMode: true } });
+
+    const p = queue.submitSide('right', { isAlarmVibrating: false, targetTemperatureF: 70 });
+    p.catch(() => undefined);
+    await vi.advanceTimersByTimeAsync(400);
+    await expect(p).rejects.toBeInstanceOf(AwayModeBlockedError);
+    expect(fake.postDeviceStatusCalls).toHaveLength(0);
+    queue.stop();
+  });
+
+  it('a patch carrying isAlarmVibrating alongside another field keeps full guard semantics — mirrored under \'mirror\' + away', async () => {
+    const { queue, fake, snapshot } = setup({ awayModePolicy: 'mirror' });
+    snapshot.observeSettings({ ...structuredClone(settingsFixture), left: { ...settingsFixture.left, awayMode: true } });
+
+    const p = queue.submitSide('right', { isAlarmVibrating: false, targetTemperatureF: 70 });
+    await vi.advanceTimersByTimeAsync(400);
+    await p;
+
+    expect(fake.postDeviceStatusCalls).toEqual([
+      { right: { isAlarmVibrating: false, targetTemperatureF: 70 } },
+      // The mirror only ever carries the overlayable fields (targetTemperatureF, isOn,
+      // isAlarmVibrating are all overlayable — writeQueue.ts's `mirrorToOtherSide`), so both
+      // fields of this mixed patch are mirrored here, unlike the alarm-only bypass case above.
+      { left: { targetTemperatureF: 70, isAlarmVibrating: false } },
+    ]);
+    queue.stop();
+  });
+
+  it('every other side write\'s away-mode behavior is unchanged by this bypass — a plain temperature write is still mirrored', async () => {
+    const { queue, fake, snapshot } = setup();
+    snapshot.observeSettings({ ...structuredClone(settingsFixture), left: { ...settingsFixture.left, awayMode: true } });
+    const p = queue.submitSide('right', { targetTemperatureF: 68 });
+    await vi.advanceTimersByTimeAsync(400);
+    await p;
+    expect(fake.postDeviceStatusCalls).toEqual([
+      { right: { targetTemperatureF: 68 } },
+      { left: { targetTemperatureF: 68 } },
+    ]);
+    queue.stop();
+  });
+});
+
 describe('write queue: stop() (9.7)', () => {
   it('pending writes settle with a shutdown failure, the Pod receives nothing, owned overlays are removed, and no timer is left', async () => {
     const { queue, fake, snapshot, timers } = setup();

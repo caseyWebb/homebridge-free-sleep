@@ -158,6 +158,15 @@ export interface MockPod {
   requests: RecordedRequest[];
   commands: Command[];
   fault(endpoint: string, options: FaultOptions): void;
+  /**
+   * `alarm-events` (#16): fault-injection-style — mutates `state.deviceStatus[side]
+   * .isAlarmVibrating` directly, no HTTP round trip, no recorded command or request (design.md,
+   * "Mock Pod: one fault-injection-style addition, no scheduler of its own"). The mock has no
+   * `alarmScheduler.ts` equivalent of its own (this file's own module doc: "Deliberately
+   * implements no plugin policy"), so this is how a test simulates "the Pod's own scheduler just
+   * fired an alarm" — server-side state this plugin's own writes never produce.
+   */
+  setAlarmVibrating(side: Side, value: boolean): void;
   reset(): void;
   close(): Promise<void>;
 }
@@ -688,6 +697,10 @@ export async function startMockPod(options: StartMockPodOptions = {}): Promise<M
     });
   }
 
+  function setAlarmVibrating(side: Side, value: boolean): void {
+    state.deviceStatus[side].isAlarmVibrating = value;
+  }
+
   function reset(): void {
     const fresh = structuredClone(initialSnapshot);
     state.deviceStatus = fresh.deviceStatus;
@@ -712,5 +725,5 @@ export async function startMockPod(options: StartMockPodOptions = {}): Promise<M
     });
   }
 
-  return { url, state, requests, commands, fault, reset, close };
+  return { url, state, requests, commands, fault, setAlarmVibrating, reset, close };
 }

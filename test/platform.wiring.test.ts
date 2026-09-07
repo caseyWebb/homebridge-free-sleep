@@ -22,6 +22,7 @@ import {
   ServicesSchema,
   SettingsSchema,
   type DeviceStatus,
+  type Schedules,
   type Side,
 } from '../src/pod/types.js';
 import { THERMOSTAT_SUBTYPE, type ThermostatService } from '../src/services/thermostat.js';
@@ -32,12 +33,14 @@ import { LED_SUBTYPE } from '../src/services/led.js';
 import { TEST_ALARM_LEFT_SUBTYPE, TEST_ALARM_RIGHT_SUBTYPE } from '../src/services/testAlarm.js';
 import { SERVER_FAULT_SUBTYPE } from '../src/services/serverFault.js';
 import { OCCUPANCY_SUBTYPE, type OccupancySensorService } from '../src/services/occupancy.js';
+import { ALARM_DISMISS_SUBTYPE } from '../src/services/alarm.js';
 import { fToC } from '../src/pod/temperature.js';
 import {
   createFakeLogging,
   FakeHomebridgeApi,
   simulateRestart,
   type PlatformFactory,
+  type FakePlatformAccessory,
 } from './fakeHomebridgeApi.js';
 import { loadFixture } from './loadFixture.js';
 import { startMockPod, type MockPod } from './mockPod.js';
@@ -91,6 +94,8 @@ interface PlatformInternals {
   ledService: { refresh: () => void } | undefined;
   testAlarmServices: Map<Side, { stop: () => void }>;
   serverFaultService: { refresh: () => void } | undefined;
+  alarmServices: Map<Side, { handleChange: (change: Change) => void; stop: () => void }>;
+  alarmWindowScheduler: { stop: () => void } | undefined;
   handleSnapshotChanges: (changes: readonly Change[]) => void;
 }
 
@@ -1133,3 +1138,185 @@ describe('occupancySource flows through to the poller (tasks.md 8.4)', () => {
     }
   }, 15_000);
 });
+
+// ---------------------------------------------------------------------------------------
+// alarm-events (#16): platform wiring (tasks.md 7.1, 7.2, 7.5, 7.6, 8.2)
+// ---------------------------------------------------------------------------------------
+
+const WEEKDAY_NAMES = ['sunday', 'monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday'] as const;
+
+/** Clones the shared schedules fixture (every day power/alarm disabled by default) and enables
+ * exactly one eligible weekday/time on `left`, computed from `instantMs` in UTC (no calendar-day
+ * shift: `power.off: '20:00'`) — paired with a `settings.timeZone: 'UTC'` override so the derived
+ * instant equals `instantMs` directly, no offset arithmetic to reason about in the test. */
+function scheduleWithOneAlarmAt(instantMs: number): Schedules {
+  const d = new Date(instantMs);
+  const hh = String(d.getUTCHours()).padStart(2, '0');
+  const mm = String(d.getUTCMinutes()).padStart(2, '0');
+  const weekday = WEEKDAY_NAMES[d.getUTCDay()]!;
+
+  const schedules = structuredClone(fixtureSchedules);
+  schedules.left[weekday] = {
+    ...schedules.left[weekday],
+    power: { ...schedules.left[weekday].power, enabled: true, off: '20:00' },
+    alarm: { ...schedules.left[weekday].alarm, enabled: true, time: `${hh}:${mm}` },
+  };
+  return schedules;
+}
+
+describe('alarmPollIntervalMs threads from config into the constructed AlarmWindowScheduler (tasks.md 7.1, 8.2)', () => {
+  it('a custom alarmPollIntervalMs governs the deviceStatus poll cadence while a window is active, distinct from a default-configured platform', async () => {
+    vi.useFakeTimers();
+    // Aligned to a whole-minute boundary — schedules.alarm.time is HH:mm (minute granularity).
+    const nowMs = Math.ceil(Date.now() / 60_000) * 60_000;
+    vi.setSystemTime(nowMs);
+    const instantMs = nowMs + 90_000; // 1.5 min out — inside the default ±3 min margin
+    const schedules = scheduleWithOneAlarmAt(instantMs);
+
+    const podFast = await startMockPod({ state: { settings: { timeZone: 'UTC' }, schedules } });
+    const podSlow = await startMockPod({ state: { settings: { timeZone: 'UTC' }, schedules } });
+    try {
+      const timersFast = createTimerHarness();
+      timersFast.random = () => 0.5;
+      const timersSlow = createTimerHarness();
+      timersSlow.random = () => 0.5;
+
+      // Both platforms start with the identical armed window; only their configured
+      // alarmPollIntervalMs differs (9000 vs the schema's own 3000 default).
+      await simulateRestart(
+        factory(clientFor(podFast), timersFast),
+        baseConfig({ pollIntervals: { alarmPollIntervalMs: 9000 } }),
+        [],
+      );
+      await simulateRestart(factory(clientFor(podSlow), timersSlow), baseConfig(), []);
+
+      const countDeviceStatus = (pod: MockPod): number =>
+        pod.requests.filter((r) => r.method === 'GET' && r.path === '/api/deviceStatus').length;
+      const beforeFast = countDeviceStatus(podFast);
+      const beforeSlow = countDeviceStatus(podSlow);
+
+      // ~3 polls at a 9000ms cadence, ~9 at the 3000ms default, over the same 27s span.
+      await advanceFakeTime(27_000, 100);
+
+      const afterFast = countDeviceStatus(podFast) - beforeFast;
+      const afterSlow = countDeviceStatus(podSlow) - beforeSlow;
+
+      expect(afterFast).toBeGreaterThanOrEqual(2);
+      expect(afterFast).toBeLessThanOrEqual(4);
+      expect(afterFast).toBeLessThan(afterSlow);
+    } finally {
+      vi.useRealTimers();
+      await podFast.close();
+      await podSlow.close();
+    }
+  }, 15_000);
+});
+
+describe('shutdown stops the alarm-window scheduler (tasks.md 7.2)', () => {
+  it('leaves no pending timer beyond the fixed per-accessory overhead, even with a window currently armed', async () => {
+    vi.useFakeTimers();
+    try {
+      // `resolvedFakeClient()`, not a real `PodClient` against a mock Pod — this file's own
+      // `resolvedFakeClient` doc explains why: a real client's own un-cancelable
+      // `AbortSignal.timeout()` per-request timer never clears under `vi.useFakeTimers()`,
+      // which would make "no timer pending after shutdown" unprovable here regardless of this
+      // change's own correctness.
+      const nowMs = Math.ceil(Date.now() / 60_000) * 60_000;
+      vi.setSystemTime(nowMs);
+      const schedules = scheduleWithOneAlarmAt(nowMs + 60_000);
+      const client = resolvedFakeClient({
+        getSchedules: () => Promise.resolve(schedules),
+        getSettings: () => Promise.resolve({ ...structuredClone(fixtureSettings), timeZone: 'UTC' }),
+      });
+
+      const timers = createTimerHarness();
+      const api = new FakeHomebridgeApi();
+      const log = createFakeLogging();
+      const platform = new FreeSleepPlatform(log, baseConfig(), api.asApi(), client, timers);
+      await api.fireDidFinishLaunching();
+
+      const perAccessoryOverhead = api.registeredAccessories.length;
+      expect(timers.pendingCount()).toBeGreaterThan(perAccessoryOverhead);
+
+      await api.fireShutdown();
+      expect(timers.pendingCount()).toBe(perAccessoryOverhead);
+      void platform;
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});
+
+describe("a side's alarm-vibration change reaches only that side's AlarmService (tasks.md 7.5)", () => {
+  it('a left-side isAlarmVibrating change reaches only the left AlarmService', async () => {
+    const client: MinimalPodClient = resolvedFakeClient();
+    const { platform } = await simulateRestart(factory(client), baseConfig(), []);
+    const i = internals(platform);
+    const left = i.alarmServices.get('left')!;
+    const right = i.alarmServices.get('right')!;
+    const leftSpy = vi.spyOn(left, 'handleChange');
+    const rightSpy = vi.spyOn(right, 'handleChange');
+    const thermostatLeft = i.thermostats.get('left')!;
+    const thermostatSpy = vi.spyOn(thermostatLeft, 'refresh');
+
+    i.handleSnapshotChanges([{ scope: 'side', field: 'isAlarmVibrating', side: 'left', previous: false, current: true }]);
+
+    expect(leftSpy).toHaveBeenCalledTimes(1);
+    expect(rightSpy).not.toHaveBeenCalled();
+    expect(thermostatSpy).not.toHaveBeenCalled();
+  });
+
+  it('alarmEvents: false constructs no AlarmService for either side, and the change is ignored without error', async () => {
+    const client: MinimalPodClient = resolvedFakeClient();
+    const { platform } = await simulateRestart(factory(client), baseConfig({ alarmEvents: false }), []);
+    const i = internals(platform);
+    expect(i.alarmServices.size).toBe(0);
+    expect(i.alarmWindowScheduler).toBeUndefined();
+
+    expect(() =>
+      i.handleSnapshotChanges([{ scope: 'side', field: 'isAlarmVibrating', side: 'left', previous: false, current: true }]),
+    ).not.toThrow();
+  });
+});
+
+describe('shutdown clears each AlarmService\'s pending revert timer (tasks.md 7.6)', () => {
+  it('no pending timer remains after shutdown with an on-write\'s accept-then-revert timer outstanding', async () => {
+    vi.useFakeTimers();
+    try {
+      const timers = createTimerHarness();
+      const api = new FakeHomebridgeApi();
+      const log = createFakeLogging();
+      const client = resolvedFakeClient();
+      const platform = new FreeSleepPlatform(log, baseConfig(), api.asApi(), client, timers);
+      await api.fireDidFinishLaunching();
+      const perAccessoryOverhead = api.registeredAccessories.length;
+
+      // `resolvedFakeClient()` returns the real settings fixture, so new accessories are named
+      // from `settings.left.name`/`settings.right.name` ("Left"/"Right"), not the "Pod Left"/
+      // "Pod Right" fallback (mirrors this file's own "a blocked write's pending away-mode-
+      // revert timer..." test above).
+      const left = accessoryByName(api, 'Left');
+      const hap = api.hap;
+      const dismissSwitch = left.getServiceById(hap.Service.Switch, ALARM_DISMISS_SUBTYPE)!;
+      const onChar = dismissSwitch.getCharacteristic(hap.Characteristic.On);
+
+      const pending = onChar.handleSetRequest(true);
+      pending.catch(() => undefined);
+      await vi.advanceTimersByTimeAsync(0);
+
+      expect(timers.pendingCount()).toBeGreaterThan(perAccessoryOverhead);
+
+      await api.fireShutdown();
+      expect(timers.pendingCount()).toBe(perAccessoryOverhead);
+      void platform;
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});
+
+function accessoryByName(api: FakeHomebridgeApi, name: string): FakePlatformAccessory {
+  const accessory = api.registeredAccessories.find((a) => a.displayName === name);
+  if (!accessory) throw new Error(`no registered accessory named ${name}`);
+  return accessory;
+}
