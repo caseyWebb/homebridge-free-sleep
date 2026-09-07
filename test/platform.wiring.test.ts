@@ -7,6 +7,7 @@
  * guardrail).
  */
 import { Characteristic } from '@homebridge/hap-nodejs';
+import type { CharacteristicSetHandler } from '@homebridge/hap-nodejs';
 import { describe, expect, it, vi } from 'vitest';
 
 import type { API, Logging, PlatformConfig } from 'homebridge';
@@ -33,14 +34,12 @@ import { LED_SUBTYPE } from '../src/services/led.js';
 import { TEST_ALARM_LEFT_SUBTYPE, TEST_ALARM_RIGHT_SUBTYPE } from '../src/services/testAlarm.js';
 import { SERVER_FAULT_SUBTYPE } from '../src/services/serverFault.js';
 import { OCCUPANCY_SUBTYPE, type OccupancySensorService } from '../src/services/occupancy.js';
-import { ALARM_DISMISS_SUBTYPE } from '../src/services/alarm.js';
 import { fToC } from '../src/pod/temperature.js';
 import {
   createFakeLogging,
   FakeHomebridgeApi,
   simulateRestart,
   type PlatformFactory,
-  type FakePlatformAccessory,
 } from './fakeHomebridgeApi.js';
 import { loadFixture } from './loadFixture.js';
 import { startMockPod, type MockPod } from './mockPod.js';
@@ -1287,21 +1286,29 @@ describe('shutdown clears each AlarmService\'s pending revert timer (tasks.md 7.
       const api = new FakeHomebridgeApi();
       const log = createFakeLogging();
       const client = resolvedFakeClient();
+
+      // Captures every onSet handler registered while the platform constructs its services —
+      // the same capture-and-invoke-directly technique test/services/alarm.test.ts's own
+      // `build()` helper uses — so this test drives AlarmService's onSet handler exactly, with
+      // no dependency on hap-nodejs's own real `handleSetRequest` plumbing (whose own internal
+      // timer/microtask behavior is not this test's concern and is not guaranteed identical
+      // across environments).
+      const setHandlers = new Map<string, CharacteristicSetHandler>();
+      const setSpy = vi.spyOn(Characteristic.prototype, 'onSet').mockImplementation(function (
+        this: Characteristic,
+        handler: CharacteristicSetHandler,
+      ) {
+        setHandlers.set(this.UUID, handler);
+        return this;
+      });
       const platform = new FreeSleepPlatform(log, baseConfig(), api.asApi(), client, timers);
       await api.fireDidFinishLaunching();
+      setSpy.mockRestore();
       const perAccessoryOverhead = api.registeredAccessories.length;
 
-      // `resolvedFakeClient()` returns the real settings fixture, so new accessories are named
-      // from `settings.left.name`/`settings.right.name` ("Left"/"Right"), not the "Pod Left"/
-      // "Pod Right" fallback (mirrors this file's own "a blocked write's pending away-mode-
-      // revert timer..." test above).
-      const left = accessoryByName(api, 'Left');
-      const hap = api.hap;
-      const dismissSwitch = left.getServiceById(hap.Service.Switch, ALARM_DISMISS_SUBTYPE)!;
-      const onChar = dismissSwitch.getCharacteristic(hap.Characteristic.On);
-
-      const pending = onChar.handleSetRequest(true);
-      pending.catch(() => undefined);
+      const onSet = setHandlers.get(api.hap.Characteristic.On.UUID)!;
+      const pending = onSet(true, {} as never, undefined);
+      if (pending instanceof Promise) pending.catch(() => undefined);
       await vi.advanceTimersByTimeAsync(0);
 
       expect(timers.pendingCount()).toBeGreaterThan(perAccessoryOverhead);
@@ -1314,9 +1321,3 @@ describe('shutdown clears each AlarmService\'s pending revert timer (tasks.md 7.
     }
   });
 });
-
-function accessoryByName(api: FakeHomebridgeApi, name: string): FakePlatformAccessory {
-  const accessory = api.registeredAccessories.find((a) => a.displayName === name);
-  if (!accessory) throw new Error(`no registered accessory named ${name}`);
-  return accessory;
-}
