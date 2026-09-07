@@ -38,7 +38,10 @@ export const CONFIGURED_NAME = {
 /** The hub carries one `TestAlarmService` per side, both on the same accessory — the only pair
  * of services in the plugin where the tech lead's short "Test Alarm" example would collide with
  * itself, so each side's label keeps the `Left`/`Right` suffix the pre-existing `Name`
- * convention already uses (`TEST_ALARM_NAMES` in `./testAlarm.ts`) purely for that reason. */
+ * convention already uses (`TEST_ALARM_NAMES` in `./testAlarm.ts`, itself now defined in terms of
+ * this constant rather than duplicating the literals — see that module's own doc) purely for that
+ * reason. Defined here, not there: `./testAlarm.ts` already imports from this module for
+ * `seedConfiguredName`, so this stays the one direction of dependency between the two files. */
 export const TEST_ALARM_CONFIGURED_NAME: Readonly<Record<Side, string>> = {
   left: 'Test Alarm Left',
   right: 'Test Alarm Right',

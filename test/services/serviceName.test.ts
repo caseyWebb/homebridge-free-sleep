@@ -37,14 +37,18 @@ describe('CONFIGURED_NAME label convention (1.1)', () => {
   it('a display name containing special characters does not leak into any seed label (labels are fixed strings, not templated)', () => {
     // Unlike the pre-#49 `Name` convention some services used (`${accessory.displayName} X`),
     // ConfiguredName seeds are fixed, accessory-independent strings (tech-lead resolution) — so
-    // an accessory renamed to something containing special characters cannot affect any label
-    // this module exports. Representative renamed display names, none of which this module ever
-    // reads.
+    // an accessory renamed to something containing special characters cannot affect the seeded
+    // label. Actually constructs an accessory under each representative weird display name and
+    // seeds a service on it, rather than merely asserting the unrelated fact that `CONFIGURED_NAME`
+    // itself contains no template syntax.
+    const hap = realHap();
     const weirdNames = ['Caséy’s "Side" 🌙', "O'Brien / Left"];
     for (const name of weirdNames) {
-      void name; // documents the case; nothing in CONFIGURED_NAME is derived from a display name
+      const accessory = new Accessory(name, hap.uuid.generate(name));
+      const service = accessory.addService(new hap.Service.Switch('Away Mode Left', 'awayMode'));
+      seedConfiguredName(service, hap, CONFIGURED_NAME.awayMode);
+      expect(service.getCharacteristic(Characteristic.ConfiguredName).value).toBe('Away Mode');
     }
-    expect(CONFIGURED_NAME.awayMode).toBe('Away Mode');
   });
 });
 

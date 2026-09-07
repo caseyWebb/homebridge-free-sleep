@@ -2,10 +2,23 @@
  * Whole-platform `ConfiguredName` coverage (release-polish tasks.md, Section 3) — the two things
  * no single service's own unit test can prove on its own:
  *
- *  - 3.1: constructing the full platform against a pre-#49 cached-accessory set (services
- *    present, no `ConfiguredName` on any of them — the exact shape a real upgrade restores from,
- *    design.md's Migration Plan) seeds every service's `ConfiguredName` to its Decision-3 default,
- *    with zero `characteristic-warning` events anywhere across the whole construction.
+ *  - 3.1: two complementary constructions, both required because neither alone proves the
+ *    other's claim:
+ *      - A genuine first-ever launch (no cached accessories at all — every accessory is created
+ *        fresh via `api.platformAccessory`) seeds every service's `ConfiguredName` to its
+ *        Decision-3 default, with zero `characteristic-warning` events anywhere across the whole
+ *        construction. This covers a brand-new install, but a service's `getServiceById` finding
+ *        nothing and a service's `getServiceById` finding something-with-no-`ConfiguredName` are
+ *        different code paths, so this alone does not prove the upgrade case below.
+ *      - The task's own headline scenario: a pre-#49 cached-accessory upgrade — services present,
+ *        `ConfiguredName` on *none* of them, the exact shape design.md's Migration Plan describes
+ *        a real upgrade restoring from. Built via hap-nodejs's own real `Accessory.serialize` ->
+ *        strip `ConfiguredName` from both `characteristics` and `optionalCharacteristics` on every
+ *        service -> `Accessory.deserialize`, then fed through `configureAccessory` on a freshly
+ *        constructed platform — `simulateRestart`'s live-object reuse cannot represent a
+ *        characteristic's *absence*, only an unmodified live value, so this scenario needs the
+ *        real serialize/deserialize round trip instead. Also proves a rename made after this
+ *        upgrade survives the *next* restart, closing the loop with 3.2 below.
  *  - 3.2: a second restart — this time restoring accessories that already carry `ConfiguredName`,
  *    one of them at a controller-renamed value — never calls `setCharacteristic` on it again for
  *    any service: the tech-lead-required explicit "restore with a renamed value survives" case.
@@ -15,11 +28,11 @@
  * services this change touches are actually constructed and checked, not just the six that are
  * on by default.
  */
-import { Characteristic } from '@homebridge/hap-nodejs';
-import type { Service, WithUUID } from '@homebridge/hap-nodejs';
+import { Accessory, Characteristic } from '@homebridge/hap-nodejs';
+import type { SerializedAccessory, Service, WithUUID } from '@homebridge/hap-nodejs';
 import { describe, expect, it } from 'vitest';
 
-import type { API, Logging, PlatformConfig } from 'homebridge';
+import type { API, Logging, PlatformAccessory, PlatformConfig } from 'homebridge';
 
 import { FreeSleepPlatform, uuidFor, type MinimalPodClient } from '../../src/platform.js';
 import {
@@ -147,6 +160,50 @@ function trackingAccessoryClass(warnings: unknown[]) {
   };
 }
 
+/** Strips `ConfiguredName` from every service's `characteristics` *and* `optionalCharacteristics`
+ * in a `SerializedAccessory`. Both arrays matter: `Service.setCharacteristic` (what
+ * `seedConfiguredName` calls) resolves via `getCharacteristic`, which — for a characteristic
+ * found in `optionalCharacteristics` — calls `addCharacteristic`, and `addCharacteristic` only
+ * ever *pushes* onto `characteristics`; it never removes the original `optionalCharacteristics`
+ * entry. So a fully-seeded, already-`ConfiguredName`-carrying service serializes with the
+ * characteristic present in both arrays, and a faithful "as if #49 never ran" fixture has to
+ * strip both to avoid a stale `optionalCharacteristics` entry the real pre-#49 accessory never
+ * had. */
+function stripConfiguredName(json: SerializedAccessory): SerializedAccessory {
+  const configuredNameUuid = Characteristic.ConfiguredName.UUID;
+  return {
+    ...json,
+    services: json.services.map((service) => ({
+      ...service,
+      characteristics: service.characteristics.filter((c) => c.UUID !== configuredNameUuid),
+      // `exactOptionalPropertyTypes`: only assign the key at all when the source service had it,
+      // rather than ever setting it to `undefined` explicitly.
+      ...(service.optionalCharacteristics
+        ? { optionalCharacteristics: service.optionalCharacteristics.filter((c) => c.UUID !== configuredNameUuid) }
+        : {}),
+    })),
+  };
+}
+
+/** Round-trips `hapAccessory` through hap-nodejs's own real `Accessory.serialize`/`deserialize` —
+ * not `simulateRestart`'s live-object reuse, which cannot represent a characteristic's *absence*,
+ * only an unmodified live value — producing a fresh `Accessory` with every service intact but
+ * `ConfiguredName` present on none of them: the exact shape design.md's Migration Plan describes
+ * a pre-#49 cached-accessory restoring from. */
+function asPreConfiguredNameCachedAccessory(hapAccessory: Accessory): Accessory {
+  return Accessory.deserialize(stripConfiguredName(Accessory.serialize(hapAccessory)));
+}
+
+/** Attaches a `ConfiguredName`-filtered `characteristic-warning` listener directly to
+ * `accessory`'s underlying hap-nodejs `Accessory` — must be called before the accessory is fed
+ * through `configureAccessory`, since warnings fire synchronously during service construction
+ * inside `didFinishLaunching`, not queued for later. */
+function trackConfiguredNameWarnings(accessory: FakePlatformAccessory, warnings: unknown[]): void {
+  accessory._associatedHAPAccessory.on('characteristic-warning', (w: CharacteristicWarningEvent) => {
+    if (w.characteristic?.UUID === Characteristic.ConfiguredName.UUID) warnings.push(w);
+  });
+}
+
 describe('ConfiguredName across a full platform construction (release-polish tasks.md 3.1)', () => {
   it('a first-ever launch seeds every service on every accessory to its default label, with zero characteristic-warning events', async () => {
     const warnings: unknown[] = [];
@@ -174,10 +231,130 @@ describe('ConfiguredName across a full platform construction (release-polish tas
     }
 
     // Task 3.1's own "zero characteristic-warning events emitted across the whole platform
-    // construction" — includes ThermostatService's own unrelated Target Temperature warning
-    // (see test/services/configuredNameHelpers.ts's doc) were it to fire here too, since the
-    // fixture used across this whole suite keeps every value in range; asserted unfiltered.
+    // construction" — `warnings` here is already filtered to `ConfiguredName.UUID` by
+    // `trackingAccessoryClass` above, not asserted unfiltered. The shared `deviceStatus` fixture
+    // does *not* keep every value in range: `ThermostatService`'s own unrelated Target Temperature
+    // default-value warning (test/services/configuredNameHelpers.ts's doc) fires twice here, once
+    // per side, unfiltered — confirmed directly against this exact construction. It is excluded
+    // from `warnings` only because of the UUID filter above, not because it doesn't fire; tracked
+    // separately, not something this test is meant to catch.
     expect(warnings).toHaveLength(0);
+  });
+});
+
+describe('a pre-#49 cached-accessory upgrade seeds every service exactly once (release-polish tasks.md 3.1, the headline scenario)', () => {
+  it('restoring accessories that carry every service but no ConfiguredName characteristic at all seeds each to its default label, with zero characteristic-warning events — and a post-upgrade rename survives the next restart too', async () => {
+    // Step 1: a genuine first launch, to obtain real, fully-populated hap-nodejs `Accessory`
+    // instances for all three roles — every service constructed, every `ConfiguredName` seeded.
+    const seedApi = new FakeHomebridgeApi();
+    new FreeSleepPlatform(createFakeLogging(), baseConfig(), seedApi.asApi(), resolvingPodClient());
+    await seedApi.fireDidFinishLaunching();
+    expect(seedApi.registeredAccessories).toHaveLength(3);
+    const seedLeft = seedApi.registeredAccessories.find((a) => a.UUID === uuidFor(seedApi.hap, 'pod.local', 'left'))!;
+    const seedRight = seedApi.registeredAccessories.find((a) => a.UUID === uuidFor(seedApi.hap, 'pod.local', 'right'))!;
+    const seedHub = seedApi.registeredAccessories.find((a) => a.UUID === uuidFor(seedApi.hap, 'pod.local', 'hub'))!;
+
+    // Step 2: the real serialize -> strip ConfiguredName -> deserialize round trip — the exact
+    // pre-#49 cached-accessory shape design.md's Migration Plan describes.
+    const upgradeLeft = FakePlatformAccessory.fromHapAccessory(asPreConfiguredNameCachedAccessory(seedLeft._associatedHAPAccessory));
+    const upgradeRight = FakePlatformAccessory.fromHapAccessory(asPreConfiguredNameCachedAccessory(seedRight._associatedHAPAccessory));
+    const upgradeHub = FakePlatformAccessory.fromHapAccessory(asPreConfiguredNameCachedAccessory(seedHub._associatedHAPAccessory));
+
+    // Confirms the strip actually worked before it matters: every service the platform will
+    // restore into is present, but genuinely carries no ConfiguredName at all yet.
+    for (const [accessory, expectations] of [
+      [upgradeLeft, SIDE_SERVICES],
+      [upgradeRight, SIDE_SERVICES],
+      [upgradeHub, HUB_SERVICES],
+    ] as const) {
+      for (const expectation of expectations) {
+        const service = serviceFor(seedApi, accessory, expectation);
+        expect(service.testCharacteristic(Characteristic.ConfiguredName)).toBe(false);
+      }
+    }
+
+    // Step 3: feed the restored, characteristic-absent accessories through `configureAccessory`
+    // on a *freshly constructed* platform, then fire `didFinishLaunching` — real Homebridge's own
+    // restore order (`simulateRestart`'s own doc). A listener is attached to each accessory's
+    // underlying hap-nodejs `Accessory` before that, since warnings fire synchronously during
+    // service construction.
+    const upgradeWarnings: unknown[] = [];
+    for (const accessory of [upgradeLeft, upgradeRight, upgradeHub]) {
+      trackConfiguredNameWarnings(accessory, upgradeWarnings);
+    }
+    const upgradeApi = new FakeHomebridgeApi();
+    const upgradePlatform = new FreeSleepPlatform(createFakeLogging(), baseConfig(), upgradeApi.asApi(), resolvingPodClient());
+    for (const accessory of [upgradeLeft, upgradeRight, upgradeHub]) {
+      upgradePlatform.configureAccessory(accessory as unknown as PlatformAccessory);
+    }
+    await upgradeApi.fireDidFinishLaunching();
+
+    // All three matched an already-cached UUID, so none of them is ever "new" —
+    // `registerPlatformAccessories` is never called for a restored accessory.
+    expect(upgradeApi.registeredAccessories).toHaveLength(0);
+
+    for (const side of [upgradeLeft, upgradeRight]) {
+      for (const expectation of SIDE_SERVICES) {
+        const service = serviceFor(upgradeApi, side, expectation);
+        expect(service.getCharacteristic(Characteristic.ConfiguredName).value).toBe(expectation.label);
+      }
+    }
+    for (const expectation of HUB_SERVICES) {
+      const service = serviceFor(upgradeApi, upgradeHub, expectation);
+      expect(service.getCharacteristic(Characteristic.ConfiguredName).value).toBe(expectation.label);
+    }
+    // Every service seeded exactly once: each landed on its Decision-3 default (not left
+    // uninitialized, not double-set to something else), and no `ConfiguredName`
+    // characteristic-warning fired anywhere during this restore.
+    expect(upgradeWarnings).toHaveLength(0);
+
+    // Step 4: a rename made post-upgrade survives the *next* restart too — the same real
+    // serialize/deserialize round trip, this time carrying the now-present `ConfiguredName`
+    // through untouched (closing the loop with 3.2 below, but via the real round trip rather
+    // than live-object reuse).
+    const renamedThermostat = serviceFor(upgradeApi, upgradeLeft, SIDE_SERVICES[0]!);
+    renamedThermostat.getCharacteristic(Characteristic.ConfiguredName).updateValue('Bedroom Thermostat');
+
+    const nextLeft = FakePlatformAccessory.fromHapAccessory(
+      Accessory.deserialize(Accessory.serialize(upgradeLeft._associatedHAPAccessory)),
+    );
+    const nextRight = FakePlatformAccessory.fromHapAccessory(
+      Accessory.deserialize(Accessory.serialize(upgradeRight._associatedHAPAccessory)),
+    );
+    const nextHub = FakePlatformAccessory.fromHapAccessory(
+      Accessory.deserialize(Accessory.serialize(upgradeHub._associatedHAPAccessory)),
+    );
+
+    const nextWarnings: unknown[] = [];
+    for (const accessory of [nextLeft, nextRight, nextHub]) {
+      trackConfiguredNameWarnings(accessory, nextWarnings);
+    }
+    const nextApi = new FakeHomebridgeApi();
+    const nextPlatform = new FreeSleepPlatform(createFakeLogging(), baseConfig(), nextApi.asApi(), resolvingPodClient());
+    for (const accessory of [nextLeft, nextRight, nextHub]) {
+      nextPlatform.configureAccessory(accessory as unknown as PlatformAccessory);
+    }
+    await nextApi.fireDidFinishLaunching();
+
+    expect(serviceFor(nextApi, nextLeft, SIDE_SERVICES[0]!).getCharacteristic(Characteristic.ConfiguredName).value).toBe(
+      'Bedroom Thermostat',
+    );
+    for (const expectation of SIDE_SERVICES.slice(1)) {
+      expect(serviceFor(nextApi, nextLeft, expectation).getCharacteristic(Characteristic.ConfiguredName).value).toBe(
+        expectation.label,
+      );
+    }
+    for (const expectation of SIDE_SERVICES) {
+      expect(serviceFor(nextApi, nextRight, expectation).getCharacteristic(Characteristic.ConfiguredName).value).toBe(
+        expectation.label,
+      );
+    }
+    for (const expectation of HUB_SERVICES) {
+      expect(serviceFor(nextApi, nextHub, expectation).getCharacteristic(Characteristic.ConfiguredName).value).toBe(
+        expectation.label,
+      );
+    }
+    expect(nextWarnings).toHaveLength(0);
   });
 });
 
@@ -217,11 +394,16 @@ describe('a restore-with-renamed-value survives a second restart (release-polish
     const { api: secondApi } = await simulateRestart(factoryWithPodClient(resolvingPodClient()), baseConfig(), previous);
     void secondApi;
 
+    // The core of task 3.2, and the one assertion in this test a regression would actually fail:
+    // both mutated values from immediately above are still exactly what the rename left them at,
+    // not reverted to their Decision-3 default by the second restart's own construction.
     expect(renamedThermostat.getCharacteristic(Characteristic.ConfiguredName).value).toBe('Bedroom Thermostat');
     expect(renamedConnection.getCharacteristic(Characteristic.ConfiguredName).value).toBe('Upstairs Pod');
 
     // Every other (non-renamed) service on both restored accessories still reports its original
-    // seeded default — the second restart touched none of them either.
+    // seeded default — the second restart touched none of them either, mutation-confirmed the
+    // same way as the two renamed services above (not merely inferred from an absence of
+    // warnings).
     const right = previous.find((a) => a.UUID === uuidFor(firstApi.hap, 'pod.local', 'right'))!;
     for (const expectation of SIDE_SERVICES.slice(1)) {
       expect(serviceFor(firstApi, left, expectation).getCharacteristic(Characteristic.ConfiguredName).value).toBe(
@@ -239,8 +421,8 @@ describe('a restore-with-renamed-value survives a second restart (release-polish
       );
     }
 
-    // The core of task 3.2: none of this — restoring, re-checking every already-present
-    // ConfiguredName, including the two renamed ones — ever calls setCharacteristic on it again.
+    // A supporting signal, not the proof itself (see the value assertions above for that): no
+    // ConfiguredName characteristic-warning fired during the second restart either.
     expect(secondWarnings).toHaveLength(0);
   });
 });

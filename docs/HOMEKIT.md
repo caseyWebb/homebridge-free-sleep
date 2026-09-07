@@ -467,6 +467,12 @@ these labels and the seeding helper (`seedConfiguredName`) live in; each service
 from its own constructor, matching how `setProps` is already handled per-service rather than
 centrally.
 
+`Name` and `ConfiguredName` now genuinely diverge on the hub's own services (e.g. `POD_LED_NAME`
+"Pod LED" vs. `ConfiguredName`'s "LED"; `POD_WATER_LOW_NAME` "Pod Water Low" vs. "Water Level") —
+intentional, not a leftover duplication to reconcile: iOS ≥16 reads `ConfiguredName` for the tile
+label (the problem this section opened with), while Eve and other HAP controllers that predate
+`ConfiguredName` still read `Name`, so both characteristics keep a real, distinct audience.
+
 **Migration.** Adding `ConfiguredName` to every service bumps the HAP configuration number on
 the very next update to an already-paired install — expected, one-time, and self-healing: every
 already-paired controller picks up "accessory database changed, re-fetch it" the same way it

@@ -48,10 +48,14 @@ export const TEST_ALARM_SUBTYPES: Readonly<Record<Side, string>> = {
   right: TEST_ALARM_RIGHT_SUBTYPE,
 };
 
-const TEST_ALARM_NAMES: Readonly<Record<Side, string>> = {
-  left: 'Test Alarm Left',
-  right: 'Test Alarm Right',
-};
+/** The pre-existing `Name` convention for these two switches (design.md's own note: the
+ * `ConfiguredName` default for this pair is "already fully-formed", i.e. identical to this).
+ * Defined in terms of the already-imported `TEST_ALARM_CONFIGURED_NAME` rather than duplicating
+ * its literal strings — this module already depends on `./serviceName.ts` for
+ * `seedConfiguredName`, so aliasing here (rather than having `serviceName.ts` import back from
+ * this module) keeps that a one-directional dependency instead of a module cycle. Exported for
+ * any caller that wants the `Name`-convention value specifically. */
+export const TEST_ALARM_NAMES: Readonly<Record<Side, string>> = TEST_ALARM_CONFIGURED_NAME;
 
 /** Issue #20's own "self-reset after ~1s" (design.md's Decision 6). */
 const RESET_DELAY_MS = 1000;

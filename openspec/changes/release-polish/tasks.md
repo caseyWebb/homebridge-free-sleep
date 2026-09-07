@@ -1,12 +1,19 @@
 ## 1. Shared naming convention (#49)
 
-- [x] 1.1 Add `src/services/serviceName.ts` (or equivalent) documenting/exporting the Decision-3
-      label convention — a small helper (e.g. `sideServiceLabel(accessory, label)` returning
-      `` `${accessory.displayName} ${label}` ``) for side-accessory sub-services; hub sub-services
-      keep using their existing exported name constants directly. Verify: `npm run typecheck`
-      passes and a new `test/services/serviceName.test.ts` unit-tests the helper's output for a
-      couple of representative accessory display names (including one containing special
-      characters, to confirm no escaping/formatting surprises).
+- [x] 1.1 Add `src/services/serviceName.ts` exporting the label convention and the shared
+      `seedConfiguredName(service, hap, label)` helper (design.md, Decisions 1–2). Shipped shape
+      supersedes this task's original `` `${accessory.displayName} ${label}` `` plan — tech-lead
+      resolution 3 (design.md, "Resolutions") overrode Decision 3 mid-flight to short, standalone
+      labels with no accessory-name prefix: `CONFIGURED_NAME` is a plain `Record` of fixed strings
+      ("Thermostat", "Alarm", "Away Mode", …), used identically for every side and hub service —
+      there is no longer a side/hub distinction in how a label is produced, only in which constant
+      each service passes. `TEST_ALARM_CONFIGURED_NAME` is the one exception, keeping its
+      `Left`/`Right` suffix (the one pair sharing an accessory, so the short form alone would
+      collide). Verify: `npm run typecheck` passes and `test/services/serviceName.test.ts`
+      unit-tests every `CONFIGURED_NAME` value (short, standalone, no accessory-name prefix, no
+      template syntax — including a display name containing special characters, confirming no
+      leakage into a label) and `seedConfiguredName`'s seed-once/never-overwrite/no-warning
+      behavior directly against a real `Accessory`.
 
 ## 2. ConfiguredName seeding per service (#49)
 
@@ -23,22 +30,29 @@ second construction against the same (now-deserialized-with-a-different-value) s
 already-set `ConfiguredName` value unchanged, simulating a controller rename surviving a restart;
 (c) no `characteristic-warning` event fires on either construction.
 
-- [x] 2.1 `ThermostatService` (`src/services/thermostat.ts`) — label `` `${accessory.displayName}
-      Thermostat}` ``. Verify: `test/services/thermostat.test.ts` extended per the pattern above,
-      `npm test` passes.
+- [x] 2.1 `ThermostatService` (`src/services/thermostat.ts`) — label `CONFIGURED_NAME.thermostat`
+      ("Thermostat"; supersedes this task's original `` `${accessory.displayName} Thermostat}` ``
+      plan — see 1.1's note on tech-lead resolution 3). Verify: `test/services/thermostat.test.ts`
+      extended per the pattern above, `npm test` passes.
 - [x] 2.2 `AlarmService`'s alarm-press `StatelessProgrammableSwitch` and its "Dismiss Alarm"
-      `Switch` (`src/services/alarm.ts`) — labels `` `${accessory.displayName} Alarm` `` and
-      `` `${accessory.displayName} Dismiss Alarm` ``. Verify: `test/services/alarm.test.ts`
-      extended, `npm test` passes.
-- [x] 2.3 `OccupancyService` (`src/services/occupancy.ts`) — label `` `${accessory.displayName}
-      Occupancy` `` (already the existing `Name` convention; now also the `ConfiguredName` seed).
-      Verify: `test/services/occupancy.test.ts` extended, `npm test` passes.
-- [x] 2.4 `AwayModeService` (`src/services/awayMode.ts`) — label `` `${accessory.displayName} Away
-      Mode` ``, replacing the hardcoded `AWAY_MODE_NAMES[side]` as the `ConfiguredName` seed
+      `Switch` (`src/services/alarm.ts`) — labels `CONFIGURED_NAME.alarm` ("Alarm") and
+      `CONFIGURED_NAME.dismissAlarm` ("Dismiss Alarm"); supersedes this task's original
+      `` `${accessory.displayName} Alarm` `` / `` `${accessory.displayName} Dismiss Alarm` `` plan.
+      Verify: `test/services/alarm.test.ts` extended, `npm test` passes.
+- [x] 2.3 `OccupancyService` (`src/services/occupancy.ts`) — label `CONFIGURED_NAME.occupancy`
+      ("Occupancy"; supersedes this task's original `` `${accessory.displayName} Occupancy` ``
+      plan). The pre-existing `Name` characteristic keeps its own, unrelated
+      `` `${accessory.displayName} Occupancy` `` value (design.md's Non-Goals — `Name` is
+      untouched by this change; only the new `ConfiguredName` seed uses the short label). Verify:
+      `test/services/occupancy.test.ts` extended, `npm test` passes.
+- [x] 2.4 `AwayModeService` (`src/services/awayMode.ts`) — label `CONFIGURED_NAME.awayMode`
+      ("Away Mode"; supersedes this task's original `` `${accessory.displayName} Away Mode` ``
+      plan), replacing the hardcoded `AWAY_MODE_NAMES[side]` as the `ConfiguredName` seed
       specifically (the `Name` characteristic argument is unchanged per design.md's Non-Goals).
       Verify: `test/services/awayMode.test.ts` extended, `npm test` passes.
-- [x] 2.5 `SkipAlarmService` (`src/services/skipAlarm.ts`) — label `` `${accessory.displayName}
-      Skip Next Alarm` ``. Verify: `test/services/skipAlarm.test.ts` extended, `npm test` passes.
+- [x] 2.5 `SkipAlarmService` (`src/services/skipAlarm.ts`) — label `CONFIGURED_NAME.skipNextAlarm`
+      ("Skip Next Alarm"; supersedes this task's original `` `${accessory.displayName} Skip Next
+      Alarm` `` plan). Verify: `test/services/skipAlarm.test.ts` extended, `npm test` passes.
 - [x] 2.6 `ConnectionService` (`src/services/connection.ts`) — label `POD_CONNECTION_NAME`
       verbatim. Verify: `test/services/connection.test.ts` extended, `npm test` passes.
 - [x] 2.7 `LedService` (`src/services/led.ts`) — label `POD_LED_NAME` verbatim. Verify:
