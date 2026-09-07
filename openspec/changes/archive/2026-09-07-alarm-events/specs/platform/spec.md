@@ -31,6 +31,29 @@ enabled set.
 - **THEN** `Pod Right` and the services it carried (including its alarm programmable switch and
   dismiss switch) are gone, and `Pod Left` and the hub keep their services
 
+#### Scenario: Fresh install with occupancy configured publishes the sensor per side
+
+- **WHEN** the platform starts with `host` configured, `sides: 'both'`, `occupancySource` set
+  to `'presence'` or `'vitals'`, and no accessories in the Homebridge cache
+- **THEN** exactly three accessories are registered; each side accessory has
+  `AccessoryInformation`, one thermostat, one occupancy sensor, one alarm programmable switch,
+  and one dismiss switch; and the hub has `AccessoryInformation` and one contact sensor
+
+#### Scenario: Fresh install with occupancy off publishes no occupancy sensor
+
+- **WHEN** the platform starts with `occupancySource: 'none'` (the default)
+- **THEN** neither side accessory carries an occupancy sensor, and every other aspect of the
+  three-accessory topology is unchanged from before this capability existed
+
+#### Scenario: The hub's enabled set grows and shrinks with its own configuration
+
+- **WHEN** the platform starts with the prime-switch, LED, test-alarm, and server-fault
+  configuration values all enabled, and is later restarted with all four disabled
+- **THEN** the hub carries all four additional services (plus the always-present connection
+  and water-level sensors) on the first launch, and carries only the connection and
+  water-level sensors on the second — with no accessory unregistered, since the hub itself
+  still has enabled services
+
 ### Requirement: The platform owns the poll and write lifecycle, and observes the Pod before wiring handlers
 
 The platform SHALL construct exactly one cached-snapshot store, one poller, one write path, and
@@ -104,8 +127,23 @@ state; no service SHALL poll or re-read on its own.
 - **WHEN** a change is reported for a field no published service publishes
 - **THEN** no update is pushed and no error is raised
 
+#### Scenario: A side's occupancy change reaches only that side's occupancy sensor
+
+- **WHEN** an observation changes the left side's vitals-derived occupancy or its presence
+  trust flag
+- **THEN** the left side's occupancy sensor is updated, the right side's occupancy sensor
+  receives no update, and no thermostat or alarm-service characteristic is updated as a result
+
+#### Scenario: An occupancy change is ignored when the sensor is not published
+
+- **WHEN** `occupancySource` is `'none'` and an observation nonetheless reports a presence or
+  vitals value (for example, because a previous configuration's poll is still draining)
+- **THEN** no update is pushed anywhere and no error is raised
+
 #### Scenario: A failing service does not stop the others
 
-- **WHEN** one service throws while handling a change notification
-- **THEN** the other services still receive that notification, the failure is logged, and
-  subsequent notifications are still delivered to all of them
+- **WHEN** one service, including an occupancy sensor, throws while handling a change
+  notification
+- **THEN** the other services — including the other side's occupancy sensor and alarm services
+  — still receive that notification, the failure is logged, and subsequent notifications are
+  still delivered to all of them

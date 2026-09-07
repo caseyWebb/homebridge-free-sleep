@@ -77,3 +77,13 @@ keep showing a value the write never actually produced.
 - **THEN** the write handler settles successfully once the Pod accepts the addressed side's
   write, and the other side's thermostat reflects the same target temperature without a separate
   read from that side's controller
+
+#### Scenario: A full-range drag never snaps back mid-drag
+
+- **WHEN** a controller writes a rapid succession of target temperatures spanning the whole
+  settable range to one side — long enough to span more than one of the write path's own
+  internal batches — while a stale observation reporting an earlier, disagreeing target
+  temperature is delivered partway through
+- **THEN** the reported target temperature never moves backward to a value earlier than the
+  drag's current point; every value it takes on on the way to the drag's final value is a value
+  the drag itself specified

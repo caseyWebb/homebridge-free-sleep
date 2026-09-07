@@ -10,7 +10,7 @@ gains one more destination field, following its own existing shape exactly.
 
 ## MODIFIED Requirements
 
-### Requirement: Exactly three bridged accessories, each carrying the services its role currently enables
+### Requirement: Exactly three bridged accessories, each carrying the services its role enables
 
 When `sides` is `'both'` (the default) and `host` is configured, the platform SHALL publish
 exactly three bridged accessories: `Pod Left`, `Pod Right`, and `Pod` (the hub). Each SHALL
@@ -19,13 +19,21 @@ accessory carries its thermostat and, when `occupancySource` is not `'none'`, an
 sensor; the hub carries the connection contact sensor. No accessory SHALL carry a service
 outside that enabled set.
 
+#### Scenario: Fresh install publishes three accessories with their services
+
+- **WHEN** the platform starts with `host` configured, `sides: 'both'`, and no accessories in
+  the Homebridge cache
+- **THEN** exactly three accessories are registered, named `Pod Left`, `Pod Right`, and `Pod`;
+  each side accessory has `AccessoryInformation` and one thermostat; and the hub has
+  `AccessoryInformation`, one contact sensor, and one water-level sensor
+
 #### Scenario: Fresh install with occupancy configured publishes the sensor per side
 
 - **WHEN** the platform starts with `host` configured, `sides: 'both'`, `occupancySource` set
   to `'presence'` or `'vitals'`, and no accessories in the Homebridge cache
 - **THEN** exactly three accessories are registered; each side accessory has
   `AccessoryInformation`, one thermostat, and one occupancy sensor; and the hub has
-  `AccessoryInformation` and one contact sensor
+  `AccessoryInformation`, one contact sensor, and one water-level sensor
 
 #### Scenario: Fresh install with occupancy off publishes no occupancy sensor
 
@@ -38,6 +46,22 @@ outside that enabled set.
 - **WHEN** any of the three accessories is inspected after startup
 - **THEN** it exposes only `AccessoryInformation` and the services its role and configuration
   currently enable, and in particular the hub carries no occupancy sensor and no thermostat
+
+#### Scenario: Narrowing sides removes that side's services with its accessory
+
+- **WHEN** the platform previously ran with `sides: 'both'` and is restarted with `sides:
+  'left'`
+- **THEN** `Pod Right` and the thermostat it carried are gone, and `Pod Left` and the hub keep
+  their services
+
+#### Scenario: The hub's enabled set grows and shrinks with its own configuration
+
+- **WHEN** the platform starts with the prime-switch, LED, test-alarm, and server-fault
+  configuration values all enabled, and is later restarted with all four disabled
+- **THEN** the hub carries all four additional services (plus the always-present connection
+  and water-level sensors) on the first launch, and carries only the connection and
+  water-level sensors on the second — with no accessory unregistered, since the hub itself
+  still has enabled services
 
 ### Requirement: Restoring from the accessory cache never duplicates, and prunes what is no longer enabled
 

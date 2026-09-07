@@ -151,8 +151,14 @@ When a notification is delivered, a read of the snapshot SHALL already return th
 The set of fields that produce change notifications SHALL be enumerated explicitly rather than
 derived from a generic deep comparison of responses. It SHALL cover, per side, the current
 temperature, the target temperature, the power state, the alarm-vibrating state, and away
-mode; and, for the device as a whole, the water-level interpretation, the priming state, and
-reachability.
+mode; and, for the device as a whole, the water-level interpretation, the priming state,
+reachability of the device-status endpoint, reachability of the subsystem-health endpoint
+(**revised, S1, PR #44 review** — this endpoint's reachability was already tracked as data,
+per the "ADDED Requirements" section below, but was not itself a watched field until this
+revision), whether the most recently observed subsystem health report contains a failed
+subsystem, and the LED brightness (**revised, S2, PR #44 review** — an externally-changed
+brightness must reach the "Pod LED" tile, not only a change this plugin's own write path
+already accelerates via the fast-poll window).
 
 A field that changes on essentially every observation by its nature — in particular the
 remaining-seconds countdown — SHALL NOT be a watched field. It SHALL still be readable from
@@ -170,6 +176,37 @@ notification, because doing so would emit an event on every poll forever.
 - **WHEN** the schedules endpoint returns different contents than before
 - **THEN** the new contents are readable from the snapshot and no per-field change notification
   is generated for them
+
+#### Scenario: A change in the subsystem-health-failure derivation generates one notification
+
+- **WHEN** a subsystem-health observation changes whether any subsystem reports a failed
+  status, compared to the previous subsystem-health observation
+- **THEN** exactly one change notification is delivered carrying that field
+
+#### Scenario: An unchanged subsystem-health-failure derivation generates no event
+
+- **WHEN** a new subsystem-health observation reports the identical set of failed-or-not
+  subsystems, and the derived failure boolean is therefore unchanged
+- **THEN** no change notification is delivered for that field
+
+#### Scenario: A subsystem-health reachability transition generates one notification (S1, PR #44 review)
+
+- **WHEN** the subsystem-health endpoint's reachability changes — a success following a
+  failure, or a failure following a success
+- **THEN** exactly one change notification is delivered carrying that field, distinct from any
+  notification carrying the failed-subsystem-derivation field
+
+#### Scenario: A change in LED brightness generates one notification (S2, PR #44 review)
+
+- **WHEN** a device-status observation's LED brightness differs from the previous observation's,
+  regardless of whether this plugin's own write path caused the change
+- **THEN** exactly one change notification is delivered carrying that field
+
+#### Scenario: An unchanged LED brightness generates no event (S2, PR #44 review)
+
+- **WHEN** a new device-status observation reports the identical LED brightness as the previous
+  one
+- **THEN** no change notification is delivered for that field
 
 ### Requirement: An optimistic overlay takes precedence over observed values
 
@@ -275,3 +312,116 @@ SHALL NOT affect who receives the notification currently being delivered.
 - **WHEN** a subscriber installs an overlay entry while handling a notification
 - **THEN** that entry takes effect and produces a separate, later notification rather than
   being folded into or interleaved with the one in progress
+
+### Requirement: Presence and vitals observations are stored per side, unconditionally
+
+The snapshot SHALL accept an observation of the presence endpoint's full response and, per
+side, expose the most recently observed presence flag. It SHALL accept an observation of the
+vitals endpoint's response for a time window and, per side, expose whether that window
+contained a row with a non-null heart rate. Both SHALL read as unknown until their own first
+observation, following the same "unknown until first success" rule already established for
+every other observed document.
+
+#### Scenario: Unobserved presence and vitals read as unknown
+
+- **WHEN** the snapshot is read before either endpoint has ever been observed
+- **THEN** both sides' presence flag and vitals-derived occupancy read as unknown
+
+#### Scenario: An observation updates both sides at once
+
+- **WHEN** a presence observation reports both sides' current flags
+- **THEN** both sides' presence flags update from that single observation
+
+### Requirement: A side's presence trust flag requires an observed, present change from this launch's baseline
+
+The snapshot SHALL record, per side, the `lastUpdatedAt` value from its first-ever presence
+observation this launch as that side's baseline. The side's presence trust flag SHALL become
+true the first time a later observation reports both a `lastUpdatedAt` different from that
+baseline *and* a `present` value of `true`, and SHALL remain true afterward regardless of what
+any subsequent observation reports. A differing `lastUpdatedAt` alone, without `present: true`,
+SHALL NOT set the trust flag — the Pod's daily reboot re-initialises presence state to a fresh
+`lastUpdatedAt` with `present: false`, so a `lastUpdatedAt` change by itself carries no
+information about a real transition, only about a restart.
+
+#### Scenario: The baseline alone does not set the trust flag
+
+- **WHEN** a side has been observed only reporting the same `lastUpdatedAt` as its first
+  observation this launch, however many times
+- **THEN** that side's presence trust flag is false
+
+#### Scenario: A differing observation without present: true does not set the trust flag
+
+- **WHEN** a side's observed `lastUpdatedAt` differs from its baseline, but the observation
+  reports `present: false` (the shape of a Pod reboot's reset default, which always reports
+  `present: false` under a fresh `lastUpdatedAt`)
+- **THEN** that side's presence trust flag remains false, however many such observations occur
+
+#### Scenario: A differing observation with present: true sets the trust flag, permanently
+
+- **WHEN** a side's observed `lastUpdatedAt` differs from its baseline and the observation
+  reports `present: true`
+- **THEN** that side's presence trust flag becomes true, and a later observation matching the
+  original baseline, or reporting `present: false`, does not clear it
+
+### Requirement: A side's vitals trust flag requires only one ever-successful observation with a row
+
+The snapshot SHALL record, per side, whether any vitals observation has ever included at least
+one row for that side. The side's vitals trust flag SHALL become true the first time this
+occurs and SHALL remain true afterward, regardless of how many later observations include no
+row for that side.
+
+#### Scenario: The first row sets the trust flag immediately
+
+- **WHEN** a vitals observation includes at least one row for a side, for the first time
+- **THEN** that side's vitals trust flag becomes true immediately — no second observation is
+  required
+
+#### Scenario: A later empty observation does not clear the trust flag
+
+- **WHEN** a side's vitals trust flag is already true, and a later observation includes no row
+  for that side
+- **THEN** the trust flag remains true
+
+### Requirement: Presence and vitals data and their trust flags are watched fields
+
+A change to a side's observed presence flag, its presence trust flag, its vitals-derived
+occupancy, or its vitals trust flag SHALL each be a watched field: a commit that changes any of
+them SHALL produce a change notification carrying that field, exactly like every other watched
+field.
+
+#### Scenario: A presence flag change is notified
+
+- **WHEN** a side's observed presence flag changes between two observations
+- **THEN** subscribers receive a change notification naming that field, that side, the previous
+  value, and the new value
+
+#### Scenario: A trust flag becoming true is notified
+
+- **WHEN** a side's presence or vitals trust flag transitions from false (or unknown) to true
+- **THEN** subscribers receive a change notification for that transition
+
+#### Scenario: An unrelated document change produces no occupancy notification
+
+- **WHEN** a commit changes only fields unrelated to presence or vitals
+- **THEN** no change notification naming a presence or vitals field is produced
+
+### Requirement: Subsystem-health reachability is exposed as data, independently of the device-status endpoint's reachability
+
+The snapshot SHALL expose the plugin's view of whether its most recent attempt to read the
+Pod's subsystem-health endpoint succeeded, and the time of its last success, tracked
+separately from the device-status endpoint's own reachability — a poll of one endpoint
+failing SHALL NOT be reported as a failure of the other.
+
+#### Scenario: Subsystem-health reachability transitions independently of device status
+
+- **WHEN** the subsystem-health endpoint stops responding while the device-status endpoint
+  continues to be polled successfully
+- **THEN** the snapshot reports subsystem-health as unreachable while continuing to report the
+  device-status endpoint as reachable
+
+#### Scenario: A subsystem-health failure does not erase the last observed report
+
+- **WHEN** subsystem health has been observed successfully at least once, and a later poll of
+  it fails
+- **THEN** the snapshot still returns the last successfully observed subsystem-health report,
+  and the derived failed-subsystem boolean computed from it is unchanged by the failed poll

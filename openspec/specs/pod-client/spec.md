@@ -13,12 +13,14 @@ rebooting Pod from a rejected payload; and a read-only smoke check against real 
 ### Requirement: Wire types are vendored, not depended upon
 
 The plugin SHALL carry its own copy of the free-sleep wire contract for device status,
-settings, schedules and services. It SHALL NOT declare a package, git, or path dependency on
-the free-sleep repository at build time or at runtime.
+settings, schedules, services, and subsystem health status. It SHALL NOT declare a package,
+git, or path dependency on the free-sleep repository at build time or at runtime.
 
 Each vendored contract SHALL record, in the source file, the upstream repository, version,
 commit, and the upstream file path it was copied from, so drift can be audited against a
-fixed upstream point.
+fixed upstream point. The alarm-trigger request shape SHALL likewise be vendored as a
+request-only contract with the same provenance recording, even though the plugin never reads
+a response body shaped like it.
 
 #### Scenario: No dependency on free-sleep
 
@@ -31,7 +33,8 @@ fixed upstream point.
 
 - **WHEN** a reader opens the vendored wire-type module
 - **THEN** it states the upstream version and commit it was copied from, and names the
-  upstream source file for each vendored contract
+  upstream source file for each vendored contract, including the subsystem-health contract
+  and the alarm-trigger request contract
 
 ### Requirement: Reads are parsed leniently, requests are validated strictly
 
@@ -270,3 +273,101 @@ The smoke check SHALL perform no writes of any kind.
 - **WHEN** the smoke check runs to completion against any host
 - **THEN** every request it issued was a read, and no Pod setting, schedule, or device state
   was modified
+
+### Requirement: The client reads presence and vitals, and writes neither
+
+`PodClient` SHALL offer a read of the presence endpoint and a read of the vitals endpoint,
+each following the same timeout, per-endpoint serialisation, in-flight GET deduplication, and
+lenient response parsing every other read already uses. The vitals read SHALL accept optional
+side and time-range filters, applied as query parameters only when given. `PodClient` SHALL
+NOT offer any write to either endpoint.
+
+#### Scenario: Presence reads the whole document
+
+- **WHEN** a presence read is made against a reachable Pod
+- **THEN** it resolves with both sides' presence data, parsed leniently
+
+#### Scenario: Vitals reads accept optional filters
+
+- **WHEN** a vitals read is made with a side filter, a time range, both, or neither
+- **THEN** exactly the given filters are sent as query parameters, and an omitted filter is not
+  sent at all
+
+#### Scenario: No write exists for either endpoint
+
+- **WHEN** the client's public surface is inspected
+- **THEN** it offers no method that issues a write to the presence or vitals endpoint
+
+### Requirement: Vitals rows are parsed without upstream's insert-side value bounds
+
+The vitals response schema SHALL accept any numeric value, including out-of-range and null, for
+heart rate, heart-rate variability, and breathing rate, and SHALL NOT reject a row for a value
+outside any physiological range. It SHALL preserve each field's wire name exactly, without
+relabeling.
+
+This mirrors the project's established rule that a value the Pod itself never re-validates on
+read must still parse — confirmed here by a real capture containing heart-rate-variability and
+breathing-rate values of zero, which fall outside the range enforced only on the endpoint's own
+insert path.
+
+#### Scenario: A real capture with unvalidated fields parses cleanly
+
+- **WHEN** a vitals response contains rows with heart-rate-variability or breathing-rate values
+  of zero
+- **THEN** parsing succeeds and those values are preserved unchanged
+
+#### Scenario: A null vital value parses cleanly
+
+- **WHEN** a vitals row reports a null value for heart rate, heart-rate variability, or
+  breathing rate
+- **THEN** parsing succeeds and that field is preserved as null, not coerced or rejected
+
+### Requirement: Subsystem health can be read
+
+The client SHALL expose a method that reads the Pod's self-reported subsystem health and
+parses it against the vendored contract, following the same lenient-read rules every other
+read follows (unknown properties preserved rather than rejected, no value-range constraint
+the Pod does not itself enforce).
+
+#### Scenario: A subsystem-health read succeeds
+
+- **WHEN** the subsystem-health endpoint responds with a well-formed body
+- **THEN** the read resolves with every subsystem's reported name, status, and message
+
+#### Scenario: An unexpected subsystem key is preserved, not rejected
+
+- **WHEN** the subsystem-health response contains a subsystem key the vendored contract does
+  not explicitly enumerate as always-present
+- **THEN** parsing still succeeds for every subsystem the contract does know about
+
+### Requirement: An alarm trigger can be sent, and is never retried
+
+The client SHALL expose a method that sends an immediate alarm-trigger request, validated
+locally against a strict request contract before any request is issued. Unlike every other
+write this client exposes, a failed alarm-trigger attempt SHALL NOT be retried under any
+circumstance — not on a network-level error, and not on an HTTP 5xx — because the underlying
+Pod operation is not safe to repeat: a second attempt landing while the first's effect is
+still in progress risks triggering the physical alarm twice.
+
+The alarm-trigger endpoint SHALL still be subject to the same at-most-one-in-flight-per-
+endpoint serialization every other endpoint gets.
+
+#### Scenario: A successful trigger sends exactly one request
+
+- **WHEN** an alarm trigger is sent and the Pod responds successfully
+- **THEN** exactly one request was made
+
+#### Scenario: A failed trigger is not retried
+
+- **WHEN** an alarm trigger's request fails with a network-level error, or with an HTTP 5xx
+- **THEN** the call rejects after exactly one attempt, with no second attempt made
+
+#### Scenario: An invalid trigger is rejected locally
+
+- **WHEN** an alarm trigger is requested with a value outside the contract's bounds
+- **THEN** the call rejects locally with a validation error, and no request is made
+
+#### Scenario: Two alarm triggers to the same endpoint are still serialized
+
+- **WHEN** two alarm-trigger requests are issued at the same time
+- **THEN** the Pod observes them one after another, never overlapping
