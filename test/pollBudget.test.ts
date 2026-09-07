@@ -24,7 +24,11 @@ function clientFor(pod: MockPod): PodClient {
  * a single confirming `refresh('settings')` instead — accelerating `deviceStatus` polling would
  * confirm nothing a settings write actually changed (S2).
  */
-function wire(pod: MockPod, timers: ReturnType<typeof createTimerHarness>) {
+function wire(
+  pod: MockPod,
+  timers: ReturnType<typeof createTimerHarness>,
+  occupancySource: 'none' | 'presence' | 'vitals' = 'none',
+) {
   const snapshot = new SnapshotStore({ timers });
   const client = clientFor(pod);
   const poller = new PodPoller({
@@ -35,6 +39,7 @@ function wire(pod: MockPod, timers: ReturnType<typeof createTimerHarness>) {
     slowPollIntervalMs: 300_000,
     fastPollIntervalMs: 5_000,
     maxBackoffMs: 60_000,
+    occupancySource,
   });
   let releaseWriteMode: (() => void) | null = null;
   const requestFastPoll = (lane: 'deviceStatus' | 'settings', untilMs: number): void => {
@@ -63,71 +68,103 @@ function wire(pod: MockPod, timers: ReturnType<typeof createTimerHarness>) {
 // ---------------------------------------------------------------------------------------
 
 describe('guardrail: the five-minute Home-app session (10.1, 10.2, 10.4)', () => {
-  it('stays within the request budget: <=40 total, exactly 1 write, >=10 deviceStatus reads, zero delta across each read burst', async () => {
-    vi.useFakeTimers();
-    const pod = await startMockPod();
-    try {
-      const timers = createTimerHarness();
-      timers.random = () => 0.5; // jitter fixed to zero, per design.md's derivation table
-      const { snapshot, poller, queue } = wire(pod, timers);
+  /**
+   * S2 (occupancy code review): the pre-occupancy version of this test only ever wired
+   * `occupancySource: 'none'`, so a scheduling regression confined to the `presence` or
+   * `vitals` endpoint classes (e.g. one of them ignoring its own `enabled` gate, or double-
+   * firing) passed this guardrail silently — those two classes' requests simply never appeared
+   * in `pod.requests` for a `'none'`-only run. Parameterized here per source, each with its own
+   * derived ceiling, so a regression in any source's cadence fails this test.
+   *
+   * Per-source derivation, all built on the same `'none'` baseline (design.md, "The request
+   * budget: N = 40"): with jitter fixed to zero, that baseline works out to 32 —
+   *   4 (bootstrap) + 0 (burst 1) + 4 (base polls to t=120s) + 0 (burst 2)
+   *   + 1 (the coalesced write) + 18 (fast poll, 90s / 5s) + 2 (base polls resuming)
+   *   + 3 (settings/schedules/services' second poll at t=300s) = 32.
+   * This harness's own fake-timer stepping (advanceFakeTime's 100ms granularity, needed so the
+   * real HTTP round trips to the mock actually settle between virtual-time jumps — see
+   * timerHarness.ts) lands one request shy of that in practice (31 for `'none'`), an artifact of
+   * step boundary rounding rather than a scheduling bug; either way the sharp per-burst delta
+   * assertions below are the precise proof, and the total is only the coarse net.
+   *
+   * `presence` and `vitals` are both registered unconditionally and become enabled the tick
+   * after `services`'s own bootstrap observation lands (near t=0 here, since the mock pod
+   * answers immediately) — see `poller.test.ts`'s "starting the tick after services first
+   * observes". Neither is affected by the `deviceStatus`-lane write's fast-poll mode (poll
+   * modes are tracked per endpoint class), so each keeps ticking on its own fixed base interval
+   * for the entire 300s window, independent of the write in the middle of it:
+   *   - `presence`: fixed 30s base interval → ticks at t=30,60,...,300 → +10 over the baseline
+   *     → 32 + 10 = 42 (measured 41, the same one-shy rounding artifact as the baseline).
+   *   - `vitals`: fixed 60s base interval → ticks at t=60,120,...,300 → +5 over the baseline
+   *     → 32 + 5 = 37 (measured 36-37, the same rounding artifact).
+   * Each ceiling below keeps the same +8 headroom over its own derived total that the original
+   * `'none'`-only ceiling (40 = 32 + 8) used — comfortable margin against a default tweak or
+   * slightly different drag timing, while staying far below what any real regression produces
+   * (see the "guardrail actually guards" test below for a concrete failing case).
+   */
+  const cases: Array<{ occupancySource: 'none' | 'presence' | 'vitals'; ceiling: number }> = [
+    { occupancySource: 'none', ceiling: 40 }, // 32 derived + 8
+    { occupancySource: 'presence', ceiling: 50 }, // 42 derived + 8
+    { occupancySource: 'vitals', ceiling: 45 }, // 37 derived + 8
+  ];
 
-      // --- t = 0: bootstrap, all four classes -------------------------------------------
-      await poller.bootstrap();
+  it.each(cases)(
+    'occupancySource: $occupancySource stays within its request budget (<=$ceiling total), exactly 1 write, >=10 deviceStatus reads, zero delta across each read burst',
+    async ({ occupancySource, ceiling }) => {
+      vi.useFakeTimers();
+      const pod = await startMockPod();
+      try {
+        const timers = createTimerHarness();
+        timers.random = () => 0.5; // jitter fixed to zero, per design.md's derivation table
+        const { snapshot, poller, queue } = wire(pod, timers, occupancySource);
 
-      // --- t = 0: 80 snapshot reads (Home app opens) — must add nothing (10.2, the sharp
-      // form of the invariant: the delta across the burst is exactly zero, not just "small"). -
-      const beforeFirstBurst = pod.requests.length;
-      for (let i = 0; i < 80; i++) snapshot.get();
-      expect(pod.requests.length).toBe(beforeFirstBurst);
+        // --- t = 0: bootstrap, all four classes (plus presence/vitals's own schedule, not
+        // yet firing — see this describe block's own derivation comment) --------------------
+        await poller.bootstrap();
 
-      // --- t = 0 -> 60s: base deviceStatus polls at 30s and 60s ---------------------------
-      await advanceFakeTime(60_000, 100);
+        // --- t = 0: 80 snapshot reads (Home app opens) — must add nothing (10.2, the sharp
+        // form of the invariant: the delta across the burst is exactly zero, not just "small"). -
+        const beforeFirstBurst = pod.requests.length;
+        for (let i = 0; i < 80; i++) snapshot.get();
+        expect(pod.requests.length).toBe(beforeFirstBurst);
 
-      // --- t = 60s: 80 more snapshot reads (Home app reopens) — again zero delta ----------
-      const beforeSecondBurst = pod.requests.length;
-      for (let i = 0; i < 80; i++) snapshot.get();
-      expect(pod.requests.length).toBe(beforeSecondBurst);
+        // --- t = 0 -> 60s: base deviceStatus polls at 30s and 60s ---------------------------
+        await advanceFakeTime(60_000, 100);
 
-      // --- t = 60s -> 120s: base deviceStatus polls at 90s and 120s -----------------------
-      await advanceFakeTime(60_000, 100);
+        // --- t = 60s: 80 more snapshot reads (Home app reopens) — again zero delta ----------
+        const beforeSecondBurst = pod.requests.length;
+        for (let i = 0; i < 80; i++) snapshot.get();
+        expect(pod.requests.length).toBe(beforeSecondBurst);
 
-      // --- t = 120.0s -> 120.3s: a temperature slider drag, six submissions to `left` -----
-      for (let i = 0; i < 6; i++) {
-        queue.submitSide('left', { targetTemperatureF: 65 + i });
-        await advanceFakeTime(50, 50);
+        // --- t = 60s -> 120s: base deviceStatus polls at 90s and 120s -----------------------
+        await advanceFakeTime(60_000, 100);
+
+        // --- t = 120.0s -> 120.3s: a temperature slider drag, six submissions to `left` -----
+        for (let i = 0; i < 6; i++) {
+          queue.submitSide('left', { targetTemperatureF: 65 + i });
+          await advanceFakeTime(50, 50);
+        }
+
+        // --- t = 120.4s -> 300s: debounce flush (1 write), the resulting fast-poll window
+        // (18 polls at 5s over 90s), base polls resuming, and the slow classes' second poll --
+        await advanceFakeTime(300_000 - 120_300, 100);
+
+        poller.stop();
+        queue.stop();
+
+        expect(pod.requests.length).toBeLessThanOrEqual(ceiling);
+
+        const writes = pod.requests.filter((r) => r.method === 'POST');
+        expect(writes.length).toBe(1); // catches a coalescing regression (6 separate POSTs -> ceiling+6, still under most ceilings but always a real regression)
+
+        const deviceStatusReads = pod.requests.filter((r) => r.method === 'GET' && r.path === '/api/deviceStatus');
+        expect(deviceStatusReads.length).toBeGreaterThanOrEqual(10); // catches a poller that silently died
+      } finally {
+        await pod.close();
       }
-
-      // --- t = 120.4s -> 300s: debounce flush (1 write), the resulting fast-poll window
-      // (18 polls at 5s over 90s), base polls resuming, and the slow classes' second poll --
-      await advanceFakeTime(300_000 - 120_300, 100);
-
-      poller.stop();
-      queue.stop();
-
-      // Derivation (design.md, "The request budget: N = 40"): with the scenario above and
-      // jitter fixed to zero, design.md's own table works out to 32 —
-      //   4 (bootstrap) + 0 (burst 1) + 4 (base polls to t=120s) + 0 (burst 2)
-      //   + 1 (the coalesced write) + 18 (fast poll, 90s / 5s) + 2 (base polls resuming)
-      //   + 3 (settings/schedules/services' second poll at t=300s) = 32.
-      // This harness's own fake-timer stepping (advanceFakeTime's 100ms granularity, needed so
-      // the real HTTP round trips to the mock actually settle between virtual-time jumps —
-      // see timerHarness.ts) lands one request shy of that at 31, an artifact of step boundary
-      // rounding rather than a scheduling bug; either way the sharp per-burst delta assertions
-      // above are the precise proof, and this total is the coarse net. N = 40 gives comfortable
-      // headroom over 31-32 so a default tweak or slightly different drag timing doesn't flake
-      // this test, while staying far below what any real regression produces (see the
-      // "guardrail actually guards" test below for a concrete failing case).
-      expect(pod.requests.length).toBeLessThanOrEqual(40);
-
-      const writes = pod.requests.filter((r) => r.method === 'POST');
-      expect(writes.length).toBe(1); // catches a coalescing regression (6 separate POSTs -> 37, still <40)
-
-      const deviceStatusReads = pod.requests.filter((r) => r.method === 'GET' && r.path === '/api/deviceStatus');
-      expect(deviceStatusReads.length).toBeGreaterThanOrEqual(10); // catches a poller that silently died
-    } finally {
-      await pod.close();
-    }
-  }, 20_000);
+    },
+    20_000,
+  );
 
   it('a read handler that contacts the Pod breaks the budget — proves the guardrail actually guards (10.3)', async () => {
     // No fake timers needed: this isolates the one failure mode the budget exists to catch —

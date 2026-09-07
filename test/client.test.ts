@@ -518,6 +518,55 @@ describe('presence and vitals reads (occupancy change, #19, tasks.md 3.1/3.2)', 
   });
 });
 
+// ---------------------------------------------------------------------------------------
+// B1 regression: the per-endpoint serialisation map must not grow with the query string
+// ---------------------------------------------------------------------------------------
+
+describe('B1: the serialisation chain map is keyed on path only, never the query string', () => {
+  /** Reaches into `PodClient`'s private `chains` map — the same "cast to a plain record" style
+   * already used above for `postPresence`/`postVitals` — because the leak this test guards
+   * against is only observable from inside that map, not from any public return value. */
+  function chainsSizeOf(client: PodClient): number {
+    const chains = (client as unknown as { chains: Map<string, unknown> }).chains;
+    return chains.size;
+  }
+
+  it('N sequential getVitals calls with an ever-advancing rolling window leave exactly one chains entry', async () => {
+    const pod = await start();
+    const client = clientFor(pod);
+
+    // Mirrors the poller's own vitals class: a fixed path, but a `startTime`/`endTime` query
+    // that advances on every call — before B1's fix, each distinct query string minted its own
+    // permanent `chains` entry (26 entries after 25 polls in the reviewer's reproduction; at a
+    // 60s vitals cadence that is ~525k leaked entries a year), because the map was keyed on the
+    // full `pathname` (query included) rather than the path alone.
+    for (let i = 0; i < 25; i++) {
+      const now = Date.parse('2026-09-06T00:00:00Z') + i * 60_000;
+      await client.getVitals({
+        startTime: new Date(now - 180_000).toISOString(),
+        endTime: new Date(now).toISOString(),
+      });
+    }
+
+    expect(chainsSizeOf(client)).toBe(1);
+  });
+
+  it('a GET and a POST to different paths still get their own independent chain entries', async () => {
+    const pod = await start();
+    const client = clientFor(pod);
+
+    await client.getDeviceStatus();
+    await client.getVitals({ side: 'left' });
+    await client.getVitals({ side: 'right' }); // same path, different query — still one entry
+    await client.postDeviceStatus({ left: { isOn: true } });
+
+    // 3 distinct `${method} ${path}` pairs: `GET /api/deviceStatus`, `GET /api/metrics/vitals`,
+    // `POST /api/deviceStatus` — not 4, which is what the pre-fix, query-inclusive key would
+    // have produced for the two differently-queried `getVitals` calls.
+    expect(chainsSizeOf(client)).toBe(3);
+  });
+});
+
 describe('no credentials ever sent (6.10)', () => {
   it('no client method sends an authorization or cookie header, or userinfo in the URL', async () => {
     const pod = await start();

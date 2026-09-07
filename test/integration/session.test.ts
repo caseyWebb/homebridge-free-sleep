@@ -436,11 +436,17 @@ describe('occupancy sensor end-to-end (tasks.md 10.2)', () => {
         const occupancyDetected = occupancyService.getCharacteristic(hap.Characteristic.OccupancyDetected);
         const statusActive = occupancyService.getCharacteristic(hap.Characteristic.StatusActive);
 
-        // One vitals-poll interval (fixed 60s) past bootstrap: the fixture's seeded rows carry
-        // real 2026 timestamps, far outside this test's virtual clock (which starts at the Unix
-        // epoch), so the mock's own recent-window filtering naturally reports zero rows — not
-        // yet proven, matching that the *vitals* rule's own asymmetry ("no requirement to
-        // observe a change") is not an exemption from ever needing a real row at all.
+        // S3 dropped `endTime` from the vitals query — the Pod itself now bounds the window's
+        // upper edge at its own "now" — so the fixture's seeded rows (real 2026 timestamps) can
+        // no longer be relied on to fall outside the window purely because they're newer than
+        // this test's virtual clock (which starts at the Unix epoch): with no upper bound sent,
+        // a `startTime`-only filter would consider those far-future-relative-to-epoch rows
+        // "recent". Clear seeded vitals explicitly so the baseline is genuinely empty.
+        pod.state.vitals = [];
+
+        // One vitals-poll interval (fixed 60s) past bootstrap: no rows yet — not yet proven,
+        // matching that the *vitals* rule's own asymmetry ("no requirement to observe a
+        // change") is not an exemption from ever needing a real row at all.
         await timers.advance(60_000);
         expect(await occupancyDetected.handleGetRequest()).toBe(hap.Characteristic.OccupancyDetected.OCCUPANCY_NOT_DETECTED);
         expect(await statusActive.handleGetRequest()).toBe(false);

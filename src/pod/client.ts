@@ -115,7 +115,16 @@ export class PodClient {
   private readonly timeoutMs: number;
   private readonly baseUrl: string;
 
-  /** One promise chain per `${method} ${pathname}` — depth-1 serialisation (design.md). */
+  /**
+   * One promise chain per `${method} ${pathname-without-its-query-string}` — depth-1
+   * serialisation (design.md). Deliberately keyed on the path alone, not the full URL: unlike
+   * `inFlightGets` below (where two different queries — e.g. `getVitals`'s rolling
+   * `startTime`/`endTime` window — really are two different in-flight requests worth deduping
+   * separately), this map exists only to force *one at a time* per endpoint, and every distinct
+   * query string used to mint its own permanent entry that nothing ever removed (B1 in the
+   * occupancy code review): a vitals poll's ever-advancing window leaked one `Promise` per poll,
+   * forever, for the process's lifetime.
+   */
   private readonly chains = new Map<string, Promise<unknown>>();
   /** In-flight GET promises, keyed the same way — dedup layer, GET only, never writes. */
   private readonly inFlightGets = new Map<string, Promise<unknown>>();
@@ -291,7 +300,7 @@ export class PodClient {
   // Transport: endpoint serialisation, timeout, retry, status interpretation
   // -----------------------------------------------------------------------------------
 
-  /** At most one in-flight physical request per `${method} ${pathname}` (design.md). */
+  /** At most one in-flight physical request per `${method} ${path-without-query}` (design.md). */
   private enqueue<T>(key: string, fn: () => Promise<T>): Promise<T> {
     const previousTail = this.chains.get(key) ?? Promise.resolve();
     const run = previousTail.then(fn, fn);
@@ -305,7 +314,13 @@ export class PodClient {
     body: unknown,
     signal?: AbortSignal,
   ): Promise<string> {
-    const key = `${method} ${pathname}`;
+    // Query-stripped: `chains` exists to serialise requests per endpoint, not per distinct
+    // query — using the full `pathname` (query included) here made every unique query string
+    // (e.g. `getVitals`'s ever-advancing `startTime`/`endTime` window) mint its own `chains`
+    // entry that nothing ever deleted (B1 in the occupancy code review). `inFlightGets` in
+    // `getJson` above is the one map that correctly keeps the query, since deduping genuinely
+    // different requests together would be wrong.
+    const key = `${method} ${pathname.split('?', 1)[0]}`;
     const { status, text } = await this.enqueue(key, () =>
       this.requestWithRetry(method, pathname, body, signal),
     );

@@ -31,6 +31,13 @@ import type { Side } from '../pod/types.ts';
 import type { ServiceContext } from './types.ts';
 
 export const OCCUPANCY_SUBTYPE = 'occupancy';
+/** N4: the accessory's `ThermostatService` already names its own service `accessory.displayName`
+ * verbatim (`./thermostat.ts`) — reusing that same string here would give two sibling services
+ * on the same accessory an identical tile name in the Home app. Appended, not a wholly separate
+ * constant, so the sensor still reads as "this side's occupancy," mirroring how
+ * `ConnectionService`'s own name constant (`POD_CONNECTION_NAME`) is a fixed, descriptive string
+ * rather than a bare reuse of any other service's name. */
+export const OCCUPANCY_NAME_SUFFIX = 'Occupancy';
 
 /** The four watched fields that, together, feed this service's `refresh()` (design.md's
  * routing table: any of them changing for a side routes to that side's occupancy sensor). */
@@ -64,7 +71,10 @@ export class OccupancySensorService {
 
     const existing = accessory.getServiceById(hap.Service.OccupancySensor, OCCUPANCY_SUBTYPE);
     this.service =
-      existing ?? accessory.addService(new hap.Service.OccupancySensor(accessory.displayName, OCCUPANCY_SUBTYPE));
+      existing ??
+      accessory.addService(
+        new hap.Service.OccupancySensor(`${accessory.displayName} ${OCCUPANCY_NAME_SUFFIX}`, OCCUPANCY_SUBTYPE),
+      );
 
     ensureCharacteristic(this.service, hap.Characteristic.StatusActive);
 

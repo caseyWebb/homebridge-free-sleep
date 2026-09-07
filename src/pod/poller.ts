@@ -39,6 +39,20 @@ import type { DeviceStatus, PresenceData, Schedules, Services, Settings, VitalsR
 export type EndpointClassId = 'deviceStatus' | 'settings' | 'schedules' | 'services' | 'presence' | 'vitals';
 
 /**
+ * S4 (occupancy code review): the subset of `PodClient`'s surface `PodPoller` actually calls.
+ * `getDeviceStatus`/`getSettings`/`getSchedules`/`getServices` are required — every poller needs
+ * all four, `occupancySource` or not. `getPresence`/`getVitals` are typed *optional*: they are
+ * only ever called from behind an `enabled` predicate that itself checks `typeof === 'function'`
+ * at runtime (see the `presence`/`vitals` class registrations below), so a client that doesn't
+ * implement them — an older client version, or a deliberately reduced test double — is simply
+ * never polled for either class instead of throwing a "not a function" `TypeError` out of
+ * `runPoll`. Keeping these two optional here (rather than requiring the full `PodClient`) is
+ * what makes that runtime check meaningful instead of redundant with the type system.
+ */
+export type MinimalPodClient = Pick<PodClient, 'getDeviceStatus' | 'getSettings' | 'getSchedules' | 'getServices'> &
+  Partial<Pick<PodClient, 'getPresence' | 'getVitals'>>;
+
+/**
  * The vitals class's query window (occupancy change, #19; design.md's "One combined vitals
  * query per poll, windowed to the 'recent' threshold itself") — issue #8's own "~3 min",
  * roughly 3x the 60s insertion cadence upstream writes at, tolerant of one or two missed
@@ -50,7 +64,7 @@ const VITALS_OCCUPIED_WINDOW_MS = 180_000;
 const HARD_FLOOR_MS = 3000;
 
 export interface PollerOptions {
-  client: PodClient;
+  client: MinimalPodClient;
   snapshot: SnapshotStore;
   timers?: TimerApi;
   logger?: Logger;
@@ -75,7 +89,7 @@ export interface PollerOptions {
 interface EndpointClassSpec<T> {
   id: EndpointClassId;
   baseIntervalMs: number;
-  read: (client: PodClient, signal: AbortSignal) => Promise<T>;
+  read: (client: MinimalPodClient, signal: AbortSignal) => Promise<T>;
   apply: (snapshot: SnapshotStore, value: T) => void;
   recordFailure?: (snapshot: SnapshotStore, kind: ErrorKind) => void;
   /**
@@ -130,7 +144,7 @@ function clamp(value: number, lo: number, hi: number): number {
 }
 
 export class PodPoller {
-  private readonly client: PodClient;
+  private readonly client: MinimalPodClient;
   private readonly snapshot: SnapshotStore;
   private readonly timers: TimerApi;
   private readonly logger: Logger;
@@ -194,10 +208,24 @@ export class PodPoller {
     this.registerClass({
       id: 'presence',
       baseIntervalMs: 30_000,
-      read: (client, signal) => client.getPresence(signal),
+      read: (client, signal) => {
+        // Guarded by this class's own `enabled` predicate below (which checks the same
+        // `typeof === 'function'` condition), so this only ever fires when `getPresence`
+        // genuinely exists — this defensive throw exists purely as a second line of defence
+        // against `enabled` and `read` ever drifting out of sync (S4).
+        if (typeof client.getPresence !== 'function') {
+          throw new Error('poller: "presence" class fired without a getPresence method on the client');
+        }
+        return client.getPresence(signal);
+      },
       apply: (snapshot, value) => snapshot.observePresence(value as PresenceData),
+      // S4: also requires the client to actually implement `getPresence` — a `MinimalPodClient`
+      // that omits it (see that type's own doc comment) must never be polled for this class,
+      // rather than throwing a "not a function" `TypeError` out of `runPoll`.
       enabled: (snapshot) =>
-        this.occupancySource === 'presence' && snapshot.documents.services?.biometrics.enabled === true,
+        typeof this.client.getPresence === 'function' &&
+        this.occupancySource === 'presence' &&
+        snapshot.documents.services?.biometrics.enabled === true,
     });
     this.registerClass({
       id: 'vitals',
@@ -208,18 +236,33 @@ export class PodPoller {
         // the accepted escape hatch (mirrors `defaultTimerApi`'s own `globalThis.Date.now()` in
         // `snapshot.ts`), used here only to format `this.timers.now()`'s already-injected
         // epoch-ms value as ISO 8601, not to read the clock itself.
-        const now = this.timers.now();
+        //
+        // S3: `endTime` is deliberately omitted — it is optional upstream (pod-client spec,
+        // "Vitals reads accept optional filters"), and this plugin's own clock is not
+        // guaranteed to agree with the Pod's. If this plugin's clock runs even slightly ahead
+        // of the Pod's, an explicit `endTime` sent as "now" by this clock names a moment the
+        // Pod itself considers still in the future, and rows genuinely inserted since the
+        // Pod's own "now" would be silently excluded from the window. Sending only `startTime`
+        // and letting the Pod default the upper bound to its own current time removes that skew
+        // entirely.
+        //
+        // Guarded by this class's own `enabled` predicate below (S4) — this defensive throw is
+        // a second line of defence against `enabled` and `read` ever drifting out of sync.
+        if (typeof client.getVitals !== 'function') {
+          throw new Error('poller: "vitals" class fired without a getVitals method on the client');
+        }
         return client.getVitals(
-          {
-            startTime: new globalThis.Date(now - VITALS_OCCUPIED_WINDOW_MS).toISOString(),
-            endTime: new globalThis.Date(now).toISOString(),
-          },
+          { startTime: new globalThis.Date(this.timers.now() - VITALS_OCCUPIED_WINDOW_MS).toISOString() },
           signal,
         );
       },
       apply: (snapshot, value) => snapshot.observeVitals(value as VitalsResponse),
+      // S4: also requires the client to actually implement `getVitals` — see the `presence`
+      // class registration above for the full rationale.
       enabled: (snapshot) =>
-        this.occupancySource === 'vitals' && snapshot.documents.services?.biometrics.enabled === true,
+        typeof this.client.getVitals === 'function' &&
+        this.occupancySource === 'vitals' &&
+        snapshot.documents.services?.biometrics.enabled === true,
     });
   }
 

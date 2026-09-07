@@ -380,17 +380,71 @@ describe('snapshot store: observePresence (5.3, 5.5, 5.6)', () => {
   it('both sides update from a single observation, independently', () => {
     store.observePresence({
       left: { present: false, lastUpdatedAt: 't0' },
-      right: { present: true, lastUpdatedAt: 't0' },
+      right: { present: false, lastUpdatedAt: 't0' },
     });
     expect(store.get().left.presencePresent).toBe(false);
-    expect(store.get().right.presencePresent).toBe(true);
+    expect(store.get().right.presencePresent).toBe(false);
 
     store.observePresence({
-      left: { present: false, lastUpdatedAt: 't1' },
-      right: { present: true, lastUpdatedAt: 't0' },
+      left: { present: false, lastUpdatedAt: 't1' }, // differs from baseline, but present: false — S1
+      right: { present: true, lastUpdatedAt: 't1' }, // differs from baseline, and present: true
     });
-    expect(store.get().left.presenceActive).toBe(true); // left changed from its baseline
-    expect(store.get().right.presenceActive).toBe(false); // right has not
+    expect(store.get().left.presenceActive).toBe(false); // still unproven — no present:true observation yet
+    expect(store.get().right.presenceActive).toBe(true); // proven, independently of left
+  });
+
+  // -------------------------------------------------------------------------------------
+  // S1 regression: a reboot-shaped observation (differing lastUpdatedAt, present still false)
+  // must not prove the side live — only an observation carrying present: true may.
+  // -------------------------------------------------------------------------------------
+
+  it('S1: a differing lastUpdatedAt alone does not prove — the Pod\'s daily reboot resets ' +
+    'lastUpdatedAt without ever setting present: true, and a dead detection stream must not ' +
+    'read as permanently, confidently "proven" from that alone', () => {
+    store.observePresence({ left: { present: false, lastUpdatedAt: 't0' } }); // baseline
+    // Simulates a reboot: a fresh lastUpdatedAt, but the reset default is always present: false.
+    store.observePresence({ left: { present: false, lastUpdatedAt: 't1' } });
+    expect(store.get().left.presenceActive).toBe(false);
+    // Any number of further reboot-shaped observations still never prove it.
+    store.observePresence({ left: { present: false, lastUpdatedAt: 't2' } });
+    expect(store.get().left.presenceActive).toBe(false);
+  });
+
+  it('S1: a present: true observation proves the side live, even though a reboot-shaped ' +
+    'observation just before it did not', () => {
+    store.observePresence({ left: { present: false, lastUpdatedAt: 't0' } }); // baseline
+    store.observePresence({ left: { present: false, lastUpdatedAt: 't1' } }); // reboot-shaped — no proof
+    expect(store.get().left.presenceActive).toBe(false);
+    store.observePresence({ left: { present: true, lastUpdatedAt: 't2' } }); // a real get-into-bed
+    expect(store.get().left.presenceActive).toBe(true);
+  });
+
+  // -------------------------------------------------------------------------------------
+  // N1 regression: an absent (undefined) lastUpdatedAt on the first-ever observation must not
+  // re-arm "baseline recording" on every later observation, burning the first real transition.
+  // -------------------------------------------------------------------------------------
+
+  it('N1: an undefined lastUpdatedAt on the first observation still lets the very next ' +
+    'differing, present: true observation prove the side', () => {
+    store.observePresence({ left: { present: false, lastUpdatedAt: undefined } }); // baseline: undefined
+    expect(store.get().left.presenceActive).toBe(false);
+    // Without N1's separate `baselineRecorded` flag, this would be misread as "still the first
+    // observation" (baseline === undefined) and merely re-record the baseline instead of proving.
+    store.observePresence({ left: { present: true, lastUpdatedAt: 't1' } });
+    expect(store.get().left.presenceActive).toBe(true);
+  });
+
+  // -------------------------------------------------------------------------------------
+  // N2 regression: a side absent from every presence document ever observed reads as unknown,
+  // not as observed-but-unproven, merely because the other side has been observed.
+  // -------------------------------------------------------------------------------------
+
+  it('N2: a side never once present in any observed document reads presenceActive as unknown, ' +
+    'not false, even once the other side has been observed', () => {
+    store.observePresence({ left: { present: false, lastUpdatedAt: 't0' } }); // right never mentioned
+    expect(store.get().left.presenceActive).toBe(false); // left: observed, not yet proven
+    expect(store.get().right.presenceActive).toBeUndefined(); // right: never observed at all
+    expect(store.get().right.presencePresent).toBeUndefined();
   });
 
   it('an entry absent from a later observation does not un-prove a side already proven', () => {

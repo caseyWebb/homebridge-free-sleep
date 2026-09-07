@@ -115,6 +115,18 @@ describe('construction (7.1)', () => {
     expect(uuids).toEqual(expect.arrayContaining([UUID.occupancyDetected, UUID.statusActive]));
   });
 
+  it('N4: names the service distinctly from the accessory-wide displayName, avoiding a name collision with the thermostat tile', () => {
+    const s = setup();
+    const ctx = contextFor(s, { occupancySource: 'presence' });
+    new OccupancySensorService(ctx, 'left');
+
+    const service = s.accessory.getServiceById(s.api.hap.Service.OccupancySensor, OCCUPANCY_SUBTYPE)!;
+    // `ThermostatService` names its own service `accessory.displayName` verbatim
+    // (`../../src/services/thermostat.ts`) — this must not be the same string.
+    expect(service.displayName).not.toBe(s.accessory.displayName);
+    expect(service.displayName).toBe(`${s.accessory.displayName} Occupancy`);
+  });
+
   it('restores by getServiceById rather than adding a second OccupancySensor', () => {
     const s = setup();
     const ctx = contextFor(s, { occupancySource: 'presence' });

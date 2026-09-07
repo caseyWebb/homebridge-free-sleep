@@ -369,6 +369,18 @@ export class FreeSleepPlatform implements DynamicPlatformPlugin {
     }
   }
 
+  /**
+   * N5: the platform's single source of truth for the configured occupancy source — used
+   * identically by `constructServicesFor` (deciding whether to construct an
+   * `OccupancySensorService`) and `pruneServices` (deciding whether to prune one), which
+   * previously each derived `this.config?.occupancySource ?? 'none'` independently. Both call
+   * sites now read through here so the two can never disagree about what is currently
+   * configured.
+   */
+  private occupancySource(): FreeSleepConfig['occupancySource'] {
+    return this.config?.occupancySource ?? 'none';
+  }
+
   private serviceContextFor(accessory: PlatformAccessory): ServiceContext | undefined {
     if (!this.config || !this.snapshot || !this.writeQueue || !this.awayModeGuard) return undefined;
     return {
@@ -398,7 +410,11 @@ export class FreeSleepPlatform implements DynamicPlatformPlugin {
       // configured — `'none'` (the default) leaves `occupancySensors` empty for this side, and
       // `enabledServiceKeysFor` above already excludes the subtype so restore never carries one
       // to prune in the first place.
-      if (this.config?.occupancySource !== 'none') {
+      //
+      // N5: reads the same `this.occupancySource()` helper `pruneServices` below uses, rather
+      // than each site independently re-deriving `config?.occupancySource ?? 'none'` — so the
+      // two can never observe a different value from each other.
+      if (this.occupancySource() !== 'none') {
         this.occupancySensors.set(role, new OccupancySensorService(ctx, role));
       }
     }
@@ -560,7 +576,7 @@ export class FreeSleepPlatform implements DynamicPlatformPlugin {
    */
   private pruneServices(accessory: PlatformAccessory, role: Role): boolean {
     const accessoryInformationUuid = this.api.hap.Service.AccessoryInformation.UUID;
-    const enabled = enabledServiceKeysFor(this.api.hap, role, this.config?.occupancySource ?? 'none');
+    const enabled = enabledServiceKeysFor(this.api.hap, role, this.occupancySource());
     let removedAny = false;
     for (const service of [...accessory.services]) {
       if (service.UUID === accessoryInformationUuid) continue;

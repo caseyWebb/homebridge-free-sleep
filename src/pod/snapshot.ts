@@ -338,8 +338,17 @@ export class SnapshotStore {
    * `StatusActive`" / "Vitals `StatusActive`"). `presenceBaseline` is this launch's first-ever
    * observed `lastUpdatedAt` per side, recorded once and never updated again; `presenceProven`/
    * `vitalsProven` are sticky — set once true, never unset.
+   *
+   * `presenceBaselineRecorded` (N1) is tracked separately from `presenceBaseline` itself:
+   * `lastUpdatedAt` is an optional field (`./types.ts`'s `PresenceSchema`), so a genuine
+   * first-ever observation can legitimately record a baseline of `undefined` — indistinguishable
+   * from "never observed" if `presenceBaseline[side] === undefined` were used as that signal.
+   * Without this flag, a Pod that never sends `lastUpdatedAt` would re-"record the baseline" on
+   * every observation forever, silently burning every later observation's chance to prove the
+   * side live.
    */
   private readonly presenceBaseline: Record<Side, string | undefined> = { left: undefined, right: undefined };
+  private readonly presenceBaselineRecorded: Record<Side, boolean> = { left: false, right: false };
   private readonly presenceProven: Record<Side, boolean> = { left: false, right: false };
   private readonly vitalsProven: Record<Side, boolean> = { left: false, right: false };
   private readonly overlay = new Map<OverlayKey, OverlayEntry>();
@@ -416,16 +425,29 @@ export class SnapshotStore {
    * against that fixed baseline — once it differs even once, `presenceProven[side]` latches
    * `true` forever, regardless of what any subsequent observation reports (never re-baselined,
    * never unset).
+   *
+   * S1 (tech-lead ruling, occupancy code review): a differing `lastUpdatedAt` alone is not
+   * enough — the proving observation must also report `present === true`. The Pod's daily
+   * reboot re-inits presence state to `{ present: false, lastUpdatedAt: <restart time> }`, so a
+   * dead detection stream still gets a fresh `lastUpdatedAt` on every restart with no real
+   * transition ever occurring; without this check, that alone would satisfy "differs from
+   * baseline" and permanently, wrongly prove the side live. A genuine get-into-bed transition
+   * always reports `present: true`, so this adds no delay to the real case this feature exists
+   * to detect.
    */
   observePresence(data: PresenceData): void {
     this.commit(() => {
       for (const side of SIDES) {
         const entry = data[side];
         if (entry === undefined) continue;
-        const baseline = this.presenceBaseline[side];
-        if (baseline === undefined) {
+        if (!this.presenceBaselineRecorded[side]) {
           this.presenceBaseline[side] = entry.lastUpdatedAt;
-        } else if (!this.presenceProven[side] && entry.lastUpdatedAt !== baseline) {
+          this.presenceBaselineRecorded[side] = true;
+        } else if (
+          !this.presenceProven[side] &&
+          entry.lastUpdatedAt !== this.presenceBaseline[side] &&
+          entry.present === true
+        ) {
           this.presenceProven[side] = true;
         }
       }
@@ -444,6 +466,10 @@ export class SnapshotStore {
   observeVitals(records: VitalsResponse): void {
     this.commit(() => {
       for (const side of SIDES) {
+        // N6: strict equality against the typed `Side` union — an unexpected/malformed `side`
+        // value on a row simply never matches either side, which fails toward "not proven"
+        // rather than crediting the wrong side. Conservative-by-construction, matching this
+        // feature's overall "never confidently wrong" design goal.
         if (!this.vitalsProven[side] && records.some((r) => r.side === side)) {
           this.vitalsProven[side] = true;
         }
@@ -613,7 +639,14 @@ export class SnapshotStore {
       isAlarmVibrating: (alarm?.value as boolean | undefined) ?? rawSide?.isAlarmVibrating,
       awayMode: (away?.value as boolean | undefined) ?? rawSettingsSide?.awayMode,
       presencePresent: this.raw.presence?.[side]?.present,
-      presenceActive: this.presenceProven[side] ? true : this.raw.presence === undefined ? undefined : false,
+      // N2: gated on this *side's own* first observation (`presenceBaselineRecorded`), not on
+      // whether the presence document has ever been observed at all (`this.raw.presence !==
+      // undefined`) — the old check read `false` (rather than unknown) for a side that has
+      // never once appeared in any presence document, as long as the *other* side had, which
+      // both contradicts the "unknown until this side's own first observation" rule
+      // (pod-snapshot spec) and could produce a spurious presenceActive change for a side with
+      // no data of its own.
+      presenceActive: this.presenceProven[side] ? true : this.presenceBaselineRecorded[side] ? false : undefined,
       vitalsOccupied: this.raw.vitals?.some((r) => r.side === side && r.heart_rate != null),
       vitalsActive: this.vitalsProven[side] ? true : this.raw.vitals === undefined ? undefined : false,
     };
