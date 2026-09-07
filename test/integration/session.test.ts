@@ -9,12 +9,13 @@
  * `node:http` server reached over real sockets, and freezing the global timer set would freeze
  * undici's own internals along with the poller's (`test/manualTimers.ts`'s module doc).
  */
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 
 import type { PlatformConfig } from 'homebridge';
 
 import { PodClient } from '../../src/pod/client.js';
 import { FreeSleepPlatform } from '../../src/platform.js';
+import { F_MAX, F_MIN, cToF, fToC } from '../../src/pod/temperature.js';
 import { SettingsSchema } from '../../src/pod/types.js';
 import { PLATFORM_NAME } from '../../src/settings.js';
 import {
@@ -181,6 +182,104 @@ describe('slider-drag guardrail (8.4)', () => {
       await pod.close();
     }
   });
+
+  // -------------------------------------------------------------------------------------
+  // #14 — the full-range drag, racing a stale mid-drag observation
+  // -------------------------------------------------------------------------------------
+
+  it(
+    'a 56-degree full-range drag, racing a stale mid-drag poll observation across a write-queue batch boundary, never snaps the published value backward',
+    async () => {
+      // `pollIntervalMs` cannot go below its 5000ms floor (config.ts's schema, matching
+      // `poller.ts`'s own clamp) — this is also the smallest `writeMaxDebounceMs` cycle length
+      // that still lets the drag span multiple batches without an unreasonably long test.
+      // `ManualTimers.random()` is a fixed 0.5 (test/manualTimers.ts), so the poller's ±10%
+      // jitter term is exactly zero — every poll fires at a deterministic virtual instant, which
+      // is what makes injecting the stale reading at a precise moment below possible at all.
+      const { pod, api, timers } = await bootSession({
+        pollIntervals: { pollIntervalMs: 5000, writeMaxDebounceMs: 2000 },
+      });
+      try {
+        const left = accessoryByName(api, LEFT_NAME);
+        const hap = api.hap;
+        const service = left.getServiceById(hap.Service.Thermostat, 'thermostat')!;
+        const targetTemp = service.getCharacteristic(hap.Characteristic.TargetTemperature);
+        const spy = vi.spyOn(targetTemp, 'updateValue');
+
+        const degreesF: number[] = [];
+        for (let f = F_MIN; f <= F_MAX; f++) degreesF.push(f);
+        expect(degreesF).toHaveLength(56);
+
+        const SPACING_MS = 100;
+        const POLL_INTERVAL_MS = 5000;
+        // The bootstrap poll fires at virtual t=0 (before any `advance()` call), so — with zero
+        // jitter — the next scheduled `deviceStatus` poll fires at exactly t=5000, regardless of
+        // how many intervening write dispatches call `requestMode` in the meantime (they all
+        // recompute the same absolute fire time, since `pollIntervalMs` and the write path's
+        // `fastPollIntervalMs` are both the 5000ms default). At 100ms spacing and a 2000ms
+        // `writeMaxDebounceMs`, this lands exactly on the boundary between the drag's second and
+        // third write-queue batches (batch 1 flushes at t=2000, batch 2 at t=4000) — every batch
+        // up to that point has dispatched and settled (`test/manualTimers.ts`'s `advance()`
+        // always drains to quiescence before returning), so the injected reading below cannot be
+        // immediately overwritten by an in-flight dispatch of the plugin's own writes.
+        const PAUSE_AFTER_WRITES = 40;
+        // Outside 55-110 °F — distinct from every whole degree this drag itself ever writes,
+        // simulating an external, disagreeing observation (e.g. the Pod's own touchscreen, or a
+        // firmware anomaly) racing the drag.
+        const STALE_F = 40;
+
+        const pending: Array<Promise<unknown>> = [];
+        for (let i = 0; i < degreesF.length; i++) {
+          pending.push(targetTemp.handleSetRequest(fToC(degreesF[i]!)));
+          await timers.advance(SPACING_MS);
+          if (i + 1 === PAUSE_AFTER_WRITES) {
+            expect(timers.now()).toBe(PAUSE_AFTER_WRITES * SPACING_MS);
+            // Direct mutation of the mock's own state, bypassing its write-path validation
+            // entirely (module doc: "no plugin policy... applies every write it is given") —
+            // this is not a write this plugin performed, it is what a poll will observe next.
+            pod.state.deviceStatus.left.targetTemperatureF = STALE_F;
+            // Advance exactly to the deterministic poll instant computed above — nothing else is
+            // due in this window (no batch is currently pending; the next write is submitted
+            // only after this call returns), so this advance triggers exactly one event: the
+            // stale-reading poll.
+            await timers.advance(POLL_INTERVAL_MS - timers.now());
+          }
+        }
+        // Flush and settle the drag's final batch (its own debounce/max-wait window).
+        await timers.advance(2000);
+        await Promise.all(pending);
+
+        const posts = postDeviceStatusRequests(pod);
+        // More than one POST — the drag spans more than one write-queue batch, unlike 8.4's
+        // single-batch case.
+        expect(posts.length).toBeGreaterThan(1);
+        const lastBody = posts[posts.length - 1]!.left as Record<string, unknown>;
+        expect(lastBody.targetTemperatureF).toBe(F_MAX);
+
+        const finalValue = (await targetTemp.handleGetRequest()) as number;
+        expect(finalValue).toBeCloseTo(fToC(F_MAX), 5);
+
+        // Sanity: the stale-reading poll actually happened (bootstrap's GET, plus this one).
+        const deviceStatusGets = pod.requests.filter((r) => r.method === 'GET' && r.path === '/api/deviceStatus');
+        expect(deviceStatusGets.length).toBeGreaterThanOrEqual(2);
+
+        // The core guarantee: whatever the characteristic was pushed over the whole drag, it
+        // never regressed, and it never carried the injected stale reading — the write queue's
+        // optimistic overlay masks every disagreeing observation for its entire lifetime
+        // (design.md's "#14" decision), so in practice this list is empty (every push the drag's
+        // own writes would otherwise trigger is suppressed by the shadow claim, same as 8.4/5.1-
+        // 5.2), but the assertion holds either way.
+        const pushedDegreesF = spy.mock.calls.map(([value]) => Math.round(cToF(value as number)));
+        expect(pushedDegreesF).not.toContain(STALE_F);
+        for (let k = 1; k < pushedDegreesF.length; k++) {
+          expect(pushedDegreesF[k]!).toBeGreaterThanOrEqual(pushedDegreesF[k - 1]!);
+        }
+      } finally {
+        await pod.close();
+      }
+    },
+    30_000,
+  );
 });
 
 // ---------------------------------------------------------------------------------------

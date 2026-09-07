@@ -16,7 +16,7 @@
 
 import type { Characteristic, Service } from 'homebridge';
 
-import { cToF, fToC, TARGET_TEMP_PROPS } from '../pod/temperature.ts';
+import { clampTargetF, cToF, fToC, TARGET_TEMP_PROPS } from '../pod/temperature.ts';
 import type { Change, EffectiveSideStatus } from '../pod/snapshot.ts';
 import type { Side } from '../pod/types.ts';
 import type { ServiceContext } from './types.ts';
@@ -153,7 +153,10 @@ export class ThermostatService {
       this.assertNotEscalated();
       const side = this.currentSide();
       if (side.targetTemperatureF === undefined) return targetTempChar.value as number;
-      return fToC(side.targetTemperatureF);
+      // #33: clamp before converting — HAP's TargetTemperature can never report a degree outside
+      // the settable range, and the read schema is deliberately lenient about what the Pod can
+      // report (src/pod/temperature.ts's `clampTargetF` doc).
+      return fToC(clampTargetF(side.targetTemperatureF));
     });
 
     currentTempChar.onGet(() => {
@@ -196,6 +199,11 @@ export class ThermostatService {
     }
     if (!side.isOn) return CurrentState.OFF;
 
+    // Deliberately the raw, unclamped `targetTemperatureF` (design.md's "#33: clamp at three
+    // read sites," row 3 — not one of the two clamped call sites, `onGet` above and `refresh`'s
+    // `pushTemperature` call below). This decides heat-vs-cool direction, not what HomeKit
+    // displays: a target genuinely outside the settable range still means something real about
+    // which way the Pod is driving, and clamping it here could flip the computed sign.
     const delta = side.targetTemperatureF - side.currentTemperatureF;
     if (delta >= 1) return CurrentState.HEAT;
     if (delta <= -1) return CurrentState.COOL;
@@ -283,9 +291,12 @@ export class ThermostatService {
       context,
       'currentF',
     );
+    // #33: clamp before the shadow comparison and the pushed value both use it — the read schema
+    // itself stays lenient (src/pod/temperature.ts's `clampTargetF` doc).
+    const targetF = side.targetTemperatureF === undefined ? undefined : clampTargetF(side.targetTemperatureF);
     this.pushTemperature(
       this.service.getCharacteristic(hap.Characteristic.TargetTemperature),
-      side.targetTemperatureF,
+      targetF,
       context,
       'targetF',
     );

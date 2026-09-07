@@ -96,8 +96,44 @@ client float to `characteristic.value` without snapping it. So the stored value 
 `17.79999`, not our canonical `fToC(64)`. If the poller then pushes the canonical value for
 the *same* °F, HAP sees a change, emits an event, and the slider jumps. Keep a shadow
 `publishedF[side]` (persisted in `accessory.context`), and only push when the °F actually
-differs. Add a `writeSettleMs` window per side so an in-flight poll that started before our
-write cannot roll the UI backwards.
+differs.
+
+**The full-range-drag guarantee, and where `writeSettleMs` actually lives** (`anti-jitter`,
+#14). Dragging the Home app's slider through its whole settable range never produces a visible
+snap-back, including while a stale, disagreeing observation races the drag. This is not a
+separate mechanism layered on top of the shadow above — it falls out of `WriteQueue`'s
+optimistic overlay (`src/pod/writeQueue.ts`, `src/pod/snapshot.ts`), which already does
+everything the original design's "`writeSettleMs` window per side" was reaching for:
+
+- The overlay is installed **synchronously**, inside `submit`'s `Promise` executor, before the
+  write's own `await` yields control — so there is no tick, and therefore no possible poll
+  completion, between the shadow claiming a degree and the overlay pinning the snapshot to it.
+- Every write in a drag re-installs the overlay for that field with a fresh `writeSettleMs`
+  window and the newest value (`syncOverlays`, called on every `submit`, not just the first in a
+  batch) — so the overlay entry is never absent during a continuous drag, and a disagreeing poll
+  observation cannot land in a gap that doesn't exist.
+- A drag spanning `writeMaxDebounceMs` starts a second write cycle with its own overlay-ownership
+  map, but the snapshot's overlay table is keyed by `(side, field)`, not by cycle, so the second
+  cycle's install simply replaces the first's with a newer generation — the two cycles agree,
+  because both are chasing the same drag.
+
+`writeSettleMs` (`src/config.ts`, default 15000) *is* this overlay's lifetime parameter, not a
+second, parallel timestamp check — a `thermostat.ts`-local duplicate would only ever suppress a
+strict *subset* of what the overlay already suppresses, making behavior worse, not better. See
+`openspec/changes/anti-jitter/design.md`'s "#14" decision for the full argument, and
+`test/integration/session.test.ts`'s "slider-drag guardrail" for the full-range-drag-under-race
+proof against the mock.
+
+**Clamp at the boundary, not in the read schema** (#33). `src/pod/types.ts`'s `SideStatusSchema`
+is deliberately lenient about `targetTemperatureF` — a Pod reporting a value outside 55–110 °F
+parses without error — but HAP's `TargetTemperature` characteristic can never report a value
+outside that range (`TARGET_TEMP_PROPS`'s `minValue`/`maxValue`). `src/services/thermostat.ts`
+calls `clampTargetF` (`src/pod/temperature.ts`) at every point an observed target temperature is
+compared against or written into the `publishedF` shadow — `onGet` and `refresh`'s
+`pushTemperature` call — so an out-of-range reading is published as the nearest bound and the
+shadow never records a value HomeKit could not have produced. This does **not** apply to
+`currentTemperatureF` (never clamped — see below) or to the sticky deadband's own delta
+calculation, which deliberately uses the raw, unclamped target to decide heat-vs-cool direction.
 
 **`CurrentTemperature`**: leave the default `minStep` of 0.1; widen the range but do **not**
 clamp it to 55–110 °F. `currentTemperatureF` is derived from the measured level, which can go

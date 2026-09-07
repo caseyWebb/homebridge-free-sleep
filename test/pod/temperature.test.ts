@@ -1,7 +1,7 @@
 import { Characteristic } from '@homebridge/hap-nodejs';
 import { describe, expect, it } from 'vitest';
 
-import { F_MAX, F_MIN, TARGET_TEMP_PROPS, cToF, fToC } from '../../src/pod/temperature.js';
+import { F_MAX, F_MIN, TARGET_TEMP_PROPS, cToF, clampTargetF, fToC } from '../../src/pod/temperature.js';
 
 describe('F_MIN / F_MAX', () => {
   it('reports 55 °F as the minimum and 110 °F as the maximum, both inclusive', () => {
@@ -46,6 +46,24 @@ describe('fToC / cToF', () => {
     // A colder room reading demonstrates the true-negative case: still not clamped.
     expect(fToC(20)).toBeLessThan(0);
     expect(fToC(20)).toBeCloseTo(((20 - 32) * 5) / 9, 10);
+  });
+});
+
+describe('clampTargetF', () => {
+  it('passes an in-range value through unchanged, including both bounds', () => {
+    expect(clampTargetF(70)).toBe(70);
+    expect(clampTargetF(F_MIN)).toBe(F_MIN);
+    expect(clampTargetF(F_MAX)).toBe(F_MAX);
+  });
+
+  it('clamps a below-range value up to F_MIN', () => {
+    expect(clampTargetF(F_MIN - 1)).toBe(F_MIN);
+    expect(clampTargetF(0)).toBe(F_MIN);
+  });
+
+  it('clamps an above-range value down to F_MAX', () => {
+    expect(clampTargetF(F_MAX + 1)).toBe(F_MAX);
+    expect(clampTargetF(500)).toBe(F_MAX);
   });
 });
 

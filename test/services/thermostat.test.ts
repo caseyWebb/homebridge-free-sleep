@@ -571,6 +571,65 @@ describe('failed-write revert (5.4)', () => {
 });
 
 // ---------------------------------------------------------------------------------------
+// #33 — an out-of-range observed target temperature is clamped at the service boundary
+// ---------------------------------------------------------------------------------------
+
+describe('#33: an out-of-range target temperature is clamped at the service boundary (1.2, 1.4)', () => {
+  it('onGet reports the clamped bound, converted, for an above-range or below-range observation', () => {
+    const { ctx } = setup({ observe: false });
+    const { getHandlers } = build(ctx, 'left');
+
+    const above = structuredClone(deviceStatusFixture);
+    above.left.targetTemperatureF = F_MAX + 20;
+    ctx.snapshot.observeDeviceStatus(above);
+    expect(getHandlers.get(UUID.targetTemp)!({} as never, undefined)).toBeCloseTo(fToC(F_MAX), 10);
+
+    const below = structuredClone(deviceStatusFixture);
+    below.left.targetTemperatureF = F_MIN - 20;
+    ctx.snapshot.observeDeviceStatus(below);
+    expect(getHandlers.get(UUID.targetTemp)!({} as never, undefined)).toBeCloseTo(fToC(F_MIN), 10);
+  });
+
+  it('an out-of-range observation publishes the clamped bound, the shadow records the clamped value, and a later in-range observation still pushes exactly once', () => {
+    const { ctx } = setup({ observe: false });
+    const hap = ctx.api.hap;
+    const { service } = build(ctx, 'left');
+    const svc = ctx.accessory.getServiceById(hap.Service.Thermostat, THERMOSTAT_SUBTYPE)!;
+    const spy = vi.spyOn(svc.getCharacteristic(hap.Characteristic.TargetTemperature), 'updateValue');
+
+    // An observation outside 55-110 °F: before the fix, the shadow would record the raw 130 °F,
+    // and the characteristic would be pushed the unclamped (and unreachable) degree.
+    const outOfRange = structuredClone(deviceStatusFixture);
+    outOfRange.left.targetTemperatureF = F_MAX + 20;
+    ctx.snapshot.observeDeviceStatus(outOfRange);
+    service.refresh();
+    expect(spy).toHaveBeenCalledTimes(1);
+    expect(spy).toHaveBeenLastCalledWith(fToC(F_MAX));
+
+    // A second observation reporting the SAME out-of-range degree pushes nothing further — as
+    // far as the shadow comparison is concerned, this is a genuine repeat of the clamped bound
+    // already recorded.
+    const stillOutOfRange = structuredClone(deviceStatusFixture);
+    stillOutOfRange.left.targetTemperatureF = F_MAX + 20;
+    ctx.snapshot.observeDeviceStatus(stillOutOfRange);
+    service.refresh();
+    expect(spy).toHaveBeenCalledTimes(1);
+
+    // A later in-range observation, different from the clamped bound, still produces exactly one
+    // correcting push: the earlier out-of-range reading did not permanently desynchronize the
+    // shadow (design.md's #33 regression scenario; the pre-fix shadow would have recorded 130,
+    // which this 105 °F reading would also have differed from — masking the actual bug this test
+    // guards, which is the *value* pushed on the first observation, asserted above).
+    const inRange = structuredClone(deviceStatusFixture);
+    inRange.left.targetTemperatureF = F_MAX - 5;
+    ctx.snapshot.observeDeviceStatus(inRange);
+    service.refresh();
+    expect(spy).toHaveBeenCalledTimes(2);
+    expect(spy).toHaveBeenLastCalledWith(fToC(F_MAX - 5));
+  });
+});
+
+// ---------------------------------------------------------------------------------------
 // S2 — a mode write claims a shadow too, so it is not echoed back to the writer
 // ---------------------------------------------------------------------------------------
 
