@@ -6,7 +6,12 @@
  * power/duration reduction → one global FIFO mutex across every lane and both write endpoints
  * → dispatch → settle (design.md, "Write queue pipeline"). The optimistic overlay is installed
  * on the snapshot at submission (not dispatch) so the cached view never goes stale while a
- * write is queued, re-based to the settle time on success, and cleared immediately on failure.
+ * write is queued, re-based to the settle time on success, and cleared immediately on failure —
+ * *except* the away-mode-guard mirror's own dispatch (`mirrorToOtherSide` below), whose overlay
+ * is kept and rebased even when its POST fails, since the addressed write it followed already
+ * succeeded and free-sleep's `controlBothSides` already applied it to both sides server-side
+ * (see `settleWrite`'s doc, the shared tail both dispatches share, parameterized by this
+ * distinction — F1 fix).
  *
  * Each write cycle (one lane's accumulating patch, from its first submission through its
  * dispatch settling) owns its overlay handles in a Map private to that cycle — never a
@@ -16,14 +21,28 @@
  * rather than by field is what keeps a later cycle's install, rebase, or clear from ever
  * touching an earlier cycle's still-live overlay for that same field.
  *
- * Imports `client.ts`, `snapshot.ts`, `errors.ts` and `types.ts` only — never `poller.ts`
- * (design.md, "Module dependency direction"). Requesting the post-write confirmation goes
- * through the injected `requestFastPoll(lane, untilMs)` callback instead — `lane` distinguishes
- * a `deviceStatus`-endpoint write (wired to `poller.requestMode('deviceStatus', …)`, the extended
- * fast-poll window) from a `settings`-endpoint write (wired to `poller.refresh('settings')`, a
- * single confirming read — a settings write has no reason to accelerate `deviceStatus` polling).
+ * Imports `client.ts`, `snapshot.ts`, `errors.ts`, `types.ts` and — as of the away-mode-guard
+ * change — `awayModeGuard.ts` (never `poller.ts`; design.md, "Module dependency direction").
+ * Requesting the post-write confirmation goes through the injected `requestFastPoll(lane,
+ * untilMs)` callback instead — `lane` distinguishes a `deviceStatus`-endpoint write (wired to
+ * `poller.requestMode('deviceStatus', …)`, the extended fast-poll window) from a
+ * `settings`-endpoint write (wired to `poller.refresh('settings')`, a single confirming read — a
+ * settings write has no reason to accelerate `deviceStatus` polling).
+ *
+ * **Away-mode guard (tech-lead resolution 2, away-mode-guard/design.md's final "Resolutions"
+ * section):** every side-lane dispatch consults the injected `AwayModeGuard` — deliberately
+ * *inside* `dispatch()`, not as a front-door wrapper callers must remember to use, so that
+ * `submitSide` protects every originator (thermostat, keep-alive, any future caller) uniformly.
+ * This does narrow the pod-write-queue spec's original "the queue holds no policy about away
+ * mode" requirement (see that spec's own delta in this change) — the queue still originates no
+ * write of its own on behalf of a *caller* and still never reads schedules; it now *does* apply
+ * the configured away-mode policy to a side write it is asked to dispatch. The decision itself
+ * is a synchronous snapshot read with no `await`, and `dispatch()` already runs serialized behind
+ * the write mutex for its entire async lifetime (see `pumpMutex` below) — so no separate
+ * `runExclusive` call is needed to make the check atomic against another in-flight dispatch.
  */
 
+import { AwayModeGuard, AwayModeBlockedError, type AwayModeDecision } from './awayModeGuard.ts';
 import type { PodClient } from './client.ts';
 import { defaultLogger, defaultTimerApi, type Logger, type OverlayHandle, type SnapshotStore, type TimerApi, type TimerHandle } from './snapshot.ts';
 import type { DeviceStatusPatch, SettingsPatch, Side } from './types.ts';
@@ -60,6 +79,14 @@ export interface WriteQueueOptions {
   snapshot: SnapshotStore;
   /** Called on success only, naming which class's confirmation the dispatch needs. */
   requestFastPoll: (lane: FastPollLane, untilMs: number) => void;
+  /**
+   * Consulted on every side-lane dispatch (away-mode-guard change, tech-lead resolution 2).
+   * Defaults to an internally-constructed guard using `policy: 'mirror'` (the config default)
+   * against the same `snapshot` — so a caller that doesn't care about away mode (most existing
+   * tests, and any future caller that never configures the policy) gets exactly today's
+   * behavior: `decide()` returns `'plain'` whenever neither side is away, at zero extra cost.
+   */
+  awayModeGuard?: AwayModeGuard;
   timers?: TimerApi;
   logger?: Logger;
   /** Trailing-edge debounce per lane. Default 400, enforced minimum 100. */
@@ -120,10 +147,15 @@ function isSideLane(lane: LaneId): lane is Side {
   return lane === 'left' || lane === 'right';
 }
 
+function describeError(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
 export class WriteQueue {
   private readonly client: PodClient;
   private readonly snapshot: SnapshotStore;
   private readonly requestFastPoll: (lane: FastPollLane, untilMs: number) => void;
+  private readonly awayModeGuard: AwayModeGuard;
   private readonly timers: TimerApi;
   private readonly logger: Logger;
 
@@ -161,6 +193,9 @@ export class WriteQueue {
     this.writeMaxDebounceMs = options.writeMaxDebounceMs ?? 2000;
     this.writeSettleMs = options.writeSettleMs ?? 15_000;
     this.fastPollDurationMs = options.fastPollDurationMs ?? 90_000;
+
+    this.awayModeGuard =
+      options.awayModeGuard ?? new AwayModeGuard({ snapshot: options.snapshot, policy: 'mirror', logger: this.logger });
   }
 
   // -----------------------------------------------------------------------------------
@@ -316,36 +351,149 @@ export class WriteQueue {
 
   private async dispatch(lane: LaneId, patch: object, waiters: Waiter[], ownership: Map<string, OverlayHandle>): Promise<void> {
     let body: object;
+    let sideReduced: SidePatch | undefined;
+    let awayDecision: AwayModeDecision = 'plain';
     if (isSideLane(lane)) {
-      const reduced = reduceDurationFields(patch as SidePatch);
-      this.logger.debug(`writeQueue: ${lane} submitted ${JSON.stringify(patch)}, dispatching ${JSON.stringify(reduced)}`);
-      body = { [lane]: reduced };
+      sideReduced = reduceDurationFields(patch as SidePatch);
+      this.logger.debug(`writeQueue: ${lane} submitted ${JSON.stringify(patch)}, dispatching ${JSON.stringify(sideReduced)}`);
+      body = { [lane]: sideReduced };
+
+      // Away-mode guard consultation (see the module doc's "Away-mode guard" section): a
+      // synchronous decision, made and acted on before any request for this write is issued.
+      awayDecision = this.awayModeGuard.decide();
+      if (awayDecision === 'block') {
+        if (!this.stopped) this.clearOwnership(ownership);
+        this.liveOverlayBatches.delete(ownership);
+        waiters.forEach((w) => w.reject(new AwayModeBlockedError()));
+        return;
+      }
     } else if (lane === 'device') {
       body = { settings: patch };
     } else {
       body = patch;
     }
 
+    const fastPollLane: FastPollLane = lane === 'settings' ? 'settings' : 'deviceStatus';
     try {
-      if (lane === 'settings') {
-        await this.client.postSettings(body as SettingsPatch);
-      } else {
-        await this.client.postDeviceStatus(body as DeviceStatusPatch);
-      }
-      if (!this.stopped) {
-        this.rebaseOwnership(ownership);
-        const fastPollLane: FastPollLane = lane === 'settings' ? 'settings' : 'deviceStatus';
-        this.requestFastPoll(fastPollLane, this.timers.now() + this.fastPollDurationMs);
+      await this.settleWrite(
+        ownership,
+        fastPollLane,
+        () =>
+          lane === 'settings'
+            ? this.client.postSettings(body as SettingsPatch)
+            : this.client.postDeviceStatus(body as DeviceStatusPatch),
+        'clear',
+      );
+      if (!this.stopped && isSideLane(lane) && awayDecision === 'mirror' && sideReduced) {
+        this.mirrorToOtherSide(lane, sideReduced);
       }
       waiters.forEach((w) => w.resolve());
     } catch (error) {
-      if (!this.stopped) {
+      waiters.forEach((w) => w.reject(error));
+    }
+  }
+
+  /**
+   * The shared post → rebase/clear → requestFastPoll tail every dispatch (addressed or
+   * mirrored) ends with, parameterized by what a *failed* POST should do to `ownership`'s
+   * overlay (F1 fix):
+   *
+   * - `'clear'` (the addressed dispatch): if the Pod never received this write, its overlay is
+   *   the only record of an intent that never took effect — keeping it would show the caller a
+   *   value the Pod doesn't have, so it is cleared immediately, reverting `get()` to raw truth.
+   * - `'rebase'` (the mirror's own one-shot dispatch, see `mirrorToOtherSide` below): the mirror
+   *   only ever runs *after* the addressed POST already succeeded, and free-sleep's
+   *   `controlBothSides` applies that addressed write to **both** sides server-side (`docs/
+   *   POD-API.md`) — so even when this second, mirrored POST itself fails, the overlay's value
+   *   is still more truthful than falling back to the stale raw cache. It is kept and rebased
+   *   exactly like a success, rather than cleared.
+   *
+   * Success always rebases and requests the fast poll, regardless of policy — `onFailure` only
+   * changes what happens when `post()` rejects. `liveOverlayBatches` bookkeeping happens here
+   * once, for every caller, instead of being duplicated at each call site.
+   */
+  private async settleWrite(
+    ownership: Map<string, OverlayHandle>,
+    fastPollLane: FastPollLane,
+    post: () => Promise<void>,
+    onFailure: 'clear' | 'rebase',
+  ): Promise<void> {
+    let error: unknown;
+    try {
+      await post();
+    } catch (caught) {
+      error = caught;
+    }
+    const succeeded = error === undefined;
+    if (!this.stopped) {
+      if (succeeded || onFailure === 'rebase') {
+        this.rebaseOwnership(ownership);
+        this.requestFastPoll(fastPollLane, this.timers.now() + this.fastPollDurationMs);
+      } else {
         this.clearOwnership(ownership);
       }
-      waiters.forEach((w) => w.reject(error));
-    } finally {
-      this.liveOverlayBatches.delete(ownership);
     }
+    this.liveOverlayBatches.delete(ownership);
+    if (!succeeded) throw error;
+  }
+
+  /**
+   * The `'mirror'` policy's extra write (design.md, "Mirroring reuses `submitSide`, not a second
+   * overlay writer"): reuses this queue's own overlay-install/rebase/clear/fast-poll machinery
+   * for the mirrored side, but as a dedicated, one-shot mutex task rather than by re-entering
+   * `submitSide`/`dispatch()` for the other side.
+   *
+   * This is deliberate, not merely an optimization: re-entering `dispatch()` for the mirrored
+   * side would consult `awayModeGuard.decide()` again there too, and — since the policy and the
+   * away-mode state have not changed — it would decide `'mirror'` again and mirror *back* to the
+   * originating side, and so on forever. Moving the guard consultation inside `dispatch()`
+   * (resolution 2) makes every side-lane dispatch a candidate for guarding, including one this
+   * method itself creates; this method sidesteps that by never routing its own write back
+   * through the guarded path at all — it only ever installs the overlay and dispatches once.
+   *
+   * Only the overlayable fields (`targetTemperatureF`, `isOn`, `isAlarmVibrating`) are mirrored —
+   * `secondsRemaining` is never overlayable (`snapshot.ts`'s `OverlayableField`) and is not a
+   * "user-visible field" the away-mode-guard spec asks to be reflected.
+   */
+  private mirrorToOtherSide(side: Side, reduced: SidePatch): void {
+    const otherSide: Side = side === 'left' ? 'right' : 'left';
+    const mirrorPatch: SidePatch = {};
+    if (reduced.targetTemperatureF !== undefined) mirrorPatch.targetTemperatureF = reduced.targetTemperatureF;
+    if (reduced.isOn !== undefined) mirrorPatch.isOn = reduced.isOn;
+    if (reduced.isAlarmVibrating !== undefined) mirrorPatch.isAlarmVibrating = reduced.isAlarmVibrating;
+    if (Object.keys(mirrorPatch).length === 0) return;
+
+    const ownership = new Map<string, OverlayHandle>();
+    this.liveOverlayBatches.add(ownership);
+    // Installed synchronously, right now — before the mirrored request is even issued — so the
+    // cached view (and HomeKit) reflects the other side's change without waiting for a poll,
+    // matching every other overlay install this queue makes (module doc, "The optimistic overlay
+    // is installed on the snapshot at submission").
+    this.syncSideOverlays(otherSide, mirrorPatch, ownership);
+
+    const task: MutexTask = {
+      run: async () => {
+        try {
+          await this.settleWrite(
+            ownership,
+            'deviceStatus',
+            () => this.client.postDeviceStatus({ [otherSide]: mirrorPatch } as DeviceStatusPatch),
+            // F1 fix: a failed mirror POST keeps (rebases) the overlay rather than clearing it —
+            // see `settleWrite`'s doc for why the overlay is still more truthful than raw cache
+            // here, unlike the addressed dispatch's 'clear' policy.
+            'rebase',
+          );
+        } catch (error) {
+          this.logger.debug(`writeQueue: mirrored away-mode write to ${otherSide} failed: ${describeError(error)}`);
+        }
+      },
+      abandon: () => {
+        this.clearOwnership(ownership);
+        this.liveOverlayBatches.delete(ownership);
+      },
+    };
+    this.mutexQueue.push(task);
+    this.pumpMutex();
   }
 
   // -----------------------------------------------------------------------------------

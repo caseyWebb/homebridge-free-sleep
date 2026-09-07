@@ -503,4 +503,60 @@ describe('shutdown stops polling, the write path and the subscription (tasks.md 
       vi.useRealTimers();
     }
   });
+
+  it("a blocked write's pending away-mode-revert timer is cleared by shutdown (tasks.md 2.3, F2 regression)", async () => {
+    vi.useFakeTimers();
+    try {
+      const timers = createTimerHarness();
+      const api = new FakeHomebridgeApi();
+      const log = createFakeLogging();
+      const awaySettings = {
+        ...structuredClone(fixtureSettings),
+        left: { ...fixtureSettings.left, awayMode: true },
+      };
+      const client = resolvedFakeClient({ getSettings: () => Promise.resolve(awaySettings) });
+
+      const platform = new FreeSleepPlatform(
+        log,
+        baseConfig({ awayModeWritePolicy: 'block' }),
+        api.asApi(),
+        client,
+        timers,
+      );
+      await api.fireDidFinishLaunching();
+      const perAccessoryOverhead = api.registeredAccessories.length;
+
+      // Left is away under the 'block' policy, so a write to *either* side is refused —
+      // addressed here at right, matching `writeQueue`'s "either side away" symmetry. The
+      // seeded `getSettings` response above carries the fixture's own side names ("Left"/
+      // "Right", `test/fixtures/settings.json`), not the `FALLBACK_NAME` ones, since
+      // `nameFor` prefers a non-empty name from the one-time settings read.
+      const hap = api.asApi().hap;
+      const right = api.registeredAccessories.find((a) => a.displayName === 'Right')!;
+      const targetTemp = right
+        .getServiceById(hap.Service.Thermostat, THERMOSTAT_SUBTYPE)!
+        .getCharacteristic(hap.Characteristic.TargetTemperature);
+
+      const pending = targetTemp.handleSetRequest(fToC(70));
+      pending.catch(() => undefined);
+      await vi.advanceTimersByTimeAsync(400); // debounce flush -> dispatch -> guard blocks
+      await expect(pending).rejects.toBe(hap.HAPStatus.NOT_ALLOWED_IN_CURRENT_STATE);
+
+      // The block's ~500ms corrective-refresh timer (thermostat.ts's `scheduleAwayModeRevert`)
+      // is now pending, not yet fired — exactly the reviewer-reproduced state ("1 pending timer
+      // after fireShutdown with a blocked write") this test locks in a fix for.
+      expect(timers.pendingCount()).toBeGreaterThan(perAccessoryOverhead);
+
+      await api.fireShutdown();
+
+      // Before the F2 fix, this timer was never retained/cleared and survived shutdown; after
+      // the fix, `ThermostatService.stop()` (wired into the platform's shutdown handler) clears
+      // it, so shutdown leaves nothing pending beyond hap-nodejs's own fixed per-accessory
+      // overhead — same bar the plain 7.4 shutdown test above holds to.
+      expect(timers.pendingCount()).toBe(perAccessoryOverhead);
+      void platform;
+    } finally {
+      vi.useRealTimers();
+    }
+  });
 });

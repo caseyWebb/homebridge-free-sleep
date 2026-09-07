@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
+import { AwayModeBlockedError, AwayModeGuard, type AwayModeWritePolicy } from '../src/pod/awayModeGuard.js';
 import { PodClient } from '../src/pod/client.js';
 import { SnapshotStore, type Change } from '../src/pod/snapshot.js';
 import { WriteQueue, WriteQueueStoppedError, type FastPollLane, type SidePatch, type WriteQueueOptions } from '../src/pod/writeQueue.js';
@@ -28,7 +29,11 @@ interface Setup {
 }
 
 function setup(
-  options: Partial<Omit<WriteQueueOptions, 'client' | 'snapshot' | 'requestFastPoll' | 'timers'>> = {},
+  options: Partial<Omit<WriteQueueOptions, 'client' | 'snapshot' | 'requestFastPoll' | 'timers'>> & {
+    /** Shorthand for `awayModeGuard`, since building one needs a reference to the `snapshot`
+     * this function constructs internally — not available to a caller passing `options` in. */
+    awayModePolicy?: AwayModeWritePolicy;
+  } = {},
   seed: { deviceStatus?: DeviceStatus } = {},
 ): Setup {
   const timers = createTimerHarness();
@@ -46,12 +51,14 @@ function setup(
     services: servicesFixture,
   });
   const fastPollRequests: Array<{ lane: FastPollLane; untilMs: number }> = [];
+  const { awayModePolicy, ...queueOptions } = options;
   const queue = new WriteQueue({
     client: fake.client,
     snapshot,
     requestFastPoll: (lane, untilMs) => fastPollRequests.push({ lane, untilMs }),
     timers,
-    ...options,
+    ...(awayModePolicy ? { awayModeGuard: new AwayModeGuard({ snapshot, policy: awayModePolicy }) } : {}),
+    ...queueOptions,
   });
   return { timers, snapshot, fake, fastPollRequests, queue };
 }
@@ -588,10 +595,21 @@ describe('write queue: a failed dispatch never clears a newer pending cycle\'s o
   });
 });
 
-describe('write queue: no policy (9.6)', () => {
-  it('an away-mode write is dispatched unmodified — the queue does not guard it', async () => {
-    const { queue, fake, snapshot } = setup();
-    snapshot.observeSettings({ ...structuredClone(settingsFixture), left: { ...settingsFixture.left, awayMode: true } });
+// ---------------------------------------------------------------------------------------
+// 9.6 — away-mode guard, consulted at dispatch (away-mode-guard change)
+//
+// Adaptation note (tech-lead resolution 2): this section replaces the pre-existing "the queue
+// holds no policy about away mode" behavior (formerly asserted here) — enforcement now lives
+// inside `dispatch()` itself, consulted for every side-lane write regardless of origin, rather
+// than in a front-door wrapper. `setup()`'s default (no `awayModePolicy` option) still exercises
+// today's zero-cost path unchanged: `AwayModeGuard.decide()` returns `'plain'` whenever neither
+// side is away, matching the "queue is a no-op guard" behavior every other describe block in
+// this file already depends on implicitly.
+// ---------------------------------------------------------------------------------------
+
+describe('write queue: away-mode guard (9.6)', () => {
+  it('with neither side away, a write is dispatched exactly as submitted — the guard adds no request', async () => {
+    const { queue, fake } = setup();
     const p = queue.submitSide('right', { targetTemperatureF: 68 });
     await vi.advanceTimersByTimeAsync(400);
     await p;
@@ -599,7 +617,102 @@ describe('write queue: no policy (9.6)', () => {
     queue.stop();
   });
 
-  it("with the real mock, the Pod's own away-mode mirroring still applies — the queue neither knows nor blocks it", async () => {
+  it("the default policy ('mirror') dispatches the addressed side and mirrors the same fields to the other side, updating its cached view without a poll", async () => {
+    const { queue, fake, snapshot } = setup();
+    snapshot.observeSettings({ ...structuredClone(settingsFixture), left: { ...settingsFixture.left, awayMode: true } });
+    const p = queue.submitSide('right', { targetTemperatureF: 68 });
+    await vi.advanceTimersByTimeAsync(400);
+    await p;
+    expect(fake.postDeviceStatusCalls).toEqual([
+      { right: { targetTemperatureF: 68 } },
+      { left: { targetTemperatureF: 68 } },
+    ]);
+    expect(snapshot.get().left.targetTemperatureF).toBe(68);
+    queue.stop();
+  });
+
+  it("an explicit 'block' policy refuses the write before it reaches the Pod, and the cached view is unchanged", async () => {
+    const { queue, fake, snapshot } = setup({ awayModePolicy: 'block' });
+    snapshot.observeSettings({ ...structuredClone(settingsFixture), left: { ...settingsFixture.left, awayMode: true } });
+    const before = snapshot.get().right.targetTemperatureF;
+    const p = queue.submitSide('right', { targetTemperatureF: 68 });
+    p.catch(() => undefined);
+    await vi.advanceTimersByTimeAsync(400);
+    await expect(p).rejects.toBeInstanceOf(AwayModeBlockedError);
+    expect(fake.postDeviceStatusCalls).toHaveLength(0);
+    expect(snapshot.get().right.targetTemperatureF).toBe(before);
+    queue.stop();
+  });
+
+  it('either side being away is sufficient to trigger the policy — right-away + left-write, and both-away, behave identically', async () => {
+    const rightAwayOnly: Settings = {
+      ...structuredClone(settingsFixture),
+      right: { ...settingsFixture.right, awayMode: true },
+    };
+    const bothAway: Settings = {
+      ...structuredClone(settingsFixture),
+      left: { ...settingsFixture.left, awayMode: true },
+      right: { ...settingsFixture.right, awayMode: true },
+    };
+    for (const awaySettings of [rightAwayOnly, bothAway]) {
+      const { queue, fake, snapshot } = setup({ awayModePolicy: 'block' });
+      snapshot.observeSettings(awaySettings);
+      const p = queue.submitSide('left', { targetTemperatureF: 68 });
+      p.catch(() => undefined);
+      await vi.advanceTimersByTimeAsync(400);
+      await expect(p).rejects.toBeInstanceOf(AwayModeBlockedError);
+      expect(fake.postDeviceStatusCalls).toHaveLength(0);
+      queue.stop();
+    }
+  });
+
+  it('a concurrent away-mode toggle does not race the check: a settings write installs its overlay synchronously, before any later-submitted side write can dispatch', async () => {
+    const { queue, fake } = setup({ awayModePolicy: 'block' });
+    // Submitted back-to-back, in the same synchronous tick — `submitSettings`'s overlay install
+    // happens synchronously at the call site (design.md's Context), so by the time the side
+    // write's own debounce later flushes and dispatches, the guard's check always observes the
+    // toggle, regardless of how close together the two calls were made.
+    const toggle = queue.submitSettings({ left: { awayMode: true } });
+    const write = queue.submitSide('right', { targetTemperatureF: 68 });
+    write.catch(() => undefined);
+    await vi.advanceTimersByTimeAsync(400);
+    await toggle;
+    await expect(write).rejects.toBeInstanceOf(AwayModeBlockedError);
+    expect(fake.postDeviceStatusCalls).toHaveLength(0);
+    queue.stop();
+  });
+
+  it("a failed mirror POST keeps the mirrored side's overlay instead of clearing it, since the addressed write already succeeded and free-sleep's controlBothSides already applied it to both sides (F1 regression)", async () => {
+    const { queue, fake, snapshot } = setup();
+    snapshot.observeSettings({ ...structuredClone(settingsFixture), left: { ...settingsFixture.left, awayMode: true } });
+
+    // The addressed (right) POST succeeds; every POST after it (the mirror, to left) fails —
+    // reproducing the reviewer's probe: before the F1 fix this cleared the mirror's overlay,
+    // leaving `snapshot.get().left.targetTemperatureF` at the stale raw fixture value (90)
+    // instead of the value the addressed write actually caused free-sleep to apply there too.
+    fake.client.postDeviceStatus = (async (patch) => {
+      fake.postDeviceStatusCalls.push(patch);
+      if (fake.postDeviceStatusCalls.length > 1) {
+        throw new Error('mirror POST failed');
+      }
+    }) as typeof fake.client.postDeviceStatus;
+
+    const p = queue.submitSide('right', { targetTemperatureF: 68 });
+    await vi.advanceTimersByTimeAsync(400);
+    await p;
+
+    expect(fake.postDeviceStatusCalls).toEqual([
+      { right: { targetTemperatureF: 68 } },
+      { left: { targetTemperatureF: 68 } },
+    ]);
+    // Reviewer probe showed left=90 (stale raw cache) / right=68 before the fix; both must now
+    // read 68 — the mirrored side's overlay is kept, not cleared, on a failed mirror POST.
+    expect(snapshot.get().right.targetTemperatureF).toBe(68);
+    expect(snapshot.get().left.targetTemperatureF).toBe(68);
+    queue.stop();
+  });
+
+  it("with the real mock, the Pod's own away-mode mirroring and this queue's own mirrored write agree", async () => {
     // Real timers only — see the note on the 8.2 describe block above.
     vi.useRealTimers();
     const pod = await startMockPod({ state: { settings: { left: { awayMode: true } } } });
@@ -607,13 +720,21 @@ describe('write queue: no policy (9.6)', () => {
       const timers = createTimerHarness();
       const snapshot = new SnapshotStore({ timers });
       const client = clientFor(pod);
+      // The guard's decision reads the *cached* snapshot, not a live request (design.md's own
+      // "no request dedicated solely to that check") — so, unlike the Pod's own `updateSide`
+      // (which reads its live settings document on every write), this plugin's own mirroring
+      // only fires once the poller (or, here, a direct observation standing in for it) has
+      // actually told the snapshot that a side is away.
+      snapshot.observeSettings(await client.getSettings());
       const queue = new WriteQueue({ client, snapshot, requestFastPoll: () => {}, timers });
       const p = queue.submitSide('right', { targetTemperatureF: 90 });
-      await realDelay(450);
+      await realDelay(600);
       await p;
       const status = await client.getDeviceStatus();
       expect(status.left.targetTemperatureF).toBe(90);
       expect(status.right.targetTemperatureF).toBe(90);
+      const statusPosts = pod.requests.filter((r) => r.method === 'POST' && r.path === '/api/deviceStatus');
+      expect(statusPosts.length).toBe(2); // the addressed right write, plus this queue's own mirror to left
       queue.stop();
     } finally {
       await pod.close();

@@ -16,6 +16,7 @@
 import type { API, Logging, PlatformAccessory } from 'homebridge';
 
 import type { FreeSleepConfig } from '../config.ts';
+import type { AwayModeGuard } from '../pod/awayModeGuard.ts';
 import type { SnapshotStore, TimerApi } from '../pod/snapshot.ts';
 import type { WriteQueue } from '../pod/writeQueue.ts';
 
@@ -25,6 +26,14 @@ export interface ServiceContext {
   readonly accessory: PlatformAccessory;
   readonly snapshot: SnapshotStore;
   readonly writeQueue: WriteQueue;
+  /**
+   * The same instance `writeQueue` itself consults on every side-lane dispatch (away-mode-guard
+   * change, tech-lead resolution 2) — services never need to call this directly to be protected
+   * (`writeQueue.submitSide` already routes every side write through it), but it is threaded
+   * through here for parity with `snapshot`/`writeQueue` and for anything that wants to inspect
+   * or test the configured policy directly.
+   */
+  readonly awayModeGuard: AwayModeGuard;
   /** The same `TimerApi` instance shared with the poller and the write queue. */
   readonly timers: TimerApi;
   readonly config: FreeSleepConfig;
