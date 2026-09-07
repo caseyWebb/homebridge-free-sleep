@@ -908,7 +908,14 @@ describe("write queue: away-mode guard — alarm-only bypass (alarm-events, tech
     queue.stop();
   });
 
-  it('a patch carrying isAlarmVibrating alongside another field keeps full guard semantics — blocked under \'block\' + away', async () => {
+  // N8 (alarm-events PR #45 review, tech-lead ruling): a dismiss coalesced with any other field
+  // is peeled into its own dispatch cycle *before* `awayModeGuard.decide()` ever runs — the
+  // alarm field always lands on the addressed side, while the remainder gets ordinary guard
+  // treatment (blocked, or mirrored) as if the two fields had never coalesced. These two tests
+  // used to assert the opposite (a coalesced patch inherited the remainder's guard outcome
+  // wholesale) — that was the bug N8 fixes; see the "N8: a coalesced dismiss..." describe block
+  // below for the reviewer's own four repro orderings.
+  it('a patch carrying isAlarmVibrating alongside another field: the alarm field still lands, blocked under \'block\' + away', async () => {
     const { queue, fake, snapshot } = setup({ awayModePolicy: 'block' });
     snapshot.observeSettings({ ...structuredClone(settingsFixture), left: { ...settingsFixture.left, awayMode: true } });
 
@@ -916,11 +923,13 @@ describe("write queue: away-mode guard — alarm-only bypass (alarm-events, tech
     p.catch(() => undefined);
     await vi.advanceTimersByTimeAsync(400);
     await expect(p).rejects.toBeInstanceOf(AwayModeBlockedError);
-    expect(fake.postDeviceStatusCalls).toHaveLength(0);
+    // The alarm-only peel landed (addressed side, alarm field only); the guarded remainder
+    // (targetTemperatureF) never reached the Pod at all — no guard evasion for the non-alarm field.
+    expect(fake.postDeviceStatusCalls).toEqual([{ right: { isAlarmVibrating: false } }]);
     queue.stop();
   });
 
-  it('a patch carrying isAlarmVibrating alongside another field keeps full guard semantics — mirrored under \'mirror\' + away', async () => {
+  it('a patch carrying isAlarmVibrating alongside another field: the alarm field lands addressed-only, the remainder mirrors normally, under \'mirror\' + away', async () => {
     const { queue, fake, snapshot } = setup({ awayModePolicy: 'mirror' });
     snapshot.observeSettings({ ...structuredClone(settingsFixture), left: { ...settingsFixture.left, awayMode: true } });
 
@@ -929,11 +938,15 @@ describe("write queue: away-mode guard — alarm-only bypass (alarm-events, tech
     await p;
 
     expect(fake.postDeviceStatusCalls).toEqual([
-      { right: { isAlarmVibrating: false, targetTemperatureF: 70 } },
-      // The mirror only ever carries the overlayable fields (targetTemperatureF, isOn,
-      // isAlarmVibrating are all overlayable — writeQueue.ts's `mirrorToOtherSide`), so both
-      // fields of this mixed patch are mirrored here, unlike the alarm-only bypass case above.
-      { left: { targetTemperatureF: 70, isAlarmVibrating: false } },
+      // The peeled alarm-only cycle, dispatched (and awaited) before the remainder's own guard
+      // decision is even made.
+      { right: { isAlarmVibrating: false } },
+      // The remainder's own addressed dispatch — guard decides 'mirror' (unaffected by the
+      // alarm field's own exemption, since it is no longer part of this patch at all).
+      { right: { targetTemperatureF: 70 } },
+      // S6: the mirror itself never carries isAlarmVibrating, whether or not one was ever
+      // coalesced into the original patch.
+      { left: { targetTemperatureF: 70 } },
     ]);
     queue.stop();
   });
@@ -948,6 +961,77 @@ describe("write queue: away-mode guard — alarm-only bypass (alarm-events, tech
       { right: { targetTemperatureF: 68 } },
       { left: { targetTemperatureF: 68 } },
     ]);
+    queue.stop();
+  });
+});
+
+// N8 (alarm-events PR #45 review, tech-lead ruling): the reviewer's own four orderings in which a
+// dismiss can coalesce with a guarded field in the same debounce window — every one must land the
+// alarm write on exactly the addressed side while the guarded remainder is blocked normally, with
+// no guard evasion for the non-alarm field(s).
+describe("write queue: N8 — a coalesced dismiss is peeled into its own dispatch cycle, ahead of the guard", () => {
+  it('dismiss submitted before isOn: the alarm write lands, isOn is blocked', async () => {
+    const { queue, fake, snapshot } = setup({ awayModePolicy: 'block' });
+    snapshot.observeSettings({ ...structuredClone(settingsFixture), left: { ...settingsFixture.left, awayMode: true } });
+
+    const dismissP = queue.submitSide('right', { isAlarmVibrating: false });
+    dismissP.catch(() => undefined);
+    const isOnP = queue.submitSide('right', { isOn: true });
+    isOnP.catch(() => undefined);
+    await vi.advanceTimersByTimeAsync(400);
+
+    await expect(isOnP).rejects.toBeInstanceOf(AwayModeBlockedError);
+    expect(fake.postDeviceStatusCalls).toEqual([{ right: { isAlarmVibrating: false } }]); // isOn never evaded the guard
+    queue.stop();
+  });
+
+  it('isOn submitted before dismiss: the alarm write still lands, isOn is still blocked', async () => {
+    const { queue, fake, snapshot } = setup({ awayModePolicy: 'block' });
+    snapshot.observeSettings({ ...structuredClone(settingsFixture), left: { ...settingsFixture.left, awayMode: true } });
+
+    const isOnP = queue.submitSide('right', { isOn: true });
+    isOnP.catch(() => undefined);
+    const dismissP = queue.submitSide('right', { isAlarmVibrating: false });
+    dismissP.catch(() => undefined);
+    await vi.advanceTimersByTimeAsync(400);
+
+    await expect(isOnP).rejects.toBeInstanceOf(AwayModeBlockedError);
+    expect(fake.postDeviceStatusCalls).toEqual([{ right: { isAlarmVibrating: false } }]);
+    queue.stop();
+  });
+
+  it('dismiss coalesced with a keep-alive secondsRemaining re-arm: the alarm write lands, secondsRemaining is blocked', async () => {
+    const { queue, fake, snapshot } = setup({ awayModePolicy: 'block' });
+    snapshot.observeSettings({ ...structuredClone(settingsFixture), left: { ...settingsFixture.left, awayMode: true } });
+
+    const dismissP = queue.submitSide('right', { isAlarmVibrating: false });
+    dismissP.catch(() => undefined);
+    const keepAliveP = queue.submitSide('right', { secondsRemaining: 500 }, 'keepAlive');
+    keepAliveP.catch(() => undefined);
+    await vi.advanceTimersByTimeAsync(400);
+
+    await expect(keepAliveP).rejects.toBeInstanceOf(AwayModeBlockedError);
+    expect(fake.postDeviceStatusCalls).toEqual([{ right: { isAlarmVibrating: false } }]);
+    queue.stop();
+  });
+
+  it('all three coalesced (dismiss, user isOn, keep-alive secondsRemaining): the alarm write still lands alone, addressed side only', async () => {
+    const { queue, fake, snapshot } = setup({ awayModePolicy: 'block' });
+    snapshot.observeSettings({ ...structuredClone(settingsFixture), left: { ...settingsFixture.left, awayMode: true } });
+
+    const dismissP = queue.submitSide('right', { isAlarmVibrating: false });
+    dismissP.catch(() => undefined);
+    const isOnP = queue.submitSide('right', { isOn: true });
+    isOnP.catch(() => undefined);
+    const keepAliveP = queue.submitSide('right', { secondsRemaining: 500 }, 'keepAlive');
+    keepAliveP.catch(() => undefined);
+    await vi.advanceTimersByTimeAsync(400);
+
+    // User-intent priority (module doc) drops the keep-alive `secondsRemaining` before the
+    // duration reduction even runs, leaving `{isAlarmVibrating, isOn}` as the merged patch —
+    // peeling still isolates the alarm field from whichever field(s) survive that reduction.
+    await expect(isOnP).rejects.toBeInstanceOf(AwayModeBlockedError);
+    expect(fake.postDeviceStatusCalls).toEqual([{ right: { isAlarmVibrating: false } }]); // no evasion for isOn or secondsRemaining
     queue.stop();
   });
 });

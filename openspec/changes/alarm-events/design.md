@@ -188,12 +188,19 @@ same "format, diff, correct" trick every dependency-free "Intl-based timezone" u
 **DST edges, noted honestly, not silently assumed correct.** A wall-clock time that is skipped
 (spring-forward) or repeated (fall-back) in the target zone is a genuine ambiguity with no single
 correct instant — every date library resolves it by some convention, none of them "correctly."
-This design's convergence loop resolves a skipped time to the post-transition instant and a
-repeated time to whichever offset the second correction iteration lands on (empirically, the
+This design's convergence loop resolves a skipped time to its **pre**-transition wall-clock
+reading — one hour before the nominal time, in the pre-transition offset (e.g. a nominal, skipped
+`02:30` resolves to `01:30` in the pre-transition zone, not `03:30` in the post-transition one) —
+and a repeated time to whichever offset the second correction iteration lands on (empirically, the
 first/earlier of the two candidates for most `Intl` implementations, but this has **not been
 verified on a real paired device across a real transition** and is flagged here rather than
-asserted). This matches, not improves on, upstream's own posture: `moment.tz` resolves the same
-ambiguity by its own internal convention with no error either. The practical exposure is small —
+asserted). **S4 (alarm-events PR #45 review) correction:** an earlier draft of this paragraph
+claimed this "matches, not improves on, upstream's own posture," implying parity with `moment.tz`
+— that was backwards for the skipped-time case: `moment.tz`'s own `moveInvalidForward` default
+moves *forward* into the post-transition offset, one hour later than this design's resolution.
+This design's skipped-time behavior differs from that upstream default by exactly one hour; it is
+pinned by its own regression test (tasks.md 2.4), not asserted to match any other library's
+convention. The practical exposure is small —
 one bad prediction, at most, twice a year, for whichever side has an alarm scheduled inside the
 one-to-two-hour transition window — and the base 30 s poll (or whatever fast-poll another
 concurrent reason is holding) remains a fallback that still has a real, if reduced, chance of
@@ -359,6 +366,17 @@ sequencing call, not a spec-changing question — the other two are lower-stakes
 2. **Config flag added: `alarmEvents`, default `true`** — the fast-poll load is bounded and
    purposeful (only near actually-enabled alarms; zero impact on alarm-free Pods), so
    default-on is right; the flag exists for opt-out and for keeping a soak profile frozen.
+   **S7 (alarm-events PR #45 review): this claim is now measured, not merely asserted** —
+   `test/pollBudget.test.ts`'s "guardrail: a fixture-driven alarm window arms and adds a
+   derived, bounded poll cost (S7)" wires a real `AlarmWindowScheduler` against a fixture-seeded
+   schedule (one enabled alarm) alongside the base poller/write-queue guardrail scenario above,
+   with its own derived ceiling: a window `windowMarginMs` wide on each side of the predicted
+   instant, polled at `alarmPollIntervalMs`, costs at most `2 × windowMarginMs /
+   alarmPollIntervalMs` extra `deviceStatus` reads over its lifetime and zero once it closes —
+   concretely, at that test's own (deliberately narrower-than-default, for a fast, exact test)
+   15s margin and the real config-floor 3000ms interval, a 30s-wide window is bounded by 10
+   reads (measured: 10), with reversion to base cadence measured immediately afterward (2 reads
+   in the following 60s span, matching the 30s base cadence alone).
 3. **Shared-module ownership settled** (supersedes settings-switches' provisional claim):
    THIS change implements first and must split the PURE next-alarm derivation (eligibility,
    midnight-crossing, override-skip, timezone) into `src/pod/alarmSchedule.ts`, consumed by

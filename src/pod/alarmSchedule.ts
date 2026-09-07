@@ -128,12 +128,19 @@ function offsetAtMs(epochMs: number, timeZone: string): number {
  * itself.
  *
  * **DST edges, noted honestly, not silently assumed correct** (design.md): a wall-clock time
- * that is skipped (spring-forward) or repeated (fall-back) has no single correct instant: this
- * resolves a skipped time to the post-transition instant, and a repeated time to whichever
- * offset this second correction lands on. Matches, not improves on, upstream's own unverified
- * `moment.tz` resolution. See tasks.md 2.4's pinned regression test, which locks in *this*
- * behavior so a future `Intl`/Node change is caught — not a claim that the resolution itself is
- * correct against real hardware.
+ * that is skipped (spring-forward) or repeated (fall-back) has no single correct instant. S4
+ * (alarm-events PR #45 review): a skipped time resolves to its **pre**-transition wall-clock
+ * reading — one hour *before* the nominal time, still in the pre-transition offset (e.g.
+ * `America/Los_Angeles`'s 2027 spring-forward: a nominal, skipped `02:30` resolves to `01:30`
+ * PST, not `03:30` PDT) — because the second "measure and correct" pass above re-measures the
+ * offset at the *first* guess, which for a skipped time still lands before the transition. A
+ * repeated (fall-back) time resolves to whichever offset that same second correction lands on.
+ * This differs from `moment.tz`'s own `moveInvalidForward` default for skipped times (which
+ * moves *forward*, one hour past the nominal time, into the post-transition offset) by exactly
+ * that one hour — not the parity with upstream's convention this module previously, incorrectly,
+ * claimed. See tasks.md 2.4's pinned regression test, which locks in *this* behavior so a future
+ * `Intl`/Node change is caught — not a claim that the resolution itself is correct against real
+ * hardware.
  */
 function zonedTimeToInstant(timeZone: string, f: WallClockFields): number {
   const guess = epochForWallClockUtc(f);
@@ -287,6 +294,20 @@ export function deriveUpcomingAlarms(
   schedules: Schedules | undefined,
   settings: Settings | undefined,
   nowMs: number,
+  /**
+   * B1 (alarm-events PR #45 review): called once per offending `${side}:${weekday}` or
+   * `${side}:override` key whenever that entry's own derivation throws (an unrecognized
+   * `settings.timeZone` reaching `Intl.DateTimeFormat`'s constructor) or resolves to a
+   * non-finite instant (a malformed `alarm.time`, e.g. `"6:45 AM"`, whose unparsed minute makes
+   * every downstream `Date.UTC`/`Intl` computation `NaN`, which `Intl.DateTimeFormat.
+   * formatToParts` itself then throws on). Optional and side-effect-only — this function stays
+   * otherwise pure (same inputs, same *returned* result) — so every existing 3-arg call site
+   * (this module's own tests included) is unaffected; `AlarmWindowScheduler` is the one caller
+   * that supplies it, deduping "once per offender" itself since that dedup is stateful across
+   * ticks and this function's own state is not (module doc, "given the same `schedules`,
+   * `settings` and `nowMs`, it always returns the same result").
+   */
+  onDeriveError?: (key: string, error: unknown) => void,
 ): UpcomingAlarm[] {
   if (!schedules || !settings || !settings.timeZone) return [];
   const timeZone = settings.timeZone;
@@ -298,29 +319,51 @@ export function deriveUpcomingAlarms(
     const sideSchedule = schedules[side];
 
     for (const weekday of WEEKDAYS) {
-      const daily = sideSchedule[weekday];
-      if (!isAlarmEligible(daily, sideSettings, timeZone)) continue;
-      const alarmWeekday = alarmWeekdayFor(weekday, daily.power.off);
-      const instantMs = nextOccurrenceOfWeekdayTime(timeZone, alarmWeekday, daily.alarm.time, nowMs);
-      if (instantMs > horizonMs) continue;
-      if (isRegularOccurrenceSuppressed(instantMs, sideSettings.scheduleOverrides.alarm.expiresAt, nowMs)) continue;
-      results.push({ side, instantMs, source: 'regular' });
+      try {
+        const daily = sideSchedule[weekday];
+        if (!isAlarmEligible(daily, sideSettings, timeZone)) continue;
+        const alarmWeekday = alarmWeekdayFor(weekday, daily.power.off);
+        const instantMs = nextOccurrenceOfWeekdayTime(timeZone, alarmWeekday, daily.alarm.time, nowMs);
+        // B1: a malformed `alarm.time` (an un-parseable minute, say) can make this `NaN` without
+        // ever throwing — never let a non-finite instant reach the scheduler, which would
+        // otherwise arm a `requestMode` window with a `NaN` `untilMs`.
+        if (!Number.isFinite(instantMs)) continue;
+        if (instantMs > horizonMs) continue;
+        if (isRegularOccurrenceSuppressed(instantMs, sideSettings.scheduleOverrides.alarm.expiresAt, nowMs)) continue;
+        results.push({ side, instantMs, source: 'regular' });
+      } catch (error) {
+        // B1: one bad weekday entry (most commonly an unrecognized `settings.timeZone`, which
+        // every weekday for this side shares and would otherwise throw identically on each of
+        // the seven iterations) must not prevent deriving every *other* entry — for this side,
+        // the other side, or the override below.
+        onDeriveError?.(`${side}:${weekday}`, error);
+      }
     }
 
-    // The override one-shot instant is independent of away mode and of the eligibility predicate
-    // above — upstream's own `scheduleAlarmOverride` has no away-mode check at all, only
-    // `executeAlarm`'s own (force-overridable) check at *execution* time, which this plugin never
-    // reproduces (design.md's "Away-mode interaction" is about the *dismiss write*, not this
-    // read-only prediction).
-    const override = sideSettings.scheduleOverrides.alarm;
-    if (!override.disabled && override.timeOverride && override.expiresAt) {
-      const expiresAtMs = parseTimestamp(override.expiresAt);
-      if (expiresAtMs !== undefined && expiresAtMs > nowMs) {
-        const instantMs = nextOccurrenceOfTime(timeZone, override.timeOverride, nowMs);
-        if (instantMs <= horizonMs) {
-          results.push({ side, instantMs, source: 'override' });
+    // S5 (alarm-events PR #45 review): the override instant *does* still require the side not be
+    // in away mode, even though it is independent of the rest of the eligibility predicate
+    // above. `scheduleAlarmOverride` itself (the function that *arms* the override job) indeed
+    // has no away-mode check — but `executeAlarm` (the function that actually *fires* any
+    // alarm job, override or regular, `alarmScheduler.ts`) early-returns on `awayMode` before
+    // vibrating either way. An away side's override job is therefore still scheduled upstream,
+    // but its every execution is unconditionally a no-op — predicting a fast-poll window for it
+    // here would be purely spurious. This also keeps this function's own top-level "Away mode
+    // suppresses a side's instants entirely" behavior (pod-alarm-scheduler spec) actually
+    // unconditional, rather than true only for the regular weekday path.
+    try {
+      const override = sideSettings.scheduleOverrides.alarm;
+      if (!sideSettings.awayMode && !override.disabled && override.timeOverride && override.expiresAt) {
+        const expiresAtMs = parseTimestamp(override.expiresAt);
+        if (expiresAtMs !== undefined && expiresAtMs > nowMs) {
+          const instantMs = nextOccurrenceOfTime(timeZone, override.timeOverride, nowMs);
+          // B1: same non-finite guard as the regular path above.
+          if (Number.isFinite(instantMs) && instantMs <= horizonMs) {
+            results.push({ side, instantMs, source: 'override' });
+          }
         }
       }
+    } catch (error) {
+      onDeriveError?.(`${side}:override`, error);
     }
   }
 

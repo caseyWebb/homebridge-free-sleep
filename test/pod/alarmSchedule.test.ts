@@ -168,14 +168,17 @@ describe('nextOccurrenceOfWeekdayTime / nextOccurrenceOfTime — Asia/Tokyo, a f
 describe('zonedTimeToInstant — DST-transition pinned regression (tasks.md 2.4)', () => {
   // America/Los_Angeles, 2027: spring-forward is 2027-03-14 02:00 -> 03:00 (second Sunday of
   // March). 02:30 local is a SKIPPED wall-clock time — there is no single correct instant; this
-  // pins the module's *current* resolution (design.md: "resolves a skipped time to the
-  // post-transition instant") so a future Intl/Node behavior change is caught, not silently
-  // assumed correct. NOT verified against real hardware — see design.md's "DST edges, noted
-  // honestly, not silently assumed correct".
-  it('spring-forward: a skipped wall-clock time resolves to the post-transition (PDT, UTC-7) instant', () => {
+  // pins the module's *current* resolution: it resolves to the *pre*-transition wall-clock
+  // reading, 01:30 PST (one hour before the nominal time) — differing from `moment.tz`'s own
+  // `moveInvalidForward` default (which would move forward to 03:30 PDT instead) by exactly that
+  // one hour (S4, alarm-events PR #45 review — the previous "matches upstream"/"post-transition"
+  // characterization here was backwards). Pinned so a future Intl/Node behavior change is
+  // caught, not silently assumed correct. NOT verified against real hardware — see design.md's
+  // "DST edges, noted honestly, not silently assumed correct".
+  it('spring-forward: a skipped wall-clock time resolves to the pre-transition (PST, UTC-8) instant', () => {
     const nowMs = Date.UTC(2027, 2, 8, 0, 0, 0); // the Monday immediately before the transition Sunday
     const instant = nextOccurrenceOfWeekdayTime('America/Los_Angeles', 'sunday', '02:30', nowMs);
-    expect(instant).toBe(Date.UTC(2027, 2, 14, 9, 30, 0)); // pinned: 2027-03-14T09:30:00.000Z
+    expect(instant).toBe(Date.UTC(2027, 2, 14, 9, 30, 0)); // pinned: 2027-03-14T09:30:00.000Z (01:30 PST)
   });
 
   // Fall-back is 2027-11-07 02:00 -> 01:00 (first Sunday of November). 01:30 local is a
@@ -333,6 +336,28 @@ describe('deriveUpcomingAlarms — override one-shot instant (tasks.md 3.4)', ()
     const upcoming = deriveUpcomingAlarms(schedules, settings, nowMs);
     expect(upcoming.some((a) => a.side === 'left' && a.source === 'override')).toBe(false);
   });
+
+  // S5 (alarm-events PR #45 review): a live, otherwise-eligible override on a side currently in
+  // away mode still contributes no instant — `scheduleAlarmOverride` (which arms the job) has no
+  // away-mode check of its own, but `executeAlarm` (which fires it) early-returns on `awayMode`
+  // regardless of which mechanism scheduled the job, making a predicted window here purely
+  // spurious. Previously this branch was deliberately independent of away mode; this pins the
+  // corrected behavior.
+  it('an away side with an otherwise-live override produces zero instants — regular or override', () => {
+    const futureExpiresAt = new Date(nowMs + 3600_000 * 5).toISOString();
+    const settings = settingsDoc({
+      left: {
+        awayMode: true,
+        scheduleOverrides: { alarm: { disabled: false, timeOverride: '11:00', expiresAt: futureExpiresAt } },
+      },
+    });
+    const schedules = schedulesDoc({
+      left: { wednesday: dailySchedule({ power: { enabled: true, off: '20:00' }, alarm: { enabled: true, time: '07:00' } }) },
+    });
+
+    const upcoming = deriveUpcomingAlarms(schedules, settings, nowMs);
+    expect(upcoming.filter((a) => a.side === 'left')).toHaveLength(0);
+  });
 });
 
 // ---------------------------------------------------------------------------------------
@@ -356,7 +381,11 @@ describe('deriveUpcomingAlarms — end-to-end (tasks.md 3.2, 3.5)', () => {
       thursday: dailySchedule({ power: { enabled: false, off: '20:00' }, alarm: { enabled: true, time: '07:00' } }),
     };
     // Right side: fully eligible on monday, but the side itself is in away mode -> contributes
-    // nothing from its regular schedule; its live override instant is unaffected by away mode.
+    // nothing from its regular schedule. S5 (alarm-events PR #45 review): its live override
+    // instant is *also* suppressed by away mode — `executeAlarm` (the function that actually
+    // fires any alarm job, override or regular) early-returns on `awayMode` regardless of which
+    // mechanism scheduled the job, so predicting a window for an away side's override would be
+    // purely spurious (`alarmSchedule.ts`'s own updated doc on this branch).
     const right: Partial<Record<Weekday, DailySchedule>> = {
       monday: dailySchedule({ power: { enabled: true, off: '20:00' }, alarm: { enabled: true, time: '07:00' } }),
     };
@@ -376,15 +405,14 @@ describe('deriveUpcomingAlarms — end-to-end (tasks.md 3.2, 3.5)', () => {
     const leftOvernight = { side: 'left' as Side, instantMs: Date.UTC(2026, 0, 7, 21, 45, 0), source: 'regular' as const };
     // Left, saturday, no shift: 2026-01-10 07:00 JST.
     const leftSameDay = { side: 'left' as Side, instantMs: Date.UTC(2026, 0, 9, 22, 0, 0), source: 'regular' as const };
-    // Right, override one-shot: today 10:00 JST (not yet passed relative to 09:00 JST "now").
-    const rightOverride = { side: 'right' as Side, instantMs: Date.UTC(2026, 0, 7, 1, 0, 0), source: 'override' as const };
 
-    expect(upcoming).toEqual([rightOverride, leftOvernight, leftSameDay].sort((a, b) => a.instantMs - b.instantMs));
+    expect(upcoming).toEqual([leftOvernight, leftSameDay].sort((a, b) => a.instantMs - b.instantMs));
 
     // Explicitly confirm the negative cases contribute nothing (friday/thursday disabled;
-    // right's monday regular occurrence suppressed by away mode).
+    // right's monday regular occurrence AND its live override both suppressed by away mode).
     expect(upcoming.filter((a) => a.side === 'right' && a.source === 'regular')).toHaveLength(0);
-    expect(upcoming).toHaveLength(3);
+    expect(upcoming.filter((a) => a.side === 'right' && a.source === 'override')).toHaveLength(0);
+    expect(upcoming).toHaveLength(2);
   });
 
   it('contributes no instant for any side when settings.timeZone is empty', () => {
@@ -398,5 +426,70 @@ describe('deriveUpcomingAlarms — end-to-end (tasks.md 3.2, 3.5)', () => {
   it('returns an empty list when schedules or settings have not been observed yet', () => {
     expect(deriveUpcomingAlarms(undefined, settingsDoc(), nowMs)).toEqual([]);
     expect(deriveUpcomingAlarms(schedulesDoc(), undefined, nowMs)).toEqual([]);
+  });
+});
+
+// ---------------------------------------------------------------------------------------
+// B1 (alarm-events PR #45 review): a malformed alarm.time or an unrecognized settings.timeZone
+// must not throw out of this pure function — the reviewer's own two executed reproductions
+// (a bare RangeError from `Intl.DateTimeFormat`, previously uncaught) — and must not silently
+// corrupt the derivation with a non-finite instant either.
+// ---------------------------------------------------------------------------------------
+
+describe('deriveUpcomingAlarms — B1: a bad entry is skipped, not thrown, and does not affect siblings', () => {
+  const nowMs = Date.UTC(2026, 0, 7, 0, 0, 0); // Wed 09:00 JST
+
+  it('a malformed alarm.time ("6:45 AM") is skipped — no throw, other weekdays and the other side still derive', () => {
+    const left: Partial<Record<Weekday, DailySchedule>> = {
+      // Malformed: `parseHhMm` yields `minute: NaN`, which makes every downstream `Date.UTC`/
+      // `Intl` computation `NaN` — `Intl.DateTimeFormat.prototype.formatToParts` itself then
+      // throws a RangeError on a non-finite epoch.
+      wednesday: dailySchedule({ power: { enabled: true, off: '20:00' }, alarm: { enabled: true, time: '6:45 AM' } }),
+      // A sibling weekday for the *same* side, well-formed — must still derive despite
+      // wednesday's own throw.
+      saturday: dailySchedule({ power: { enabled: true, off: '20:00' }, alarm: { enabled: true, time: '07:00' } }),
+    };
+    const right: Partial<Record<Weekday, DailySchedule>> = {
+      // The *other* side, well-formed — must still derive too.
+      monday: dailySchedule({ power: { enabled: true, off: '20:00' }, alarm: { enabled: true, time: '07:00' } }),
+    };
+    const schedules = schedulesDoc({ left, right });
+    const settings = settingsDoc();
+
+    const errors: Array<{ key: string; error: unknown }> = [];
+    let upcoming: ReturnType<typeof deriveUpcomingAlarms> = [];
+    expect(() => {
+      upcoming = deriveUpcomingAlarms(schedules, settings, nowMs, (key, error) => errors.push({ key, error }));
+    }).not.toThrow();
+
+    expect(errors).toHaveLength(1);
+    expect(errors[0]!.key).toBe('left:wednesday');
+    expect(errors[0]!.error).toBeInstanceOf(RangeError);
+
+    // The offending entry contributed nothing; the two well-formed siblings did.
+    expect(upcoming.some((a) => a.side === 'left' && a.source === 'regular' && a.instantMs === Date.UTC(2026, 0, 7, 21, 45, 0))).toBe(
+      false,
+    );
+    expect(upcoming.some((a) => a.side === 'left' && a.source === 'regular')).toBe(true); // saturday
+    expect(upcoming.some((a) => a.side === 'right' && a.source === 'regular')).toBe(true); // monday
+    expect(upcoming.every((a) => Number.isFinite(a.instantMs))).toBe(true); // never a NaN instant
+  });
+
+  it('an unrecognized settings.timeZone is skipped entirely — no throw, an empty result, one error per weekday/override entry', () => {
+    const schedules = schedulesDoc({
+      left: { monday: dailySchedule({ power: { enabled: true, off: '20:00' }, alarm: { enabled: true, time: '07:00' } }) },
+      right: { tuesday: dailySchedule({ power: { enabled: true, off: '20:00' }, alarm: { enabled: true, time: '07:00' } }) },
+    });
+    const settings = settingsDoc({ timeZone: 'Not/AZone' });
+
+    const errors: Array<{ key: string; error: unknown }> = [];
+    let upcoming: ReturnType<typeof deriveUpcomingAlarms> = [];
+    expect(() => {
+      upcoming = deriveUpcomingAlarms(schedules, settings, nowMs, (key, error) => errors.push({ key, error }));
+    }).not.toThrow();
+
+    expect(upcoming).toEqual([]);
+    expect(errors.length).toBeGreaterThan(0);
+    expect(errors.every((e) => e.error instanceof RangeError)).toBe(true);
   });
 });

@@ -14,7 +14,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { AlarmWindowScheduler } from '../../src/pod/alarmWindowScheduler.js';
 import type { PodPoller } from '../../src/pod/poller.js';
-import { SnapshotStore } from '../../src/pod/snapshot.js';
+import { SnapshotStore, type Logger } from '../../src/pod/snapshot.js';
 import type { DailySchedule, Schedules, Settings, SideSchedule } from '../../src/pod/types.js';
 import { createTimerHarness, type TimerHarness } from '../timerHarness.js';
 
@@ -115,7 +115,7 @@ interface Setup {
   calls: RequestModeCall[];
   releases: Array<() => void>;
   nowMs: number;
-  build: (options?: { alarmPollIntervalMs?: number; windowMarginMs?: number }) => AlarmWindowScheduler;
+  build: (options?: { alarmPollIntervalMs?: number; windowMarginMs?: number; logger?: Logger }) => AlarmWindowScheduler;
 }
 
 function setup(): Setup {
@@ -130,13 +130,14 @@ function setup(): Setup {
   vi.setSystemTime(nowMs);
   const snapshot = new SnapshotStore({ timers });
   const { poller, calls, releases } = createFakePoller();
-  const build = (options: { alarmPollIntervalMs?: number; windowMarginMs?: number } = {}): AlarmWindowScheduler =>
+  const build = (options: { alarmPollIntervalMs?: number; windowMarginMs?: number; logger?: Logger } = {}): AlarmWindowScheduler =>
     new AlarmWindowScheduler({
       snapshot,
       poller,
       timers,
       alarmPollIntervalMs: options.alarmPollIntervalMs ?? 3000,
       ...(options.windowMarginMs !== undefined ? { windowMarginMs: options.windowMarginMs } : {}),
+      ...(options.logger !== undefined ? { logger: options.logger } : {}),
     });
   return { timers, snapshot, calls, releases, nowMs, build };
 }
@@ -238,14 +239,13 @@ describe('AlarmWindowScheduler recompute-and-reconcile (tasks.md 4.2)', () => {
     scheduler.stop();
   });
 
-  it('a stale window is withdrawn on the next recompute once its instant no longer appears in the derivation', async () => {
+  it('a stale window is withdrawn immediately once the schedule genuinely changes, while its instant is still upcoming', () => {
     const { snapshot, calls, releases, nowMs, build } = setup();
-    // instantMs = nowMs + 180_000: inside its window at construction (window starts exactly at
-    // nowMs) *and* its untilMs (instantMs + 180_000 = nowMs + 360_000) survives past the
-    // 300_000ms recompute-ceiling tick below — so that tick's own "tidy already-elapsed entries"
-    // step (reconcile's first loop) does not prune it first; the withdrawal below exercises the
-    // *stale-but-not-yet-expired* path (design.md's step 3) specifically, not a natural expiry.
-    const { schedules, settings } = withOneAlarmAt(nowMs + 180_000); // armed on construction
+    // instantMs = nowMs + 60_000: inside its window at construction (window starts at
+    // nowMs - 120_000, already open) and still 60s in the future — a genuine schedule edit here
+    // is unambiguous: the occurrence has not fired yet, so its disappearance from the fresh
+    // derivation can only mean the schedule changed out from under it.
+    const { schedules, settings } = withOneAlarmAt(nowMs + 60_000); // armed on construction
     snapshot.observeSchedules(schedules);
     snapshot.observeSettings(settings);
 
@@ -253,20 +253,148 @@ describe('AlarmWindowScheduler recompute-and-reconcile (tasks.md 4.2)', () => {
     expect(calls).toHaveLength(1);
     expect(releases[0]).not.toHaveBeenCalled();
 
-    // The schedule changes out from under the armed window — disable the alarm entirely, so the
-    // next recompute's derivation no longer includes this occurrence at all.
+    // The schedule changes out from under the armed window, 30s before its own instant.
+    vi.setSystemTime(nowMs + 30_000);
     const disabled = structuredClone(schedules);
     for (const day of WEEKDAYS) disabled.left[day].alarm.enabled = false;
     snapshot.observeSchedules(disabled);
 
-    // No more unarmed occurrences remain, so the scheduler's own next tick was scheduled at the
-    // recompute ceiling (300_000ms) after construction's own tick.
-    await vi.advanceTimersByTimeAsync(300_000);
+    scheduler.recomputeNow();
 
-    expect(releases[0]).toHaveBeenCalledTimes(1);
-    // No new requestMode call was made for the now-absent occurrence.
-    expect(calls).toHaveLength(1);
+    expect(releases[0]).toHaveBeenCalledTimes(1); // withdrawn immediately — a genuine schedule change
+    expect(calls).toHaveLength(1); // no new requestMode call was made for the now-absent occurrence
     scheduler.stop();
+  });
+
+  // S3 (alarm-events PR #45 review): a *weekly-recurring* occurrence's key (`${side}:
+  // ${instantMs}:${source}`) is only ever valid until the occurrence itself fires — the very next
+  // recompute after that derives *next week's* occurrence instead, under a different `instantMs`
+  // and therefore a different key, even though nothing about the schedule actually changed. The
+  // bug: the stale-window withdrawal treated that rollover alone as "the schedule changed" and
+  // released the still-live window immediately — reverting to base-cadence polling for the rest
+  // of the post-instant margin, up to a full `windowMarginMs` before the window's own real expiry.
+  it("a weekly-recurring window's own rollover past its instant does not release it early (S3 regression)", async () => {
+    const { snapshot, calls, releases, nowMs, build } = setup();
+    const marginMs = 180_000;
+    // instantMs = nowMs + 60_000: fires 1 minute after construction (the same offset the
+    // "armed immediately" test above uses, so it's still strictly in the future — `withOneAlarmAt`
+    // floors to the whole minute, and a candidate at-or-before "now" rolls to *next* week
+    // instead of today, which a too-small offset would otherwise trip over). The rest of this
+    // test plays out in the post-instant margin, where the rollover bug lived.
+    const { schedules, settings, instantMs } = withOneAlarmAt(nowMs + 60_000);
+    snapshot.observeSchedules(schedules);
+    snapshot.observeSettings(settings);
+
+    const scheduler = build({ windowMarginMs: marginMs });
+    expect(calls).toHaveLength(1); // armed at construction — instant is inside the window already
+    const untilMs = instantMs + marginMs;
+
+    // T = untilMs - 1s: well past the instant (the alarm has "fired," and every intervening
+    // recompute has derived *next week's* occurrence under a different key), but still 1s short
+    // of this window's own natural expiry. Without the fix, the first recompute after the
+    // instant passed would already have released this window, up to `marginMs` (180s) early.
+    await vi.advanceTimersByTimeAsync(untilMs - nowMs - 1_000);
+    expect(releases[0]).not.toHaveBeenCalled();
+    expect(calls).toHaveLength(1); // no re-arm either — still the one, original window
+
+    // T = untilMs + a bit: past this window's own natural expiry. `reconcile`'s "tidy
+    // already-elapsed entries" step (design.md: relies on the *real* poller's own internal
+    // expiry timer having already dropped the mode server-side) retires the bookkeeping here —
+    // not a further `release()` call, which is reserved for a genuine stale withdrawal
+    // (the previous test) or `stop()`.
+    await vi.advanceTimersByTimeAsync(2_000);
+    expect(releases[0]).not.toHaveBeenCalled();
+
+    scheduler.stop();
+  });
+});
+
+// ---------------------------------------------------------------------------------------
+// B1 (alarm-events PR #45 review): a derivation failure (a malformed alarm.time, or an
+// unrecognized settings.timeZone) must never escape a bare timer callback — previously this
+// crashed the whole Homebridge process, at most RECOMPUTE_CEILING_MS after every restart.
+// ---------------------------------------------------------------------------------------
+
+describe('AlarmWindowScheduler — B1: a derivation failure never crashes the scheduler', () => {
+  function fakeLogger(): { logger: Logger; warnings: string[] } {
+    const warnings: string[] = [];
+    return {
+      logger: { debug: () => undefined, warn: (message: string) => warnings.push(message) },
+      warnings,
+    };
+  }
+
+  // The malformed-`alarm.time` reproduction itself (`deriveUpcomingAlarms`'s own per-entry
+  // guard, catching the `Intl.DateTimeFormat.formatToParts` RangeError a non-finite epoch
+  // produces) is pinned at the pure-function level in `alarmSchedule.test.ts`'s own "B1: a bad
+  // entry is skipped, not thrown" block — vitest's fake-timer patching in *this* file changes
+  // how `Intl` resolves a non-finite epoch (it stops throwing at all under `vi.useFakeTimers()`,
+  // confirmed against a real `node` process without it), so it is not a reliable reproduction
+  // here. This file instead proves the two things specific to *this* class: the unrecognized-
+  // timeZone reproduction (below, unaffected by that fake-timer quirk, since
+  // `Intl.DateTimeFormat`'s constructor validates the zone name itself) end-to-end through the
+  // scheduler's own per-offender dedup, and the coarser, tick()-level catch-all (further below)
+  // that exists for *any other* failure this specific guard didn't anticipate.
+  it('an unrecognized settings.timeZone is logged once per offending entry, not once per recompute', () => {
+    const { snapshot, nowMs, build } = setup();
+    const { logger, warnings } = fakeLogger();
+
+    const { schedules } = withOneAlarmAt(nowMs + 60_000);
+    const settings = utcSettings();
+    settings.timeZone = 'Not/AZone'; // Intl.DateTimeFormat's constructor throws a RangeError on this
+    snapshot.observeSchedules(schedules);
+    snapshot.observeSettings(settings);
+
+    const scheduler = build({ windowMarginMs: 180_000, logger });
+    const warningsAfterConstruction = warnings.length;
+    expect(warningsAfterConstruction).toBeGreaterThan(0);
+
+    scheduler.recomputeNow();
+    scheduler.recomputeNow();
+    scheduler.recomputeNow();
+
+    // Deduped per offending key: repeated recomputes against the same broken timeZone do not
+    // grow the warning log any further, for the lifetime of this scheduler instance.
+    expect(warnings.length).toBe(warningsAfterConstruction);
+
+    scheduler.stop();
+  });
+
+  // The coarser, tick()-level line of defense (this class's own B1 fix): a failure *anywhere*
+  // in a recompute — not just inside `deriveUpcomingAlarms`'s own per-entry guard — must not
+  // escape the bare `setTimeout` callback this class's self-rescheduling depends on. Simulated
+  // here with a poller whose `requestMode` itself throws, standing in for "a future
+  // `deriveUpcomingAlarms`/`reconcile`/`scheduleNext` regression this per-entry guard didn't
+  // anticipate."
+  it('any other failure during a recompute (e.g. the poller itself throwing) is caught, logged, and the scheduler keeps rescheduling', () => {
+    const { snapshot, timers, nowMs } = setup();
+    const { logger, warnings } = fakeLogger();
+    const { schedules, settings } = withOneAlarmAt(nowMs + 60_000); // armed on construction
+    snapshot.observeSchedules(schedules);
+    snapshot.observeSettings(settings);
+
+    const throwingPoller = {
+      requestMode: () => {
+        throw new Error('poller exploded');
+      },
+    } as unknown as PodPoller;
+
+    let scheduler: AlarmWindowScheduler | undefined;
+    expect(() => {
+      scheduler = new AlarmWindowScheduler({
+        snapshot,
+        poller: throwingPoller,
+        timers,
+        alarmPollIntervalMs: 3000,
+        windowMarginMs: 180_000,
+        logger,
+      });
+    }).not.toThrow();
+
+    expect(warnings.some((w) => w.includes('recompute failed unexpectedly'))).toBe(true);
+    expect(timers.pendingCount()).toBeGreaterThan(0); // re-armed via the fallback re-schedule, not left inert
+
+    scheduler!.stop();
   });
 });
 

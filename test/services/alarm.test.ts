@@ -369,6 +369,117 @@ describe('dismiss switch: turning it off submits an isAlarmVibrating: false writ
   });
 });
 
+// ---------------------------------------------------------------------------------------
+// B2 (alarm-events PR #45 review): `handleChange`'s rising-edge check is evaluated on the
+// *effective* (overlay-applied) snapshot diff, not a raw observation diff — so this service's
+// own dismiss write can manufacture a `false -> true` transition it never actually observed
+// from the Pod, purely from its own optimistic overlay's lifecycle (installed, then later
+// cleared on failure or expired unconfirmed on success), and read it as a second alarm press.
+// These tests wire a real end-to-end routing path (`snapshot.subscribe` -> `isAlarmChange` ->
+// `service.handleChange`, mirroring `platform.ts`'s own routing table) rather than driving
+// `handleChange` with synthetic `Change` objects, since the bug is specifically about what a
+// *real* write cycle's own overlay does to the diffed sequence.
+// ---------------------------------------------------------------------------------------
+
+describe('B2: the dismiss overlay itself never manufactures a spurious press', () => {
+  function routeAlarmChanges(ctx: ServiceContext, service: AlarmService): () => void {
+    return ctx.snapshot.subscribe((changes) => {
+      for (const change of changes) {
+        if (isAlarmChange(change)) service.handleChange(change);
+      }
+    });
+  }
+
+  it('reviewer repro 1 — a failed dismiss POST reports exactly one press total, not two', async () => {
+    const { ctx, accessory, api, fake } = setup(); // raw isAlarmVibrating: false to start
+    const { service, setHandlers } = build(ctx, 'left');
+    const unsubscribe = routeAlarmChanges(ctx, service);
+    const press = accessory.getServiceById(api.hap.Service.StatelessProgrammableSwitch, ALARM_PRESS_SUBTYPE)!;
+    const pressSpy = vi.spyOn(press.getCharacteristic(api.hap.Characteristic.ProgrammableSwitchEvent), 'updateValue');
+
+    // Genuine alarm start: press #1.
+    const vibrating = structuredClone(deviceStatusFixture);
+    vibrating.left.isAlarmVibrating = true;
+    ctx.snapshot.observeDeviceStatus(vibrating);
+    expect(pressSpy).toHaveBeenCalledTimes(1);
+
+    // A dismiss attempt that fails at the Pod — raw is (and remains) still vibrating throughout.
+    fake.postDeviceStatusOutcome = { kind: 'error', error: new Error('boom') };
+    const pending = setHandlers.get(UUID.dismissOn)!(false, {} as never, undefined);
+    const assertion = expect(pending).rejects.toMatchObject({ hapStatus: ctx.api.hap.HAPStatus.SERVICE_COMMUNICATION_FAILURE });
+    // Debounce flush -> dispatch -> POST fails -> WriteQueue clears the overlay synchronously,
+    // reverting `effective` back to raw's still-true value — without the B2 fix, this reads as
+    // a second false -> true edge right here.
+    await vi.advanceTimersByTimeAsync(400);
+    await assertion;
+
+    expect(pressSpy).toHaveBeenCalledTimes(1); // still just the one, genuine press
+    unsubscribe();
+  });
+
+  it('reviewer repro 2 — a successful dismiss whose settle window expires with raw still vibrating reports exactly one press total', async () => {
+    const { ctx, accessory, api } = setup();
+    const { service, setHandlers } = build(ctx, 'left');
+    const unsubscribe = routeAlarmChanges(ctx, service);
+    const press = accessory.getServiceById(api.hap.Service.StatelessProgrammableSwitch, ALARM_PRESS_SUBTYPE)!;
+    const pressSpy = vi.spyOn(press.getCharacteristic(api.hap.Characteristic.ProgrammableSwitchEvent), 'updateValue');
+
+    const vibrating = structuredClone(deviceStatusFixture);
+    vibrating.left.isAlarmVibrating = true;
+    ctx.snapshot.observeDeviceStatus(vibrating);
+    expect(pressSpy).toHaveBeenCalledTimes(1);
+
+    // The dismiss write itself succeeds at the Pod, but — unlike a real deployment, where the
+    // alarm-window scheduler's own fast-poll would normally confirm it well within the settle
+    // window — no further observation ever arrives in this test, so `raw` never actually
+    // catches up to `false`.
+    const pending = setHandlers.get(UUID.dismissOn)!(false, {} as never, undefined);
+    await vi.advanceTimersByTimeAsync(400);
+    await pending;
+    expect(pressSpy).toHaveBeenCalledTimes(1); // the overlay install itself is a falling edge, no press
+
+    // Past the overlay's own writeSettleMs window (default 15000ms): it expires, revealing
+    // raw's still-true value — without the B2 fix, this reads as a second false -> true edge.
+    await vi.advanceTimersByTimeAsync(ctx.config.writeSettleMs + 10);
+    expect(pressSpy).toHaveBeenCalledTimes(1);
+    unsubscribe();
+  });
+
+  it('a genuine new ring after a completed (confirmed) dismissal still fires its own press', async () => {
+    const { ctx, accessory, api } = setup();
+    const { service, setHandlers } = build(ctx, 'left');
+    const unsubscribe = routeAlarmChanges(ctx, service);
+    const press = accessory.getServiceById(api.hap.Service.StatelessProgrammableSwitch, ALARM_PRESS_SUBTYPE)!;
+    const pressSpy = vi.spyOn(press.getCharacteristic(api.hap.Characteristic.ProgrammableSwitchEvent), 'updateValue');
+
+    const vibrating = structuredClone(deviceStatusFixture);
+    vibrating.left.isAlarmVibrating = true;
+    ctx.snapshot.observeDeviceStatus(vibrating);
+    expect(pressSpy).toHaveBeenCalledTimes(1); // press #1
+
+    const pending = setHandlers.get(UUID.dismissOn)!(false, {} as never, undefined);
+    await vi.advanceTimersByTimeAsync(400);
+    await pending;
+
+    // Confirmed: a poll observes raw genuinely reaching `false` before the overlay's own
+    // writeSettleMs window would have expired — the overlay retires by agreement, silently (no
+    // `Change` at all, since `effective` was already `false`).
+    const dismissed = structuredClone(deviceStatusFixture);
+    dismissed.left.isAlarmVibrating = false;
+    ctx.snapshot.observeDeviceStatus(dismissed);
+    expect(pressSpy).toHaveBeenCalledTimes(1); // still just the one so far
+
+    // Well past the (now-irrelevant) original settle window, a brand new alarm genuinely rings.
+    await vi.advanceTimersByTimeAsync(ctx.config.writeSettleMs + 10);
+    const vibratingAgain = structuredClone(deviceStatusFixture);
+    vibratingAgain.left.isAlarmVibrating = true;
+    ctx.snapshot.observeDeviceStatus(vibratingAgain);
+
+    expect(pressSpy).toHaveBeenCalledTimes(2); // the guard has long since cleared — this one fires
+    unsubscribe();
+  });
+});
+
 describe('dismiss switch: turning it on is accepted, never forwarded, and reverts (tasks.md 6.5, 6.6)', () => {
   it('an on-write never submits isAlarmVibrating: true to the Pod', async () => {
     const { ctx, fake } = setup();

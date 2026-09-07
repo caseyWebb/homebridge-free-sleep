@@ -56,6 +56,21 @@ export class AlarmService {
   /** The pending accept-then-revert timer, if any — retained (mirrors `ThermostatService`'s F2
    * fix) so `stop()` can clear it on platform shutdown. */
   private revertTimer: TimerHandle | null = null;
+  /**
+   * B2 (alarm-events PR #45 review): `true` for as long as *this service's own* off-write to
+   * `isAlarmVibrating` might still be the reason `change.previous === false` in `handleChange`,
+   * rather than a genuine prior "not vibrating" observation — see `handleChange`'s doc for why
+   * that distinction matters. Set the moment a dismiss write is submitted; cleared the moment
+   * the overlay it installed is known to be gone (a failed POST clears it synchronously before
+   * `submitSide` rejects) or, on success, after `writeSettleMs` — the overlay's own maximum
+   * remaining lifetime once `submitSide` resolves (`writeQueue.ts`'s `settleWrite`/
+   * `rebaseOwnership`: a successful dispatch re-arms the overlay for a fresh `writeSettleMs`
+   * window measured from settle time, which is this exact moment).
+   */
+  private dismissOverlayGuardActive = false;
+  /** The pending guard-clear timer for the success path above, if any — retained so `stop()` can
+   * clear it, mirroring `revertTimer`. */
+  private dismissOverlayGuardTimer: TimerHandle | null = null;
 
   constructor(ctx: ServiceContext, side: Side, platformStartedAt: number) {
     this.ctx = ctx;
@@ -145,9 +160,30 @@ export class AlarmService {
         this.scheduleRevert();
         return;
       }
+      // B2: armed *before* `submitSide` is even called — `WriteQueue.submitSide` installs its
+      // optimistic overlay synchronously, inside this very call, before it returns a pending
+      // Promise (`writeQueue.ts`'s `submit()`: the overlay-sync call happens inside the
+      // executor, which runs synchronously as part of constructing the `Promise` `submitSide`
+      // returns) — so the guard must already be active for the falling-edge `handleChange` call
+      // that install triggers, and for any rising edge that follows it before this `await`
+      // settles.
+      this.armDismissOverlayGuard();
       try {
         await this.ctx.writeQueue.submitSide(this.side, { isAlarmVibrating: false });
+        // Success: the overlay was just rebased with a fresh `writeSettleMs` window (see the
+        // guard field's own doc) — keep guarding until that window has had its full chance to
+        // either retire by agreement (silently, no `handleChange` call at all — the common case)
+        // or expire with `raw` still disagreeing (the B2 bug this guard exists for).
+        if (this.dismissOverlayGuardTimer !== null) this.ctx.timers.clearTimeout(this.dismissOverlayGuardTimer);
+        this.dismissOverlayGuardTimer = this.ctx.timers.setTimeout(() => {
+          this.dismissOverlayGuardTimer = null;
+          this.dismissOverlayGuardActive = false;
+        }, this.ctx.config.writeSettleMs);
       } catch (error) {
+        // Failure: `WriteQueue` already cleared the overlay synchronously before this rejection
+        // (`writeQueue.ts`'s `settleWrite`, `onFailure: 'clear'`) — `raw` is already fully
+        // revealed, so there is nothing further left to guard against.
+        this.clearDismissOverlayGuard();
         if (error instanceof AwayModeBlockedError) {
           this.ctx.log.debug(
             `FreeSleep: ${this.side} dismiss-alarm write refused by the away-mode guard: ${describeError(error)}`,
@@ -159,6 +195,22 @@ export class AlarmService {
         throw new hap.HapStatusError(hap.HAPStatus.SERVICE_COMMUNICATION_FAILURE);
       }
     });
+  }
+
+  private armDismissOverlayGuard(): void {
+    if (this.dismissOverlayGuardTimer !== null) {
+      this.ctx.timers.clearTimeout(this.dismissOverlayGuardTimer);
+      this.dismissOverlayGuardTimer = null;
+    }
+    this.dismissOverlayGuardActive = true;
+  }
+
+  private clearDismissOverlayGuard(): void {
+    if (this.dismissOverlayGuardTimer !== null) {
+      this.ctx.timers.clearTimeout(this.dismissOverlayGuardTimer);
+      this.dismissOverlayGuardTimer = null;
+    }
+    this.dismissOverlayGuardActive = false;
   }
 
   private scheduleRevert(): void {
@@ -185,13 +237,37 @@ export class AlarmService {
   /**
    * (a) pushes the dismiss switch's `On` characteristic to `change.current` whenever it differs
    * from the currently-published value, and (b) additionally fires `SINGLE_PRESS` on the press
-   * service iff `change.previous === false && change.current === true` — a rising edge. Evaluated
-   * from the `Change` object the platform's routing table hands this service directly, not
-   * re-derived from `snapshot.get()`, which only has "now," not "a moment ago."
+   * service iff `change.previous === false && change.current === true` — a rising edge, UNLESS
+   * `dismissOverlayGuardActive` (B2 fix, below). Evaluated from the `Change` object the
+   * platform's routing table hands this service directly, not re-derived from `snapshot.get()`,
+   * which only has "now," not "a moment ago."
+   *
+   * **B2 (alarm-events PR #45 review):** `change.previous`/`.current` are diffed off the
+   * *effective* (overlay-applied) snapshot (`snapshot.ts`'s `diffWatched`), not off raw
+   * observations — so this service's own dismiss write can manufacture a `false` it never
+   * actually observed from the Pod: submitting `{isAlarmVibrating: false}` installs an overlay
+   * that forces `effective` to `false` immediately, *before* the Pod has confirmed anything. If
+   * that overlay later goes away while `raw` still disagrees (a failed POST, whose overlay is
+   * cleared synchronously on rejection; or a successful POST whose `writeSettleMs` window
+   * expires before any poll ever confirmed the dismissal), `effective` snaps back to `true` —
+   * a `false -> true` transition this service did not cause and the Pod never actually reported,
+   * which without this guard reads as a second, spurious alarm press.
+   *
+   * Two fixes were on the table (reviewer's review comment): gate on *raw* observation diffs
+   * instead of effective ones, or suppress a rising edge whose `false` half was manufactured by
+   * this service's own overlay. The first would need this service to track `documents.
+   * deviceStatus[side].isAlarmVibrating` independently, and that tracking itself has a gap: `raw`
+   * can silently catch up to the overlay (`retireAgreedOverlaysAgainstRaw`) without ever
+   * producing a `Change` at all, since `effective` doesn't move when it does — so nothing would
+   * ever tell this service the guard could safely disarm again, permanently suppressing every
+   * later, genuine press. This fix takes the second option instead: the service itself always
+   * knows exactly when it starts a dismiss write and (bounded by `writeSettleMs`) how long its
+   * own overlay could still be masking `raw` afterward, which sidesteps that gap entirely.
    */
   handleChange(change: AlarmVibratingChange): void {
     this.publishDismissState(change.current);
     if (change.previous === false && change.current === true) {
+      if (this.dismissOverlayGuardActive) return;
       const hap = this.ctx.api.hap;
       this.pressService
         .getCharacteristic(hap.Characteristic.ProgrammableSwitchEvent)
@@ -200,11 +276,12 @@ export class AlarmService {
   }
 
   /** Clears any pending accept-then-revert timer — wired into the platform's `shutdown` teardown
-   * alongside `thermostat.stop()`. */
+   * alongside `thermostat.stop()`. Also clears the B2 dismiss-overlay guard's own timer. */
   stop(): void {
     if (this.revertTimer !== null) {
       this.ctx.timers.clearTimeout(this.revertTimer);
       this.revertTimer = null;
     }
+    this.clearDismissOverlayGuard();
   }
 }

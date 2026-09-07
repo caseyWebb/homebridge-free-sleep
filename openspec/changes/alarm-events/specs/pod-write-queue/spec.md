@@ -28,9 +28,19 @@ exactly as submitted, and SHALL NOT be mirrored to the other side, regardless of
 currently in away mode or which away-mode policy is configured. This mirrors free-sleep's own
 `updateSide`, which never consults `controlBothSides`/`updateLeft`/`updateRight` for this field
 at all (`server/src/routes/deviceStatus/updateDeviceStatus.ts`) — the exemption is parity with
-upstream's own unconditional behavior, not a plugin-specific carve-out. A side patch carrying
-`isAlarmVibrating` alongside any other field is unaffected by this exemption and remains subject
-to whatever away-mode policy otherwise applies to it.
+upstream's own unconditional behavior, not a plugin-specific carve-out.
+
+**N8 (alarm-events PR #45 review, tech-lead ruling) — a coalesced patch is split, not swept
+wholesale under the remainder's own guard outcome:** a side patch carrying `isAlarmVibrating`
+alongside one or more other fields SHALL have its `isAlarmVibrating` field dispatched to the
+addressed side exactly as submitted — exempt from any away-mode policy, exactly as an
+alarm-only patch is, and evaluated *before* the away-mode policy is ever consulted for the rest
+of the patch. The remaining field(s) SHALL then be subject to whatever away-mode policy
+otherwise applies to them, exactly as they would be had `isAlarmVibrating` never been part of
+the same submission at all — coalescing with a dismiss SHALL NOT let a guarded field evade its
+own policy, and SHALL NOT let the guarded field's own policy outcome (e.g. `'block'`) prevent
+the alarm field's delivery either. `isAlarmVibrating` itself is never mirrored to the other
+side under any circumstance (S6), coalesced or not.
 
 #### Scenario: An away-mode write is dispatched, not guarded
 
@@ -50,12 +60,28 @@ to whatever away-mode policy otherwise applies to it.
 - **THEN** the write is dispatched to the addressed side only, and no second write is issued to
   the other side
 
-#### Scenario: A mixed patch containing isAlarmVibrating keeps whatever away-mode policy otherwise applies
+#### Scenario: A mixed patch's alarm field is dispatched addressed-only regardless of policy, and the remainder is guarded normally
 
 - **WHEN** a side patch contains `isAlarmVibrating` alongside at least one other field, and either
   side is in away mode
-- **THEN** the patch is subject to the configured away-mode policy exactly as it would be without
-  `isAlarmVibrating` present
+- **THEN** the `isAlarmVibrating` field is dispatched to the addressed side exactly as submitted —
+  never refused and never mirrored — and the remaining field(s) are separately subject to the
+  configured away-mode policy exactly as they would be had `isAlarmVibrating` not been part of
+  the same submission
+
+#### Scenario: A mixed patch's alarm field still lands when the remainder is blocked
+
+- **WHEN** a side patch contains `isAlarmVibrating` alongside at least one other field, either
+  side is in away mode, and the configured away-mode policy is `'block'`
+- **THEN** the `isAlarmVibrating` field is still dispatched to the addressed side, even though the
+  remaining field(s) are refused
+
+#### Scenario: isAlarmVibrating is never mirrored, mixed or not
+
+- **WHEN** any side write that includes `isAlarmVibrating` is dispatched while the configured
+  away-mode policy is `'mirror'` and either side is in away mode
+- **THEN** no mirrored write to the other side ever carries `isAlarmVibrating`, whether or not it
+  was coalesced with another field
 
 #### Scenario: An idle queue is silent
 

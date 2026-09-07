@@ -3,9 +3,11 @@ import { fileURLToPath } from 'node:url';
 
 import { describe, expect, it, vi } from 'vitest';
 
+import { AlarmWindowScheduler } from '../src/pod/alarmWindowScheduler.js';
 import { PodClient } from '../src/pod/client.js';
 import { PodPoller } from '../src/pod/poller.js';
 import { SnapshotStore, type Change } from '../src/pod/snapshot.js';
+import type { DailySchedule, Schedules, SideSchedule } from '../src/pod/types.js';
 import { WriteQueue } from '../src/pod/writeQueue.js';
 import { advanceFakeTime, createTimerHarness } from './timerHarness.js';
 import { startMockPod, type MockPod } from './mockPod.js';
@@ -398,6 +400,130 @@ describe('S2 regression: an awayMode write confirms via a settings re-read, neve
       const settingsReads = pod.requests.filter((r) => r.method === 'GET' && r.path === '/api/settings').length;
       expect(settingsReads).toBeGreaterThan(1); // bootstrap's read, plus at least the confirming refresh
 
+      poller.stop();
+      queue.stop();
+    } finally {
+      await pod.close();
+    }
+  }, 20_000);
+});
+
+// ---------------------------------------------------------------------------------------
+// S7 (alarm-events PR #45 review): a fixture-driven alarm-window case for the guardrail above —
+// resolution 2 (design.md, "Resolutions") claims the alarm-window scheduler's own fast-poll load
+// is "bounded and purposeful"; this measures that claim against a real, derivable request count
+// rather than merely asserting it, the same way the guardrail above measures the base + write
+// scenario's own request budget.
+// ---------------------------------------------------------------------------------------
+
+const WEEKDAYS = ['sunday', 'monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday'] as const;
+type Weekday = (typeof WEEKDAYS)[number];
+
+function inertDaily(): DailySchedule {
+  return {
+    temperatures: {},
+    power: { on: '21:00', off: '20:00', onTemperature: 82, enabled: false },
+    alarm: { time: '00:00', vibrationIntensity: 60, vibrationPattern: 'rise', duration: 30, enabled: false, alarmTemperature: 80 },
+  };
+}
+
+function inertSideSchedule(): SideSchedule {
+  const side = {} as SideSchedule;
+  for (const day of WEEKDAYS) side[day] = inertDaily();
+  return side;
+}
+
+/** One side (`left`) carrying exactly one enabled weekday/time, at `targetMs` rounded down to
+ * the whole minute (`alarm.time` is `HH:mm`, minute granularity only) — mirrors
+ * `alarmWindowScheduler.test.ts`'s own `withOneAlarmAt` helper. `right` stays fully inert, so
+ * every request this scenario produces is attributable to `left`'s one alarm alone. */
+function schedulesWithOneAlarmAt(targetMs: number): { schedules: Schedules; instantMs: number } {
+  const instantMs = Math.floor(targetMs / 60_000) * 60_000;
+  const d = new Date(instantMs);
+  const hh = String(d.getUTCHours()).padStart(2, '0');
+  const mm = String(d.getUTCMinutes()).padStart(2, '0');
+  const weekday: Weekday = WEEKDAYS[d.getUTCDay()]!;
+
+  const left = inertSideSchedule();
+  left[weekday] = {
+    temperatures: {},
+    power: { on: '21:00', off: '20:00', onTemperature: 82, enabled: true },
+    alarm: { time: `${hh}:${mm}`, vibrationIntensity: 60, vibrationPattern: 'rise', duration: 30, enabled: true, alarmTemperature: 80 },
+  };
+  return { schedules: { left, right: inertSideSchedule() }, instantMs };
+}
+
+describe('guardrail: a fixture-driven alarm window arms and adds a derived, bounded poll cost (S7)', () => {
+  it('the window accelerates deviceStatus polling to alarmPollIntervalMs only across its own margin, within a derived ceiling', async () => {
+    vi.useFakeTimers();
+    // Minute-aligned, matching `schedulesWithOneAlarmAt`'s own minute-floor rounding — see that
+    // helper's doc.
+    const nowMs = Math.ceil(Date.now() / 60_000) * 60_000;
+    vi.setSystemTime(nowMs);
+
+    // A deliberately narrow margin (15s, vs. issue #16's real-world default of 3 minutes) keeps
+    // this scenario's own added request count small and its derivation exact, while still
+    // exercising the real, config-floor `alarmPollIntervalMs` (3000ms, `src/config.ts`'s own
+    // minimum) acceleration end-to-end against a real mock Pod.
+    const windowMarginMs = 15_000;
+    const alarmPollIntervalMs = 3000;
+    // 1 minute out — comfortably inside the scheduler's own lookahead horizon, and (per
+    // `schedulesWithOneAlarmAt`'s minute-floor rounding) safely in the future rather than
+    // rolling to next week (see `alarmWindowScheduler.test.ts`'s own note on this).
+    const { schedules, instantMs } = schedulesWithOneAlarmAt(nowMs + 60_000);
+    const windowStartMs = instantMs - windowMarginMs; // nowMs + 45_000
+    const windowEndMs = instantMs + windowMarginMs; // nowMs + 75_000
+
+    const pod = await startMockPod({ state: { schedules, settings: { timeZone: 'UTC' } } });
+    try {
+      const timers = createTimerHarness();
+      timers.random = () => 0.5;
+      const { snapshot, poller, queue } = wire(pod, timers);
+
+      await poller.bootstrap(); // observes the seeded schedules/settings above
+
+      const alarmScheduler = new AlarmWindowScheduler({
+        snapshot,
+        poller,
+        timers,
+        alarmPollIntervalMs,
+        windowMarginMs,
+      });
+      alarmScheduler.recomputeNow(); // platform.ts's own post-bootstrap kick
+
+      const deviceStatusReadsAt = (): number =>
+        pod.requests.filter((r) => r.method === 'GET' && r.path === '/api/deviceStatus').length;
+
+      // --- t = 0 -> windowStartMs (45s): base cadence only (30s), the window has not opened yet -
+      await advanceFakeTime(windowStartMs - nowMs, 100);
+      const beforeWindow = deviceStatusReadsAt();
+      // Derived: bootstrap's own read (t=0) plus one base-cadence tick (30s, comfortably inside
+      // this 45s span) = 2. Measured: 2. A small headroom (3), not an exact-count assertion,
+      // for the same fake-timer step-boundary rounding this file's own guardrail above documents.
+      expect(beforeWindow).toBeLessThanOrEqual(3);
+
+      // --- windowStartMs -> windowEndMs (45s -> 75s, 30s wide): accelerated to alarmPollIntervalMs
+      await advanceFakeTime(windowEndMs - windowStartMs, 100);
+      const afterWindow = deviceStatusReadsAt();
+      const duringWindow = afterWindow - beforeWindow;
+      // Derived: a 30s-wide window at a 3s interval is at most floor(30/3) = 10 ticks. Measured:
+      // 10 — this *is* "the 3s window math," measured rather than asserted (S7): the base 30s
+      // cadence alone would have produced at most 1 further read in the same 30s span, so this
+      // count is squarely attributable to the window's own acceleration, and it is bounded by
+      // the window's own width/interval, not open-ended.
+      expect(duringWindow).toBeGreaterThanOrEqual(6); // materially faster than the ~1 base cadence would give
+      expect(duringWindow).toBeLessThanOrEqual(10); // and bounded — never more than the window's own width/interval math allows
+
+      // --- past windowEndMs: reverts to base cadence — the window's own load does not linger ---
+      await advanceFakeTime(60_000, 100);
+      const afterReversion = deviceStatusReadsAt();
+      const sinceWindowClosed = afterReversion - afterWindow;
+      // Derived: 60s at the 30s base cadence is at most 2 further reads. Measured: 2 — the
+      // concrete "did it actually revert" proof, nowhere near what a lingering fast-poll (20
+      // reads at 3s over the same 60s) would have produced.
+      expect(sinceWindowClosed).toBeLessThanOrEqual(3);
+
+      alarmScheduler.stop();
       poller.stop();
       queue.stop();
     } finally {

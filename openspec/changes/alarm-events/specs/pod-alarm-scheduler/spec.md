@@ -103,14 +103,20 @@ itself suppress a regular occurrence; it governs only the separate override occu
 ### Requirement: An active schedule override contributes its own one-shot instant
 
 When a side's `scheduleOverrides.alarm` has `disabled` false and both `timeOverride` and
-`expiresAt` set, with `expiresAt` later than the current moment, the system SHALL derive one
-additional, one-shot upcoming instant for that side at `timeOverride`'s next occurrence in the
-configured timezone.
+`expiresAt` set, with `expiresAt` later than the current moment, and that side is not in away
+mode, the system SHALL derive one additional, one-shot upcoming instant for that side at
+`timeOverride`'s next occurrence in the configured timezone.
+
+Away mode SHALL suppress this override instant exactly as it suppresses every regular
+weekday-derived instant for that side (this spec's "Away mode suppresses a side's instants
+entirely," above) — the underlying Pod job that would fire this override is itself scheduled
+independent of away mode, but its every execution is unconditionally a no-op while the side is
+away, making a predicted fast-poll window for it purely spurious.
 
 #### Scenario: A live override produces its own instant
 
 - **WHEN** a side's schedule override is not disabled and both its time and its expiry are set
-  with the expiry still in the future
+  with the expiry still in the future, and that side is not in away mode
 - **THEN** the system derives an additional upcoming instant at the override's time, alongside
   (or instead of, per the suppression requirement above) any regular occurrence it covers
 
@@ -119,6 +125,12 @@ configured timezone.
 - **WHEN** a side's schedule override has `disabled` true
 - **THEN** the system derives no override-specific instant for that side, whatever
   `timeOverride`/`expiresAt` hold
+
+#### Scenario: An away side's otherwise-live override produces no instant
+
+- **WHEN** a side is currently observed in away mode and that side's schedule override is
+  otherwise live (not disabled, both time and expiry set, expiry still in the future)
+- **THEN** the system derives no override-specific instant for that side
 
 ### Requirement: Each upcoming instant is covered by a bounded high-frequency polling window
 

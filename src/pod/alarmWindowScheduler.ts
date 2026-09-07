@@ -37,9 +37,18 @@ function clamp(value: number, lo: number, hi: number): number {
   return Math.min(Math.max(value, lo), hi);
 }
 
+function describeError(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
 interface ActiveWindow {
   release: () => void;
   untilMs: number;
+  /** S3 (alarm-events PR #45 review): the occurrence's own predicted instant, so the stale-
+   * window withdrawal below can tell "this occurrence's schedule genuinely changed out from
+   * under it" apart from "this occurrence already fired and next week's recomputation simply
+   * derived a new key for its *next* occurrence" — see `reconcile`'s doc. */
+  instantMs: number;
 }
 
 export interface AlarmWindowSchedulerOptions {
@@ -66,6 +75,10 @@ export class AlarmWindowScheduler {
   private readonly active = new Map<string, ActiveWindow>();
   private timerHandle: TimerHandle | null = null;
   private stopped = false;
+  /** B1: `deriveUpcomingAlarms`'s per-entry error hook reports here, deduped so a persistently
+   * bad entry (e.g. an unrecognized `settings.timeZone`) logs once per offender for this
+   * scheduler's lifetime rather than once per recompute tick. */
+  private readonly loggedDeriveErrors = new Set<string>();
 
   constructor(options: AlarmWindowSchedulerOptions) {
     this.snapshot = options.snapshot;
@@ -98,13 +111,39 @@ export class AlarmWindowScheduler {
     this.tick();
   }
 
+  /**
+   * B1 (alarm-events PR #45 review): every entry point into this class's own recompute logic —
+   * the constructor, `recomputeNow()`, and this method's own self-rescheduled `setTimeout`
+   * callback — funnels through here, so one try/catch around the whole body is enough to make
+   * every one of them safe. This is deliberately a *second*, coarser line of defense on top of
+   * `deriveUpcomingAlarms`'s own per-entry guard (B1 in that module): that guard is expected to
+   * handle the specific failure modes known today (a malformed `alarm.time`, an unrecognized
+   * `settings.timeZone`); this one exists so that *any* future bug anywhere in this method's own
+   * body — `reconcile`, `scheduleNext`, or a `deriveUpcomingAlarms` regression this guard didn't
+   * anticipate — logs and skips this one recompute rather than throwing out of a bare timer
+   * callback, which Node has no handler for and which crashes the whole Homebridge process
+   * (issue: a malformed schedule entry surviving to this point previously meant a crash loop,
+   * at most `RECOMPUTE_CEILING_MS` after every restart).
+   */
   private tick(): void {
     if (this.stopped) return;
-    const now = this.timers.now();
-    const documents = this.snapshot.get().documents;
-    const upcoming = deriveUpcomingAlarms(documents.schedules, documents.settings, now);
-    this.reconcile(upcoming, now);
-    this.scheduleNext(upcoming, now);
+    try {
+      const now = this.timers.now();
+      const documents = this.snapshot.get().documents;
+      const upcoming = deriveUpcomingAlarms(documents.schedules, documents.settings, now, (key, error) => {
+        if (this.loggedDeriveErrors.has(key)) return;
+        this.loggedDeriveErrors.add(key);
+        this.logger.warn(`alarmWindowScheduler: skipping upcoming-alarm entry "${key}" — derivation failed: ${describeError(error)}`);
+      });
+      this.reconcile(upcoming, now);
+      this.scheduleNext(upcoming, now);
+    } catch (error) {
+      this.logger.warn(`alarmWindowScheduler: recompute failed unexpectedly, skipping this tick: ${describeError(error)}`);
+      // Never leave the scheduler permanently inert after a caught error — re-arm on the ceiling
+      // delay (an empty `upcoming` list) so the next recompute still gets a chance to succeed
+      // once whatever produced this failure is no longer true (e.g. a schedule edit).
+      if (!this.stopped) this.scheduleNext([], this.timers.now());
+    }
   }
 
   private reconcile(upcoming: readonly UpcomingAlarm[], now: number): void {
@@ -121,8 +160,22 @@ export class AlarmWindowScheduler {
     // schedule changed out from under it) is withdrawn immediately, rather than left to run to
     // its original expiry for an alarm that no longer exists (design.md's step 3; pod-alarm-
     // scheduler spec's "A stale window is withdrawn when the schedule changes").
+    //
+    // S3 (alarm-events PR #45 review): missing from `freshKeys` is not by itself proof the
+    // schedule changed — a *weekly-recurring* occurrence's key is `${side}:${instantMs}:
+    // ${source}`, and once `now` passes that `instantMs` (the alarm has fired), the very next
+    // recompute derives *next* week's occurrence instead, under a different `instantMs` and
+    // therefore a different key. Without the `now < entry.instantMs` guard below, that rollover
+    // alone made this loop treat the just-fired occurrence's still-live window (its own
+    // `untilMs`, the post-instant half of the margin, has not arrived yet) as stale and release
+    // it early — reverting to base-cadence polling up to a full `windowMarginMs` before the
+    // window's actual expiry. Restricting withdrawal to windows whose instant is still in the
+    // future correctly distinguishes "this occurrence's schedule genuinely changed before it
+    // ever fired" (withdraw now) from "this occurrence already fired and is simply running out
+    // its own post-instant margin under a now-superseded key" (leave it to expire naturally via
+    // the `untilMs` cleanup above).
     for (const [key, entry] of this.active) {
-      if (!freshKeys.has(key)) {
+      if (now < entry.instantMs && !freshKeys.has(key)) {
         entry.release();
         this.active.delete(key);
       }
@@ -139,7 +192,7 @@ export class AlarmWindowScheduler {
         untilMs: windowEnd,
         reason: 'alarm',
       });
-      this.active.set(key, { release, untilMs: windowEnd });
+      this.active.set(key, { release, untilMs: windowEnd, instantMs: occurrence.instantMs });
       this.logger.debug(
         `alarmWindowScheduler: armed a fast-poll window for ${occurrence.side} (${occurrence.source}), ` +
           `until ${new globalThis.Date(windowEnd).toISOString()}`,
