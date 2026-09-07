@@ -7,15 +7,19 @@
  * `platform-foundation` (`src/platform.ts`); the rest are validated and defaulted but
  * otherwise ignored until the change that owns them reads them:
  *
- *   | Key                  | Owner (reads it for behavior) |
- *   |----------------------|--------------------------------|
- *   | `pollIntervals`      | `poller-and-write-queue` (#8)  |
- *   | `writeSettleMs`      | `poller-and-write-queue` (#10) |
- *   | `noResponseAfterMs`  | `thermostat-and-offline` (#11) |
- *   | `occupancySource`    | #19                            |
- *   | `waterLowSensorType` | #20                            |
- *   | `keepAlive`          | #12                            |
- *   | `awayModeWritePolicy`| #13                            |
+ *   | Key                  | Owner (reads it for behavior)   |
+ *   |----------------------|----------------------------------|
+ *   | `pollIntervals`      | `poller-and-write-queue` (#8), plus `pollIntervals.deviceWriteDebounceMs` (`hub-accessory`, #20) |
+ *   | `writeSettleMs`      | `poller-and-write-queue` (#10)  |
+ *   | `noResponseAfterMs`  | `thermostat-and-offline` (#11)  |
+ *   | `occupancySource`    | #19                             |
+ *   | `waterLowSensorType` | `hub-accessory` (#20)           |
+ *   | `keepAlive`          | #12                             |
+ *   | `awayModeWritePolicy`| #13                             |
+ *   | `primeSwitch`        | `hub-accessory` (#20)           |
+ *   | `ledLightbulb`       | `hub-accessory` (#20)           |
+ *   | `testAlarmSwitch`    | `hub-accessory` (#20)           |
+ *   | `serverFaultSensor`  | `hub-accessory` (#20)           |
  *
  * Every reserved key is nonetheless genuinely validated — a `z.object`/`z.enum` per key, not
  * `z.unknown()` — so a typo'd future config value fails loudly today rather than silently
@@ -103,6 +107,17 @@ export const PollIntervalsFieldsSchema = z
       .int()
       .min(1000, { message: 'bootstrapTimeoutMs must be at least 1000ms' })
       .optional(),
+    /**
+     * Write-queue debounce for the device-wide lane specifically (as opposed to
+     * `writeDebounceMs`, which governs every other lane). Default 500. Minimum 500 — issue #10's
+     * own note that a brightness drag (#20) needs a harder debounce than the shared default
+     * (`hub-accessory` design.md, Decision 4), not merely "at least the shared default".
+     */
+    deviceWriteDebounceMs: z
+      .number()
+      .int()
+      .min(500, { message: 'deviceWriteDebounceMs must be at least 500ms' })
+      .optional(),
   });
 
 export const PollIntervalsSchema = PollIntervalsFieldsSchema.default({});
@@ -146,7 +161,13 @@ export const FreeSleepConfigSchema = z.object({
     })
     .default('none'),
 
-  /** Reserved — see module doc. */
+  /**
+   * Consumed starting with `hub-accessory` (#20): governs which HomeKit service type the hub's
+   * always-published water-level sensor is published as — `'contact'` (default) a `ContactSensor`,
+   * `'leak'` a `LeakSensor`. The sensor itself is unconditional (mirrors the connection sensor's
+   * own always-on precedent, design.md's Decision 1); this key selects its service type only,
+   * never whether it exists.
+   */
   waterLowSensorType: z
     .enum(['contact', 'leak'], {
       message: "waterLowSensorType must be one of 'contact' or 'leak'",
@@ -204,6 +225,35 @@ export const FreeSleepConfigSchema = z.object({
       message: "awayModeWritePolicy must be one of 'mirror' or 'block'",
     })
     .default('mirror'),
+
+  /**
+   * Consumed starting with `hub-accessory` (#20): gates the "Pod Prime" `Switch` on the hub.
+   * Default `false` — priming is loud and runs for minutes with no stop command
+   * (docs/HOMEKIT.md's hub-service table), so it ships opt-in.
+   */
+  primeSwitch: z.boolean().default(false),
+
+  /**
+   * Consumed starting with `hub-accessory` (#20): gates the "Pod LED" `Lightbulb` on the hub.
+   * Default `false` — an always-on LED tile pollutes the Home app's Lights category and answers
+   * to "turn off all the lights" (docs/HOMEKIT.md), so it ships opt-in.
+   */
+  ledLightbulb: z.boolean().default(false),
+
+  /**
+   * Consumed starting with `hub-accessory` (#20): gates the momentary "Pod Test Alarm" `Switch`
+   * on the hub. Default `false` — a manual trigger that can fire a bed vibration at any hour
+   * (docs/HOMEKIT.md), so it ships opt-in.
+   */
+  testAlarmSwitch: z.boolean().default(false),
+
+  /**
+   * Consumed starting with `hub-accessory` (#20): gates the "Pod Server Fault" `ContactSensor`
+   * on the hub, and — via `PodPoller`'s `serverStatus` endpoint class — whether the plugin polls
+   * `GET /api/serverStatus` at all. Default `false` — diagnostic-only, and the endpoint is not
+   * free (a real SQLite round-trip on every call upstream, `hub-accessory` design.md's Context).
+   */
+  serverFaultSensor: z.boolean().default(false),
 }).superRefine((data, ctx) => {
   if (data.keepAliveThresholdMs >= data.keepAliveMs) {
     ctx.addIssue({

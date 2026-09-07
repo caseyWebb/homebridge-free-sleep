@@ -13,7 +13,16 @@
  */
 
 import type { PodClient } from '../src/pod/client.ts';
-import type { DeviceStatus, DeviceStatusPatch, Schedules, Services, Settings, SettingsPatch } from '../src/pod/types.ts';
+import type {
+  AlarmRequest,
+  DeviceStatus,
+  DeviceStatusPatch,
+  Schedules,
+  ServerStatus,
+  Services,
+  Settings,
+  SettingsPatch,
+} from '../src/pod/types.ts';
 
 type Outcome<T> =
   | { kind: 'value'; value: T }
@@ -92,10 +101,15 @@ export interface FakePodClient {
   settings: FakeEndpoint<Settings>;
   schedules: FakeEndpoint<Schedules>;
   services: FakeEndpoint<Services>;
+  /** hub-accessory: only populated with a fallback when `fixtures.serverStatus` is provided —
+   * every pre-existing caller of `createFakePodClient` never calls `getServerStatus` at all. */
+  serverStatus: FakeEndpoint<ServerStatus>;
   postDeviceStatusCalls: DeviceStatusPatch[];
   postSettingsCalls: SettingsPatch[];
+  postAlarmCalls: AlarmRequest[];
   postDeviceStatusOutcome: { kind: 'success' } | { kind: 'error'; error: unknown };
   postSettingsOutcome: { kind: 'success' } | { kind: 'error'; error: unknown };
+  postAlarmOutcome: { kind: 'success' } | { kind: 'error'; error: unknown };
 }
 
 export interface FakePodClientFixtures {
@@ -103,6 +117,9 @@ export interface FakePodClientFixtures {
   settings: Settings;
   schedules: Schedules;
   services: Services;
+  /** hub-accessory: optional — omitted by every pre-existing caller, which never exercises the
+   * `serverStatus` endpoint class. */
+  serverStatus?: ServerStatus;
 }
 
 export function createFakePodClient(fixtures: FakePodClientFixtures): FakePodClient {
@@ -110,23 +127,29 @@ export function createFakePodClient(fixtures: FakePodClientFixtures): FakePodCli
   const settings = new FakeEndpoint<Settings>();
   const schedules = new FakeEndpoint<Schedules>();
   const services = new FakeEndpoint<Services>();
+  const serverStatus = new FakeEndpoint<ServerStatus>();
   deviceStatus.setFallback(fixtures.deviceStatus);
   settings.setFallback(fixtures.settings);
   schedules.setFallback(fixtures.schedules);
   services.setFallback(fixtures.services);
+  if (fixtures.serverStatus) serverStatus.setFallback(fixtures.serverStatus);
 
   const postDeviceStatusCalls: DeviceStatusPatch[] = [];
   const postSettingsCalls: SettingsPatch[] = [];
+  const postAlarmCalls: AlarmRequest[] = [];
   const state: FakePodClient = {
     client: undefined as unknown as PodClient,
     deviceStatus,
     settings,
     schedules,
     services,
+    serverStatus,
     postDeviceStatusCalls,
     postSettingsCalls,
+    postAlarmCalls,
     postDeviceStatusOutcome: { kind: 'success' },
     postSettingsOutcome: { kind: 'success' },
+    postAlarmOutcome: { kind: 'success' },
   };
 
   const client = {
@@ -134,6 +157,7 @@ export function createFakePodClient(fixtures: FakePodClientFixtures): FakePodCli
     getSettings: (signal?: AbortSignal) => settings.run(signal),
     getSchedules: (signal?: AbortSignal) => schedules.run(signal),
     getServices: (signal?: AbortSignal) => services.run(signal),
+    getServerStatus: (signal?: AbortSignal) => serverStatus.run(signal),
     postDeviceStatus: async (patch: DeviceStatusPatch) => {
       postDeviceStatusCalls.push(patch);
       if (state.postDeviceStatusOutcome.kind === 'error') throw state.postDeviceStatusOutcome.error;
@@ -141,6 +165,10 @@ export function createFakePodClient(fixtures: FakePodClientFixtures): FakePodCli
     postSettings: async (patch: SettingsPatch) => {
       postSettingsCalls.push(patch);
       if (state.postSettingsOutcome.kind === 'error') throw state.postSettingsOutcome.error;
+    },
+    postAlarm: async (request: AlarmRequest) => {
+      postAlarmCalls.push(request);
+      if (state.postAlarmOutcome.kind === 'error') throw state.postAlarmOutcome.error;
     },
   } as unknown as PodClient;
 

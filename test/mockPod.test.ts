@@ -2,11 +2,13 @@ import { afterEach, describe, expect, it } from 'vitest';
 
 import { startMockPod, type MockPod } from './mockPod.js';
 import { loadFixture } from './loadFixture.js';
+import { ServerStatusSchema, type ServerStatus } from '../src/pod/types.js';
 
 const deviceStatusFixture = loadFixture('deviceStatus.json');
 const settingsFixture = loadFixture('settings.json') as { id: string };
 const schedulesFixture = loadFixture('schedules.json');
 const servicesFixture = loadFixture('services.json');
+const serverStatusFixture: ServerStatus = ServerStatusSchema.parse(loadFixture('serverStatus.json'));
 
 let pods: MockPod[] = [];
 
@@ -164,8 +166,10 @@ describe('transport', () => {
         'GET /api/settings',
         'GET /api/schedules',
         'GET /api/services',
+        'GET /api/serverStatus',
         'POST /api/deviceStatus',
         'POST /api/settings',
+        'POST /api/alarm',
       ]) {
         expect(() => pod.fault(endpoint, { kind: 'status', times: 1 })).not.toThrow();
       }
@@ -426,5 +430,147 @@ describe('no plugin policy (5.6)', () => {
     const after = await getDeviceStatus(pod);
     expect(after.left.targetTemperatureF).toBe(66);
     expect(after.right.targetTemperatureF).toBe(66);
+  });
+});
+
+// ---------------------------------------------------------------------------------------
+// hub-accessory: subsystem health (GET /api/serverStatus)
+// ---------------------------------------------------------------------------------------
+
+describe('subsystem health (6.2)', () => {
+  it('the default response reports no failed subsystem', async () => {
+    const pod = await start();
+    const response = await fetch(`${pod.url}/api/serverStatus`);
+    expect(response.status).toBe(200);
+    const body = (await response.json()) as ServerStatus;
+    expect(body).toEqual(serverStatusFixture);
+    for (const info of Object.values(body)) {
+      expect(info?.status).not.toBe('failed');
+    }
+  });
+
+  it('a startup override injecting a failed subsystem is served back unchanged', async () => {
+    const failed: ServerStatus = { ...serverStatusFixture, database: { ...serverStatusFixture.database, status: 'failed' } };
+    const pod = await start({ state: { serverStatus: failed } });
+    const response = await fetch(`${pod.url}/api/serverStatus`);
+    const body = (await response.json()) as ServerStatus;
+    expect(body.database.status).toBe('failed');
+  });
+
+  it('reset() restores the seeded (including override) subsystem-health document, matching every other document\'s own reset behavior', async () => {
+    const failed: ServerStatus = { ...serverStatusFixture, database: { ...serverStatusFixture.database, status: 'failed' } };
+    const pod = await start({ state: { serverStatus: failed } });
+    pod.reset();
+    const response = await fetch(`${pod.url}/api/serverStatus`);
+    const body = (await response.json()) as ServerStatus;
+    expect(body.database.status).toBe('failed');
+  });
+});
+
+// ---------------------------------------------------------------------------------------
+// hub-accessory: alarm trigger (POST /api/alarm)
+// ---------------------------------------------------------------------------------------
+
+async function postAlarm(pod: MockPod, body: unknown): Promise<Response> {
+  return fetch(`${pod.url}/api/alarm`, {
+    method: 'POST',
+    body: JSON.stringify(body),
+    headers: { 'content-type': 'application/json' },
+  });
+}
+
+describe('alarm trigger (6.3)', () => {
+  it('a forced trigger against an off, away side is still recorded as a command', async () => {
+    const pod = await start({ state: { settings: { left: { awayMode: true } }, deviceStatus: { left: { secondsRemaining: 0 } } } });
+    const response = await postAlarm(pod, {
+      side: 'left',
+      vibrationIntensity: 60,
+      vibrationPattern: 'double',
+      duration: 10,
+      force: true,
+    });
+    expect(response.status).toBe(200);
+    expect(pod.commands.some((c) => c.name === 'ALARM_LEFT')).toBe(true);
+  });
+
+  it('a non-forced trigger against an off side is a no-op with respect to hardware commands', async () => {
+    const pod = await start({ state: { deviceStatus: { left: { secondsRemaining: 0 } } } });
+    const response = await postAlarm(pod, {
+      side: 'left',
+      vibrationIntensity: 60,
+      vibrationPattern: 'double',
+      duration: 10,
+      force: false,
+    });
+    expect(response.status).toBe(200);
+    expect(pod.commands.some((c) => c.name === 'ALARM_LEFT')).toBe(false);
+  });
+
+  it('a non-forced trigger against an on, non-away side fires', async () => {
+    const pod = await start({ state: { deviceStatus: { left: { secondsRemaining: 600 } } } });
+    const response = await postAlarm(pod, {
+      side: 'left',
+      vibrationIntensity: 60,
+      vibrationPattern: 'double',
+      duration: 10,
+      force: false,
+    });
+    expect(response.status).toBe(200);
+    expect(pod.commands.some((c) => c.name === 'ALARM_LEFT')).toBe(true);
+  });
+
+  it('the request is always recorded, regardless of whether it was allowed to fire', async () => {
+    const pod = await start({ state: { deviceStatus: { left: { secondsRemaining: 0 } } } });
+    await postAlarm(pod, { side: 'left', vibrationIntensity: 60, vibrationPattern: 'double', duration: 10, force: false });
+    expect(pod.requests.some((r) => r.path === '/api/alarm')).toBe(true);
+  });
+
+  it('an out-of-bounds request gives 400 naming the field', async () => {
+    const pod = await start();
+    const response = await postAlarm(pod, {
+      side: 'left',
+      vibrationIntensity: 0,
+      vibrationPattern: 'double',
+      duration: 10,
+      force: true,
+    });
+    expect(response.status).toBe(400);
+    const body = (await response.json()) as { details: unknown[] };
+    expect(JSON.stringify(body.details)).toMatch(/vibrationIntensity/);
+  });
+
+  it('responds 200 with the current schedules document', async () => {
+    const pod = await start();
+    const response = await postAlarm(pod, {
+      side: 'right',
+      vibrationIntensity: 60,
+      vibrationPattern: 'rise',
+      duration: 10,
+      force: true,
+    });
+    const body = await response.json();
+    expect(body).toEqual(schedulesFixture);
+  });
+});
+
+// ---------------------------------------------------------------------------------------
+// hub-accessory: priming-trigger field write semantics (6.4)
+// ---------------------------------------------------------------------------------------
+
+describe('priming-trigger field write semantics (6.4)', () => {
+  it('a false priming-trigger field changes nothing and records no priming-related command', async () => {
+    const pod = await start({ state: { deviceStatus: { isPriming: true } } });
+    const response = await postDeviceStatus(pod, { isPriming: false });
+    expect(response.status).toBe(204);
+    const after = await fetch(`${pod.url}/api/deviceStatus`).then((r) => r.json()) as { isPriming: boolean };
+    expect(after.isPriming).toBe(true); // an in-progress prime is not stopped
+    expect(pod.commands.some((c) => c.name === 'PRIME')).toBe(false);
+  });
+
+  it('a true priming-trigger field starts a prime', async () => {
+    const pod = await start();
+    const response = await postDeviceStatus(pod, { isPriming: true });
+    expect(response.status).toBe(204);
+    expect(pod.commands.some((c) => c.name === 'PRIME')).toBe(true);
   });
 });

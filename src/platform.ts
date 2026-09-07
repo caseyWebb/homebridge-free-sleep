@@ -31,9 +31,11 @@ import type {
 
 import { FreeSleepConfigSchema, unrecognizedConfigKeys, type FreeSleepConfig } from './config.ts';
 import type {
+  AlarmRequest,
   DeviceStatus,
   DeviceStatusPatch,
   Schedules,
+  ServerStatus,
   Services as PodServices,
   Settings,
   SettingsPatch,
@@ -46,8 +48,13 @@ import { PodPoller } from './pod/poller.ts';
 import { defaultTimerApi, SnapshotStore, type Change, type TimerApi } from './pod/snapshot.ts';
 import { WriteQueue } from './pod/writeQueue.ts';
 import { CONNECTION_SUBTYPE, ConnectionService } from './services/connection.ts';
+import { LED_SUBTYPE, LedService } from './services/led.ts';
+import { PRIME_SUBTYPE, PrimeService } from './services/prime.ts';
+import { SERVER_FAULT_SUBTYPE, ServerFaultService } from './services/serverFault.ts';
+import { TEST_ALARM_SUBTYPE, TestAlarmService } from './services/testAlarm.ts';
 import { isThermostatChange, THERMOSTAT_SUBTYPE, ThermostatService } from './services/thermostat.ts';
 import type { ServiceContext } from './services/types.ts';
+import { WATER_LOW_SUBTYPE, WaterLowService } from './services/waterLow.ts';
 import { PLATFORM_NAME, PLUGIN_NAME } from './settings.ts';
 
 const require = createRequire(import.meta.url);
@@ -79,6 +86,15 @@ export interface MinimalPodClient {
   getServices(signal?: AbortSignal): Promise<PodServices>;
   postDeviceStatus(patch: DeviceStatusPatch, signal?: AbortSignal): Promise<void>;
   postSettings(patch: SettingsPatch, signal?: AbortSignal): Promise<void>;
+  /** Widened by `hub-accessory`: needed by `PodPoller`'s `serverStatus` class. */
+  getServerStatus(signal?: AbortSignal): Promise<ServerStatus>;
+  /**
+   * Widened by `hub-accessory`: `TestAlarmService` is the first service to call the client
+   * directly (via `ServiceContext.podClient`) rather than solely through
+   * `writeQueue`/`snapshot` — `postAlarm` is a one-off fire-and-forget write, not a
+   * debounced/merged field the write queue's lane model fits.
+   */
+  postAlarm(request: AlarmRequest, signal?: AbortSignal): Promise<void>;
 }
 
 /**
@@ -134,15 +150,27 @@ interface WantedAccessory {
 
 /**
  * The currently-enabled non-`AccessoryInformation` services, per role, as
- * `${Service.UUID}:${subtype}` compound keys — side accessories enable the thermostat subtype,
- * the hub enables the connection-sensor subtype (tasks.md 1.2). Computed from `hap` rather than
- * a module-level constant, since the UUIDs come from `api.hap.Service.*`, never a direct
- * `@homebridge/hap-nodejs` import (docs/HOMEKIT.md). `pruneServices` below reads this and never
- * needs to change shape itself as more services are added (design.md, "Restore flow").
+ * `${Service.UUID}:${subtype}` compound keys — side accessories enable the thermostat subtype;
+ * the hub enables the connection sensor and the water-low sensor unconditionally, plus whichever
+ * of the prime switch, LED lightbulb, test-alarm switch, and server-fault sensor `config`
+ * currently enables (`hub-accessory`, tasks.md 9.1). Computed from `hap` (and, for the hub, from
+ * `config`) rather than a module-level constant, since the UUIDs come from `api.hap.Service.*`,
+ * never a direct `@homebridge/hap-nodejs` import (docs/HOMEKIT.md). `pruneServices` below reads
+ * this and never needs to change shape itself as more services are added (design.md, "Restore
+ * flow").
  */
-function enabledServiceKeysFor(hap: HAP, role: Role): ReadonlySet<string> {
+function enabledServiceKeysFor(hap: HAP, role: Role, config: FreeSleepConfig): ReadonlySet<string> {
   if (role === 'hub') {
-    return new Set([`${hap.Service.ContactSensor.UUID}:${CONNECTION_SUBTYPE}`]);
+    const waterLowServiceCtor = config.waterLowSensorType === 'leak' ? hap.Service.LeakSensor : hap.Service.ContactSensor;
+    const keys = [
+      `${hap.Service.ContactSensor.UUID}:${CONNECTION_SUBTYPE}`,
+      `${waterLowServiceCtor.UUID}:${WATER_LOW_SUBTYPE}`,
+    ];
+    if (config.primeSwitch) keys.push(`${hap.Service.Switch.UUID}:${PRIME_SUBTYPE}`);
+    if (config.ledLightbulb) keys.push(`${hap.Service.Lightbulb.UUID}:${LED_SUBTYPE}`);
+    if (config.testAlarmSwitch) keys.push(`${hap.Service.Switch.UUID}:${TEST_ALARM_SUBTYPE}`);
+    if (config.serverFaultSensor) keys.push(`${hap.Service.ContactSensor.UUID}:${SERVER_FAULT_SUBTYPE}`);
+    return new Set(keys);
   }
   return new Set([`${hap.Service.Thermostat.UUID}:${THERMOSTAT_SUBTYPE}`]);
 }
@@ -183,6 +211,15 @@ export class FreeSleepPlatform implements DynamicPlatformPlugin {
 
   private readonly thermostats = new Map<Side, ThermostatService>();
   private connectionService: ConnectionService | undefined;
+  private waterLowService: WaterLowService | undefined;
+  private primeService: PrimeService | undefined;
+  // No stored `ledService` field: unlike the other four hub services, `LedService` watches no
+  // snapshot-change field (`ledBrightness` is not among `pod-snapshot`'s watched fields,
+  // design.md's Decision 2) and owns no timer for `shutdown` to stop — there is nothing for
+  // `handleSnapshotChanges` or `shutdown` to reach it for, so it is constructed and left to the
+  // accessory's own service list rather than retained here unused.
+  private testAlarmService: TestAlarmService | undefined;
+  private serverFaultService: ServerFaultService | undefined;
 
   constructor(
     log: Logging,
@@ -237,6 +274,7 @@ export class FreeSleepPlatform implements DynamicPlatformPlugin {
       ...(pollOptions.fastPollIntervalMs !== undefined ? { fastPollIntervalMs: pollOptions.fastPollIntervalMs } : {}),
       ...(pollOptions.maxBackoffMs !== undefined ? { maxBackoffMs: pollOptions.maxBackoffMs } : {}),
       ...(pollOptions.bootstrapTimeoutMs !== undefined ? { bootstrapTimeoutMs: pollOptions.bootstrapTimeoutMs } : {}),
+      serverFaultSensorEnabled: parsed.data.serverFaultSensor,
     });
     this.poller = poller;
 
@@ -264,6 +302,9 @@ export class FreeSleepPlatform implements DynamicPlatformPlugin {
       awayModeGuard,
       timers: this.timers,
       ...(pollOptions.writeDebounceMs !== undefined ? { writeDebounceMs: pollOptions.writeDebounceMs } : {}),
+      ...(pollOptions.deviceWriteDebounceMs !== undefined
+        ? { deviceWriteDebounceMs: pollOptions.deviceWriteDebounceMs }
+        : {}),
       ...(pollOptions.writeMaxDebounceMs !== undefined ? { writeMaxDebounceMs: pollOptions.writeMaxDebounceMs } : {}),
       writeSettleMs: parsed.data.writeSettleMs,
       ...(pollOptions.fastPollDurationMs !== undefined ? { fastPollDurationMs: pollOptions.fastPollDurationMs } : {}),
@@ -304,6 +345,8 @@ export class FreeSleepPlatform implements DynamicPlatformPlugin {
       for (const thermostat of this.thermostats.values()) {
         thermostat.stop();
       }
+      this.primeService?.stop();
+      this.testAlarmService?.stop();
       this.unsubscribeSnapshot?.();
       this.unsubscribeSnapshot = undefined;
     });
@@ -321,9 +364,15 @@ export class FreeSleepPlatform implements DynamicPlatformPlugin {
           this.thermostats.get(change.side)?.refresh();
         } else if (change.scope === 'device' && change.field === 'connectionOnline') {
           this.connectionService?.refresh();
+        } else if (change.scope === 'device' && change.field === 'waterLevelState') {
+          this.waterLowService?.refresh();
+        } else if (change.scope === 'device' && change.field === 'isPriming') {
+          this.primeService?.refresh();
+        } else if (change.scope === 'device' && change.field === 'serverFault') {
+          this.serverFaultService?.refresh();
         }
-        // isAlarmVibrating, awayMode, waterLevelState, isPriming: no published service watches
-        // these fields yet — ignored, without error (design.md's routing table; #13/#16/#19/#20).
+        // isAlarmVibrating, awayMode: no published service watches these fields yet — ignored,
+        // without error (design.md's routing table; #13/#16/#19).
       } catch (error) {
         this.log.warn(`FreeSleep: a service failed to handle a snapshot change: ${describeError(error)}`);
       }
@@ -331,7 +380,7 @@ export class FreeSleepPlatform implements DynamicPlatformPlugin {
   }
 
   private serviceContextFor(accessory: PlatformAccessory): ServiceContext | undefined {
-    if (!this.config || !this.snapshot || !this.writeQueue || !this.awayModeGuard) return undefined;
+    if (!this.config || !this.snapshot || !this.writeQueue || !this.awayModeGuard || !this.podClient) return undefined;
     return {
       api: this.api,
       log: this.log,
@@ -341,6 +390,7 @@ export class FreeSleepPlatform implements DynamicPlatformPlugin {
       awayModeGuard: this.awayModeGuard,
       timers: this.timers,
       config: this.config,
+      podClient: this.podClient,
     };
   }
 
@@ -353,6 +403,11 @@ export class FreeSleepPlatform implements DynamicPlatformPlugin {
     if (!ctx) return;
     if (role === 'hub') {
       this.connectionService = new ConnectionService(ctx);
+      this.waterLowService = new WaterLowService(ctx);
+      if (ctx.config.primeSwitch) this.primeService = new PrimeService(ctx);
+      if (ctx.config.ledLightbulb) new LedService(ctx);
+      if (ctx.config.testAlarmSwitch) this.testAlarmService = new TestAlarmService(ctx);
+      if (ctx.config.serverFaultSensor) this.serverFaultService = new ServerFaultService(ctx);
     } else {
       this.thermostats.set(role, new ThermostatService(ctx, role, this.platformStartedAt));
     }
@@ -404,7 +459,7 @@ export class FreeSleepPlatform implements DynamicPlatformPlugin {
         // until something overwrites it — re-apply AccessoryInformation on every restart so it
         // never sticks at that placeholder forever.
         this.setAccessoryInformation(existing, host, w.role);
-        const pruned = this.pruneServices(existing, w.role);
+        const pruned = this.pruneServices(existing, w.role, config);
         if (pruned) {
           // F4: persist the prune so it survives an unclean shutdown (one that never reaches
           // Homebridge's normal cached-accessories flush). Only when something actually
@@ -512,9 +567,9 @@ export class FreeSleepPlatform implements DynamicPlatformPlugin {
    * Returns whether any service was actually removed, so callers (F4) can persist the mutation
    * with `updatePlatformAccessories` only when there is something to persist.
    */
-  private pruneServices(accessory: PlatformAccessory, role: Role): boolean {
+  private pruneServices(accessory: PlatformAccessory, role: Role, config: FreeSleepConfig): boolean {
     const accessoryInformationUuid = this.api.hap.Service.AccessoryInformation.UUID;
-    const enabled = enabledServiceKeysFor(this.api.hap, role);
+    const enabled = enabledServiceKeysFor(this.api.hap, role, config);
     let removedAny = false;
     for (const service of [...accessory.services]) {
       if (service.UUID === accessoryInformationUuid) continue;

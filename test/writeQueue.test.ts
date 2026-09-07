@@ -90,10 +90,100 @@ describe('write queue: lanes and per-submission promises (7.1)', () => {
     const { queue, fake } = setup();
     const pDevice = queue.submitDeviceSettings({ ledBrightness: 40 });
     const pSettings = queue.submitSettings({ primePodDaily: { enabled: false } });
-    await vi.advanceTimersByTimeAsync(400);
+    // The device lane's own debounce (default 500ms, hub-accessory design.md's Decision 4) is
+    // stricter than the shared 400ms default every other lane still uses.
+    await vi.advanceTimersByTimeAsync(500);
     await Promise.all([pDevice, pSettings]);
     expect(fake.postDeviceStatusCalls).toEqual([{ settings: { ledBrightness: 40 } }]);
     expect(fake.postSettingsCalls).toEqual([{ primePodDaily: { enabled: false } }]);
+    queue.stop();
+  });
+});
+
+// ---------------------------------------------------------------------------------------
+// hub-accessory: device-lane widening (tasks.md 2.1, 2.2, 2.3)
+// ---------------------------------------------------------------------------------------
+
+describe('write queue: device-lane widening carries isPriming alongside settings fields (2.1)', () => {
+  it('a device-lane submission carrying only isPriming dispatches {isPriming: true} with no settings key', async () => {
+    const { queue, fake } = setup();
+    const p = queue.submitDeviceSettings({ isPriming: true });
+    await vi.advanceTimersByTimeAsync(500);
+    await p;
+    expect(fake.postDeviceStatusCalls).toEqual([{ isPriming: true }]);
+    queue.stop();
+  });
+
+  it('a device-lane submission carrying only ledBrightness dispatches {settings: {ledBrightness: N}} with no isPriming key', async () => {
+    const { queue, fake } = setup();
+    const p = queue.submitDeviceSettings({ ledBrightness: 55 });
+    await vi.advanceTimersByTimeAsync(500);
+    await p;
+    expect(fake.postDeviceStatusCalls).toEqual([{ settings: { ledBrightness: 55 } }]);
+    queue.stop();
+  });
+});
+
+describe('write queue: a priming trigger and a device-settings write merge on the same lane (2.2)', () => {
+  it('both fields submitted within the debounce window dispatch as one request carrying both', async () => {
+    const { queue, fake } = setup();
+    const p1 = queue.submitDeviceSettings({ isPriming: true });
+    await vi.advanceTimersByTimeAsync(100);
+    const p2 = queue.submitDeviceSettings({ ledBrightness: 70 });
+    await vi.advanceTimersByTimeAsync(500);
+    await Promise.all([p1, p2]);
+    expect(fake.postDeviceStatusCalls).toEqual([{ isPriming: true, settings: { ledBrightness: 70 } }]);
+    queue.stop();
+  });
+});
+
+describe('write queue: the device-lane debounce is independently configurable (2.3)', () => {
+  it('a device-lane write submitted twice 450ms apart (below the 500ms device default, above the 400ms shared default) is still merged into one dispatch', async () => {
+    const { queue, fake } = setup();
+    const p1 = queue.submitDeviceSettings({ ledBrightness: 10 });
+    await vi.advanceTimersByTimeAsync(450);
+    const p2 = queue.submitDeviceSettings({ ledBrightness: 20 });
+    await vi.advanceTimersByTimeAsync(500);
+    await Promise.all([p1, p2]);
+    expect(fake.postDeviceStatusCalls).toEqual([{ settings: { ledBrightness: 20 } }]);
+    queue.stop();
+  });
+
+  it('an equivalent side-lane write at the same 450ms spacing already flushes under the shared 400ms default — the two lanes demonstrably use different debounce windows', async () => {
+    const { queue, fake } = setup();
+    const p1 = queue.submitSide('left', { targetTemperatureF: 65 });
+    await vi.advanceTimersByTimeAsync(450); // already past the shared 400ms default
+    await p1;
+    expect(fake.postDeviceStatusCalls).toEqual([{ left: { targetTemperatureF: 65 } }]);
+    const p2 = queue.submitSide('left', { targetTemperatureF: 70 });
+    await vi.advanceTimersByTimeAsync(400);
+    await p2;
+    expect(fake.postDeviceStatusCalls).toEqual([
+      { left: { targetTemperatureF: 65 } },
+      { left: { targetTemperatureF: 70 } },
+    ]);
+    queue.stop();
+  });
+
+  it('a configured deviceWriteDebounceMs above 500 is honored', async () => {
+    const { queue, fake } = setup({ deviceWriteDebounceMs: 800 });
+    const p = queue.submitDeviceSettings({ ledBrightness: 30 });
+    await vi.advanceTimersByTimeAsync(700);
+    expect(fake.postDeviceStatusCalls).toHaveLength(0);
+    await vi.advanceTimersByTimeAsync(100);
+    await p;
+    expect(fake.postDeviceStatusCalls).toEqual([{ settings: { ledBrightness: 30 } }]);
+    queue.stop();
+  });
+
+  it('a configured deviceWriteDebounceMs below the 500ms floor is clamped to the floor', async () => {
+    const { queue, fake } = setup({ deviceWriteDebounceMs: 100 });
+    const p = queue.submitDeviceSettings({ ledBrightness: 30 });
+    await vi.advanceTimersByTimeAsync(499);
+    expect(fake.postDeviceStatusCalls).toHaveLength(0);
+    await vi.advanceTimersByTimeAsync(1);
+    await p;
+    expect(fake.postDeviceStatusCalls).toEqual([{ settings: { ledBrightness: 30 } }]);
     queue.stop();
   });
 });
@@ -485,7 +575,7 @@ describe('write queue: fast poll is lane-aware (S2 regression)', () => {
   it('a device-lane write requests the deviceStatus lane', async () => {
     const { queue, fastPollRequests } = setup();
     const p = queue.submitDeviceSettings({ ledBrightness: 40 });
-    await vi.advanceTimersByTimeAsync(400);
+    await vi.advanceTimersByTimeAsync(500);
     await p;
     expect(fastPollRequests).toHaveLength(1);
     expect(fastPollRequests[0]!.lane).toBe('deviceStatus');

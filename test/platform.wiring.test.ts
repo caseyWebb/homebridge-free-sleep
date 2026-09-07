@@ -18,6 +18,7 @@ import type { Change } from '../src/pod/snapshot.js';
 import {
   DeviceStatusSchema,
   SchedulesSchema,
+  ServerStatusSchema,
   ServicesSchema,
   SettingsSchema,
   type DeviceStatus,
@@ -25,6 +26,11 @@ import {
 } from '../src/pod/types.js';
 import { THERMOSTAT_SUBTYPE, type ThermostatService } from '../src/services/thermostat.js';
 import { CONNECTION_SUBTYPE } from '../src/services/connection.js';
+import { WATER_LOW_SUBTYPE } from '../src/services/waterLow.js';
+import { PRIME_SUBTYPE } from '../src/services/prime.js';
+import { LED_SUBTYPE } from '../src/services/led.js';
+import { TEST_ALARM_SUBTYPE } from '../src/services/testAlarm.js';
+import { SERVER_FAULT_SUBTYPE } from '../src/services/serverFault.js';
 import { fToC } from '../src/pod/temperature.js';
 import {
   createFakeLogging,
@@ -40,6 +46,7 @@ const fixtureDeviceStatus = DeviceStatusSchema.parse(loadFixture('deviceStatus.j
 const fixtureSettings = SettingsSchema.parse(loadFixture('settings.json'));
 const fixtureSchedules = SchedulesSchema.parse(loadFixture('schedules.json'));
 const fixtureServices = ServicesSchema.parse(loadFixture('services.json'));
+const fixtureServerStatus = ServerStatusSchema.parse(loadFixture('serverStatus.json'));
 
 /** A resolved-by-default fake client for tests that need real bootstrap data without a real
  * mock Pod (avoids `PodClient`'s own un-cancelable `AbortSignal.timeout()` per-request timer,
@@ -51,8 +58,10 @@ function resolvedFakeClient(overrides: Partial<MinimalPodClient> = {}): MinimalP
     getSettings: () => Promise.resolve(fixtureSettings),
     getSchedules: () => Promise.resolve(fixtureSchedules),
     getServices: () => Promise.resolve(fixtureServices),
+    getServerStatus: () => Promise.resolve(structuredClone(fixtureServerStatus)),
     postDeviceStatus: () => Promise.resolve(),
     postSettings: () => Promise.resolve(),
+    postAlarm: () => Promise.resolve(),
     ...overrides,
   };
 }
@@ -75,6 +84,10 @@ function factory(podClient?: MinimalPodClient, timers?: TimerHarness): PlatformF
 interface PlatformInternals {
   thermostats: Map<Side, ThermostatService>;
   connectionService: { refresh: () => void } | undefined;
+  waterLowService: { refresh: () => void } | undefined;
+  primeService: { refresh: () => void; stop: () => void } | undefined;
+  testAlarmService: { stop: () => void } | undefined;
+  serverFaultService: { refresh: () => void } | undefined;
   handleSnapshotChanges: (changes: readonly Change[]) => void;
 }
 
@@ -113,8 +126,10 @@ describe('construction ordering: setProps before registration (tasks.md 2.3)', (
       getSettings: () => Promise.reject(new Error('unreachable')),
       getSchedules: () => Promise.reject(new Error('unreachable')),
       getServices: () => Promise.reject(new Error('unreachable')),
+      getServerStatus: () => Promise.reject(new Error('unreachable')),
       postDeviceStatus: () => Promise.reject(new Error('unreachable')),
       postSettings: () => Promise.reject(new Error('unreachable')),
+      postAlarm: () => Promise.reject(new Error('unreachable')),
     });
     await api.fireDidFinishLaunching();
 
@@ -141,8 +156,10 @@ describe('enabled-subtype services survive restore (tasks.md 1.2)', () => {
         getSettings: () => Promise.reject(new Error('unreachable')),
         getSchedules: () => Promise.reject(new Error('unreachable')),
         getServices: () => Promise.reject(new Error('unreachable')),
+        getServerStatus: () => Promise.reject(new Error('unreachable')),
         postDeviceStatus: () => Promise.reject(new Error('unreachable')),
         postSettings: () => Promise.reject(new Error('unreachable')),
+        postAlarm: () => Promise.reject(new Error('unreachable')),
       }),
       baseConfig(),
       [],
@@ -156,8 +173,10 @@ describe('enabled-subtype services survive restore (tasks.md 1.2)', () => {
         getSettings: () => Promise.reject(new Error('unreachable')),
         getSchedules: () => Promise.reject(new Error('unreachable')),
         getServices: () => Promise.reject(new Error('unreachable')),
+        getServerStatus: () => Promise.reject(new Error('unreachable')),
         postDeviceStatus: () => Promise.reject(new Error('unreachable')),
         postSettings: () => Promise.reject(new Error('unreachable')),
+        postAlarm: () => Promise.reject(new Error('unreachable')),
       }),
       baseConfig(),
       previous,
@@ -282,8 +301,10 @@ describe('handlers are wired after bootstrap settles (tasks.md 7.2)', () => {
         getSettings: () => Promise.reject(new Error('unreachable')),
         getSchedules: () => Promise.reject(new Error('unreachable')),
         getServices: () => Promise.reject(new Error('unreachable')),
+        getServerStatus: () => Promise.reject(new Error('unreachable')),
         postDeviceStatus: () => Promise.reject(new Error('unreachable')),
         postSettings: () => Promise.reject(new Error('unreachable')),
+        postAlarm: () => Promise.reject(new Error('unreachable')),
       };
       const { api, platform } = await simulateRestart(factory(client, timers), baseConfig(), []);
 
@@ -327,8 +348,10 @@ describe('snapshot changes are routed to the services that publish them (tasks.m
       getSettings: () => Promise.reject(new Error('unreachable')),
       getSchedules: () => Promise.reject(new Error('unreachable')),
       getServices: () => Promise.reject(new Error('unreachable')),
+      getServerStatus: () => Promise.reject(new Error('unreachable')),
       postDeviceStatus: () => Promise.reject(new Error('unreachable')),
       postSettings: () => Promise.reject(new Error('unreachable')),
+      postAlarm: () => Promise.reject(new Error('unreachable')),
     };
     const { platform } = await simulateRestart(factory(client), baseConfig(), []);
     const left = internals(platform).thermostats.get('left')!;
@@ -350,8 +373,10 @@ describe('snapshot changes are routed to the services that publish them (tasks.m
       getSettings: () => Promise.reject(new Error('unreachable')),
       getSchedules: () => Promise.reject(new Error('unreachable')),
       getServices: () => Promise.reject(new Error('unreachable')),
+      getServerStatus: () => Promise.reject(new Error('unreachable')),
       postDeviceStatus: () => Promise.reject(new Error('unreachable')),
       postSettings: () => Promise.reject(new Error('unreachable')),
+      postAlarm: () => Promise.reject(new Error('unreachable')),
     };
     const { platform } = await simulateRestart(factory(client), baseConfig(), []);
     const left = internals(platform).thermostats.get('left')!;
@@ -374,8 +399,10 @@ describe('snapshot changes are routed to the services that publish them (tasks.m
       getSettings: () => Promise.reject(new Error('unreachable')),
       getSchedules: () => Promise.reject(new Error('unreachable')),
       getServices: () => Promise.reject(new Error('unreachable')),
+      getServerStatus: () => Promise.reject(new Error('unreachable')),
       postDeviceStatus: () => Promise.reject(new Error('unreachable')),
       postSettings: () => Promise.reject(new Error('unreachable')),
+      postAlarm: () => Promise.reject(new Error('unreachable')),
     };
     const { platform } = await simulateRestart(factory(client), baseConfig(), []);
     const left = internals(platform).thermostats.get('left')!;
@@ -400,8 +427,10 @@ describe('snapshot changes are routed to the services that publish them (tasks.m
       getSettings: () => Promise.reject(new Error('unreachable')),
       getSchedules: () => Promise.reject(new Error('unreachable')),
       getServices: () => Promise.reject(new Error('unreachable')),
+      getServerStatus: () => Promise.reject(new Error('unreachable')),
       postDeviceStatus: () => Promise.reject(new Error('unreachable')),
       postSettings: () => Promise.reject(new Error('unreachable')),
+      postAlarm: () => Promise.reject(new Error('unreachable')),
     };
     const log = createFakeLogging();
     const api = new FakeHomebridgeApi();
@@ -648,6 +677,190 @@ describe('keep-alive wiring (tasks.md 3.1, 3.2)', () => {
       // The keep-alive check timer contributes to this pending count exactly like the poller's
       // and write queue's own timers do — no dedicated assertion of "which" timer it is, mirroring
       // the plain 7.4 shutdown test's own convention above.
+      expect(timers.pendingCount()).toBeGreaterThan(perAccessoryOverhead);
+
+      await api.fireShutdown();
+      expect(timers.pendingCount()).toBe(perAccessoryOverhead);
+      void platform;
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------------------
+// hub-accessory: the hub's enabled service set grows and shrinks with config (tasks.md 9.1, 9.3)
+// ---------------------------------------------------------------------------------------
+
+const HUB_BOOLEAN_KEYS = ['primeSwitch', 'ledLightbulb', 'testAlarmSwitch', 'serverFaultSensor'] as const;
+
+function hubServiceKeys(services: Array<{ UUID: string; subtype?: string }>): Set<string> {
+  return new Set(services.map((sv) => `${sv.UUID}:${sv.subtype ?? ''}`));
+}
+
+describe('the hub\'s enabled service set grows and shrinks with its own configuration (tasks.md 9.1)', () => {
+  it('across all 16 combinations of the four boolean keys, exactly the expected subtype set is present', async () => {
+    for (let mask = 0; mask < 16; mask++) {
+      const overrides: Record<string, boolean> = {};
+      HUB_BOOLEAN_KEYS.forEach((key, i) => {
+        overrides[key] = (mask & (1 << i)) !== 0;
+      });
+
+      const { api } = await simulateRestart(factory(resolvedFakeClient()), baseConfig(overrides), []);
+      const hub = api.registeredAccessories.find((a) => a.displayName === 'Pod')!;
+      const hap = api.hap;
+
+      const nonInfo = hub.services.filter((sv) => sv.UUID !== hap.Service.AccessoryInformation.UUID);
+      const keys = hubServiceKeys(nonInfo);
+
+      const expected = new Set<string>([
+        `${hap.Service.ContactSensor.UUID}:${CONNECTION_SUBTYPE}`,
+        `${hap.Service.ContactSensor.UUID}:${WATER_LOW_SUBTYPE}`,
+      ]);
+      if (overrides.primeSwitch) expected.add(`${hap.Service.Switch.UUID}:${PRIME_SUBTYPE}`);
+      if (overrides.ledLightbulb) expected.add(`${hap.Service.Lightbulb.UUID}:${LED_SUBTYPE}`);
+      if (overrides.testAlarmSwitch) expected.add(`${hap.Service.Switch.UUID}:${TEST_ALARM_SUBTYPE}`);
+      if (overrides.serverFaultSensor) expected.add(`${hap.Service.ContactSensor.UUID}:${SERVER_FAULT_SUBTYPE}`);
+
+      expect(keys).toEqual(expected);
+    }
+  });
+});
+
+describe('constructServicesFor grows to construct all four conditional hub services (tasks.md 9.3)', () => {
+  it('all four enabled: all five hub services (plus connection) exist on the hub accessory', async () => {
+    const { platform } = await simulateRestart(
+      factory(resolvedFakeClient()),
+      baseConfig({ primeSwitch: true, ledLightbulb: true, testAlarmSwitch: true, serverFaultSensor: true }),
+      [],
+    );
+    const i = internals(platform);
+    expect(i.connectionService).toBeDefined();
+    expect(i.waterLowService).toBeDefined();
+    expect(i.primeService).toBeDefined();
+    expect(i.testAlarmService).toBeDefined();
+    expect(i.serverFaultService).toBeDefined();
+  });
+
+  it('all four disabled: only connection and water-low exist', async () => {
+    const { platform } = await simulateRestart(
+      factory(resolvedFakeClient()),
+      baseConfig({ primeSwitch: false, ledLightbulb: false, testAlarmSwitch: false, serverFaultSensor: false }),
+      [],
+    );
+    const i = internals(platform);
+    expect(i.connectionService).toBeDefined();
+    expect(i.waterLowService).toBeDefined();
+    expect(i.primeService).toBeUndefined();
+    expect(i.testAlarmService).toBeUndefined();
+    expect(i.serverFaultService).toBeUndefined();
+  });
+});
+
+// ---------------------------------------------------------------------------------------
+// hub-accessory: snapshot-change routing for the three new device-level fields (tasks.md 9.4)
+// ---------------------------------------------------------------------------------------
+
+describe('the three new hub-accessory snapshot fields route only to their own service (tasks.md 9.4)', () => {
+  it('isPriming routes only to PrimeService.refresh()', async () => {
+    const { platform } = await simulateRestart(
+      factory(resolvedFakeClient()),
+      baseConfig({ primeSwitch: true, ledLightbulb: true, testAlarmSwitch: true, serverFaultSensor: true }),
+      [],
+    );
+    const i = internals(platform);
+    const primeSpy = vi.spyOn(i.primeService!, 'refresh');
+    const waterLowSpy = vi.spyOn(i.waterLowService!, 'refresh');
+    const serverFaultSpy = vi.spyOn(i.serverFaultService!, 'refresh');
+    const connectionSpy = vi.spyOn(i.connectionService!, 'refresh');
+
+    i.handleSnapshotChanges([{ scope: 'device', field: 'isPriming', previous: false, current: true }]);
+
+    expect(primeSpy).toHaveBeenCalledTimes(1);
+    expect(waterLowSpy).not.toHaveBeenCalled();
+    expect(serverFaultSpy).not.toHaveBeenCalled();
+    expect(connectionSpy).not.toHaveBeenCalled();
+  });
+
+  it('waterLevelState routes only to WaterLowService.refresh()', async () => {
+    const { platform } = await simulateRestart(
+      factory(resolvedFakeClient()),
+      baseConfig({ primeSwitch: true, ledLightbulb: true, testAlarmSwitch: true, serverFaultSensor: true }),
+      [],
+    );
+    const i = internals(platform);
+    const primeSpy = vi.spyOn(i.primeService!, 'refresh');
+    const waterLowSpy = vi.spyOn(i.waterLowService!, 'refresh');
+    const serverFaultSpy = vi.spyOn(i.serverFaultService!, 'refresh');
+
+    i.handleSnapshotChanges([{ scope: 'device', field: 'waterLevelState', previous: 'ok', current: 'low' }]);
+
+    expect(waterLowSpy).toHaveBeenCalledTimes(1);
+    expect(primeSpy).not.toHaveBeenCalled();
+    expect(serverFaultSpy).not.toHaveBeenCalled();
+  });
+
+  it('serverFault routes only to ServerFaultService.refresh()', async () => {
+    const { platform } = await simulateRestart(
+      factory(resolvedFakeClient()),
+      baseConfig({ primeSwitch: true, ledLightbulb: true, testAlarmSwitch: true, serverFaultSensor: true }),
+      [],
+    );
+    const i = internals(platform);
+    const primeSpy = vi.spyOn(i.primeService!, 'refresh');
+    const waterLowSpy = vi.spyOn(i.waterLowService!, 'refresh');
+    const serverFaultSpy = vi.spyOn(i.serverFaultService!, 'refresh');
+
+    i.handleSnapshotChanges([{ scope: 'device', field: 'serverFault', previous: false, current: true }]);
+
+    expect(serverFaultSpy).toHaveBeenCalledTimes(1);
+    expect(primeSpy).not.toHaveBeenCalled();
+    expect(waterLowSpy).not.toHaveBeenCalled();
+  });
+});
+
+// ---------------------------------------------------------------------------------------
+// hub-accessory: shutdown stops PrimeService and TestAlarmService (tasks.md 9.5)
+// ---------------------------------------------------------------------------------------
+
+describe('shutdown stops PrimeService and TestAlarmService alongside the existing stops (tasks.md 9.5)', () => {
+  it('no pending timer remains after shutdown with a refused prime-off write and an in-flight test-alarm trigger both outstanding', async () => {
+    vi.useFakeTimers();
+    try {
+      const timers = createTimerHarness();
+      const api = new FakeHomebridgeApi();
+      const log = createFakeLogging();
+      const onDeviceStatus = structuredClone(fixtureDeviceStatus);
+      onDeviceStatus.isPriming = true;
+      const client = resolvedFakeClient({ getDeviceStatus: () => Promise.resolve(structuredClone(onDeviceStatus)) });
+
+      const platform = new FreeSleepPlatform(
+        log,
+        baseConfig({ primeSwitch: true, testAlarmSwitch: true }),
+        api.asApi(),
+        client,
+        timers,
+      );
+      await api.fireDidFinishLaunching();
+      const perAccessoryOverhead = api.registeredAccessories.length;
+
+      const hub = api.registeredAccessories.find((a) => a.displayName === 'Pod')!;
+      const hap = api.hap;
+      const primeSwitch = hub.getServiceById(hap.Service.Switch, PRIME_SUBTYPE)!;
+      const testAlarmSwitch = hub.getServiceById(hap.Service.Switch, TEST_ALARM_SUBTYPE)!;
+
+      // Refused prime-off write — schedules PrimeService's revert timer.
+      const primeOn = primeSwitch.getCharacteristic(hap.Characteristic.On);
+      const primeOff = primeOn.handleSetRequest(false);
+      primeOff.catch(() => undefined);
+      await vi.advanceTimersByTimeAsync(0);
+
+      // An in-flight test-alarm trigger — schedules TestAlarmService's self-reset timer.
+      const testAlarmOn = testAlarmSwitch.getCharacteristic(hap.Characteristic.On);
+      const alarmPending = testAlarmOn.handleSetRequest(true);
+      alarmPending.catch(() => undefined);
+      await vi.advanceTimersByTimeAsync(0);
+
       expect(timers.pendingCount()).toBeGreaterThan(perAccessoryOverhead);
 
       await api.fireShutdown();

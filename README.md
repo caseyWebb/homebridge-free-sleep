@@ -17,14 +17,18 @@ recommended free-sleep setup. This plugin talks only to your Pod, on your LAN.
 ## Status: v0.1.0 (MVP)
 
 This is a first, minimal release: **each side of the bed as a HomeKit thermostat** (Off/Auto,
-55–110°F) driven from a live cache of the Pod's status, plus a **"Pod Connection" contact
-sensor** on the hub accessory that reports reachability and handles the Pod's daily reboot
+55–110°F) driven from a live cache of the Pod's status. The hub accessory carries a **"Pod
+Connection" contact sensor** that reports reachability and handles the Pod's daily reboot
 gracefully (last-known values served through the outage; the sensor flags it; nothing throws
-"No Response" for a routine restart). Implemented and tested against **free-sleep v2.1.5**.
+"No Response" for a routine restart), a **"Pod Water Low" sensor** (always published; see
+`waterLowSensorType` below), and four opt-in services — **"Pod Prime"** (a switch), **"Pod
+LED"** (a lightbulb), **"Pod Test Alarm"** (a momentary switch), and **"Pod Server Fault"** (a
+sensor) — each disabled by default and gated by its own config key (see Config keys below).
+Implemented and tested against **free-sleep v2.1.5**.
 
-Not yet included: alarms, away mode, occupancy, and the rest of the hub accessory (water low,
-prime, LED, test alarm). See [docs/ROADMAP.md](docs/ROADMAP.md) for what's planned (milestone
-M4) and why some things are deliberately non-goals.
+Not yet included: scheduled-alarm handling (a "Dismiss Alarm" switch and alarm-ringing
+notification) and occupancy. See [docs/ROADMAP.md](docs/ROADMAP.md) for what's planned
+(milestone M4) and why some things are deliberately non-goals.
 
 ### Honesty caveat — read this before installing
 
@@ -93,11 +97,16 @@ Minimal config — everything but `host` is optional:
 |---|---|---|---|
 | `host` | string | *(required)* | Pod's LAN hostname or IP. Normalized to lowercase. |
 | `sides` | `'both'` \| `'left'` \| `'right'` | `'both'` | Which side accessories to publish. |
-| `pollIntervals.*` | object | see `config.schema.json` | Advanced poll/write timing overrides (base/fast/slow poll intervals, backoff ceiling, write debounce). Most installs should leave these alone. |
+| `pollIntervals.*` | object | see `config.schema.json` | Advanced poll/write timing overrides (base/fast/slow poll intervals, backoff ceiling, write debounce, plus `deviceWriteDebounceMs` below). Most installs should leave these alone. |
+| `pollIntervals.deviceWriteDebounceMs` | number (ms) | `500` | Write debounce for the device-wide lane specifically (currently only the LED lightbulb writes on it), independent of the side lanes' own write debounce. Minimum `500`. |
 | `writeSettleMs` | number (ms) | `15000` | How long a write's optimistic value is protected from being overwritten by an in-flight poll. |
 | `noResponseAfterMs` | number (ms) | `600000` | How long the Pod must be unreachable before thermostat reads start throwing instead of serving last-known values. `0` disables escalation. |
 | `occupancySource` | `'none'` \| `'presence'` \| `'vitals'` | `'none'` | **Reserved — no effect yet.** Planned for M4 (#19). |
-| `waterLowSensorType` | `'contact'` \| `'leak'` | `'contact'` | **Reserved — no effect yet.** Planned for M4 (#20). |
+| `waterLowSensorType` | `'contact'` \| `'leak'` | `'contact'` | Chooses which HomeKit service type represents the hub's water-low sensor — a `ContactSensor` (default) or a `LeakSensor`. The sensor itself is always published, regardless of this setting or any other config key. |
+| `primeSwitch` | boolean | `false` | Publishes a "Pod Prime" switch on the hub. Turning it on starts a prime cycle; the Pod has no stop command, so turning it off is refused (surfaces as "not allowed" in the Home app) rather than sent. |
+| `ledLightbulb` | boolean | `false` | Publishes a "Pod LED" lightbulb (on/off + brightness) on the hub. Every write re-posts the Pod's full device-settings object, debounced by `pollIntervals.deviceWriteDebounceMs` (default 500ms). **Trade-off:** unlike the thermostat's target temperature, an LED write has no optimistic feedback — after debouncing, the slider can take up to roughly the fast-poll interval (default ~5s) to visibly settle at the written value in the Home app. This reads as "a little slow," not stuck or reverted: nothing pushes a disagreeing value in the interim. |
+| `testAlarmSwitch` | boolean | `false` | Publishes a momentary "Pod Test Alarm" switch on the hub. Turning it on triggers the Pod's alarm vibration on both sides immediately, overriding away mode and power state; the tile self-resets to off after about a second regardless of outcome, while the physical vibration itself lasts at least 10 real seconds. |
+| `serverFaultSensor` | boolean | `false` | Publishes a "Pod Server Fault" sensor on the hub, reflecting the Pod's own self-reported subsystem health (`GET /api/serverStatus`). Polled on the slow cadence, and only while this is enabled — the endpoint is not free (a real SQLite round-trip on every call upstream). |
 | `keepAlive` | boolean | `true` | While a side is on, periodically re-posts its remaining time so the Pod's 12-hour `isOn` duration never silently expires. `false` disables the component entirely — no timer, no writes. |
 | `keepAliveMs` | number (ms) | `43200000` (12h) | The duration re-posted as a side's remaining time when it is re-armed, matching the Pod's own 12-hour duration. |
 | `keepAliveThresholdMs` | number (ms) | `1800000` (30min) | A side is re-armed once its remaining time drops below this. Must be strictly less than `keepAliveMs`; the config UI cannot enforce that, so an invalid combination fails loudly at Homebridge startup instead. Minimum `120000` (2min) — below that, the plugin's own internally-derived check cadence can no longer guarantee it catches every side before it expires. |

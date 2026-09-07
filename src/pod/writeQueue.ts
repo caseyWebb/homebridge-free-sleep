@@ -79,7 +79,22 @@ export type SidePatch = Partial<{
  */
 export type WriteOrigin = 'user' | 'keepAlive';
 
-export type DevicePatch = Partial<{ v: number; gainLeft: number; gainRight: number; ledBrightness: number }>;
+/**
+ * The device-wide lane's patch shape. `isPriming` (hub-accessory) sits alongside the four
+ * device-settings fields (poller-and-write-queue) on the same lane — `dispatch()`'s `'device'`
+ * branch splits them back apart into a bare top-level `isPriming` and a nested `settings` object
+ * at dispatch time, since that's the shape `POST /api/deviceStatus` actually expects (design.md's
+ * "Requires a `src/pod/writeQueue.ts` change").
+ */
+export type DevicePatch = Partial<{
+  v: number;
+  gainLeft: number;
+  gainRight: number;
+  ledBrightness: number;
+  isPriming: boolean;
+}>;
+
+const DEVICE_SETTINGS_KEYS = ['v', 'gainLeft', 'gainRight', 'ledBrightness'] as const;
 
 type LaneId = 'left' | 'right' | 'device' | 'settings';
 
@@ -106,8 +121,17 @@ export interface WriteQueueOptions {
   awayModeGuard?: AwayModeGuard;
   timers?: TimerApi;
   logger?: Logger;
-  /** Trailing-edge debounce per lane. Default 400, enforced minimum 100. */
+  /** Trailing-edge debounce per lane. Default 400, enforced minimum 100. Applies to every lane
+   * except `device`, which uses `deviceWriteDebounceMs` instead (hub-accessory design.md,
+   * Decision 4). */
   writeDebounceMs?: number;
+  /**
+   * Trailing-edge debounce for the `device` lane specifically. Default 500, enforced minimum
+   * 500 — issue #10's own note that a brightness drag (#20) needs a harder debounce than the
+   * shared default, without slowing down a side write's own responsiveness (hub-accessory
+   * design.md, Decision 4).
+   */
+  deviceWriteDebounceMs?: number;
   /** Hard cap on how long a continuing batch can be postponed. Default 2000. */
   writeMaxDebounceMs?: number;
   /** Optimistic-overlay window, re-based at dispatch settle. Default 15000. */
@@ -210,6 +234,7 @@ export class WriteQueue {
   private readonly logger: Logger;
 
   private readonly writeDebounceMs: number;
+  private readonly deviceWriteDebounceMs: number;
   private readonly writeMaxDebounceMs: number;
   private readonly writeSettleMs: number;
   private readonly fastPollDurationMs: number;
@@ -240,6 +265,7 @@ export class WriteQueue {
     this.logger = options.logger ?? defaultLogger;
 
     this.writeDebounceMs = Math.max(100, options.writeDebounceMs ?? 400);
+    this.deviceWriteDebounceMs = Math.max(500, options.deviceWriteDebounceMs ?? 500);
     this.writeMaxDebounceMs = options.writeMaxDebounceMs ?? 2000;
     this.writeSettleMs = options.writeSettleMs ?? 15_000;
     this.fastPollDurationMs = options.fastPollDurationMs ?? 90_000;
@@ -309,7 +335,8 @@ export class WriteQueue {
       }
       rt.waiters.push({ resolve, reject });
       if (rt.debounceTimer !== null) this.timers.clearTimeout(rt.debounceTimer);
-      rt.debounceTimer = this.timers.setTimeout(() => this.flush(lane, rt), this.writeDebounceMs);
+      const debounceMs = lane === 'device' ? this.deviceWriteDebounceMs : this.writeDebounceMs;
+      rt.debounceTimer = this.timers.setTimeout(() => this.flush(lane, rt), debounceMs);
       syncOverlays();
     });
   }
@@ -451,7 +478,21 @@ export class WriteQueue {
         return;
       }
     } else if (lane === 'device') {
-      body = { settings: patch };
+      // hub-accessory's widening: the device-wide lane now carries a bare `isPriming` field
+      // alongside the four device-settings fields (design.md's "Requires a
+      // `src/pod/writeQueue.ts` change") — split back apart here into the shape
+      // `POST /api/deviceStatus` actually expects, rather than nesting `isPriming` under
+      // `settings` (which the Pod would silently ignore, `settings` being CBOR-encoded
+      // key-for-key).
+      const devicePatch = patch as DevicePatch;
+      const settingsFields: DevicePatch = {};
+      for (const key of DEVICE_SETTINGS_KEYS) {
+        if (devicePatch[key] !== undefined) settingsFields[key] = devicePatch[key];
+      }
+      body = {
+        ...(devicePatch.isPriming !== undefined ? { isPriming: devicePatch.isPriming } : {}),
+        ...(Object.keys(settingsFields).length > 0 ? { settings: settingsFields } : {}),
+      };
     } else {
       body = patch;
     }

@@ -1,9 +1,11 @@
 import { describe, expect, it } from 'vitest';
 
 import {
+  AlarmRequestSchema,
   DeviceStatusPatchSchema,
   DeviceStatusSchema,
   SchedulesSchema,
+  ServerStatusSchema,
   SettingsPatchSchema,
   SettingsSchema,
   interpretWaterLevel,
@@ -162,6 +164,110 @@ describe('settings request schema is strict (B1)', () => {
   it("rejects a temperatureFormat of 'kelvin'", () => {
     const result = SettingsPatchSchema.safeParse({ temperatureFormat: 'kelvin' });
     expect(result.success).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------------------
+// hub-accessory: ServerStatusSchema (tasks.md 1.1)
+// ---------------------------------------------------------------------------------------
+
+describe('ServerStatusSchema', () => {
+  it('parses the serverStatus fixture successfully', () => {
+    const result = ServerStatusSchema.safeParse(loadFixture('serverStatus.json'));
+    expect(result.success).toBe(true);
+  });
+
+  it('rejects a document with a wrong-typed status value', () => {
+    const serverStatus = loadFixture('serverStatus.json') as { database: { status: unknown } };
+    const broken = { ...serverStatus, database: { ...serverStatus.database, status: 42 } };
+    const result = ServerStatusSchema.safeParse(broken);
+    expect(result.success).toBe(false);
+  });
+
+  it('parses fine when every biometrics-gated key is absent', () => {
+    const result = ServerStatusSchema.safeParse(loadFixture('serverStatus.json'));
+    expect(result.success).toBe(true);
+    if (result.success) {
+      expect(result.data.analyzeSleepLeft).toBeUndefined();
+    }
+  });
+
+  it('still parses when a biometrics-gated key is present', () => {
+    const serverStatus = loadFixture('serverStatus.json') as Record<string, unknown>;
+    const withBiometrics = {
+      ...serverStatus,
+      analyzeSleepLeft: { name: 'analyzeSleepLeft', status: 'healthy', description: 'x', message: 'OK' },
+    };
+    const result = ServerStatusSchema.safeParse(withBiometrics);
+    expect(result.success).toBe(true);
+    if (result.success) {
+      expect(result.data.analyzeSleepLeft?.status).toBe('healthy');
+    }
+  });
+
+  it('rejects a document missing a required always-present subsystem', () => {
+    const serverStatus = { ...(loadFixture('serverStatus.json') as Record<string, unknown>) };
+    delete serverStatus.database;
+    const result = ServerStatusSchema.safeParse(serverStatus);
+    expect(result.success).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------------------
+// hub-accessory: AlarmRequestSchema (tasks.md 1.2)
+// ---------------------------------------------------------------------------------------
+
+describe('AlarmRequestSchema', () => {
+  const validRequest = {
+    side: 'left',
+    vibrationIntensity: 60,
+    vibrationPattern: 'double',
+    duration: 10,
+    force: true,
+  };
+
+  it('accepts a valid request', () => {
+    const result = AlarmRequestSchema.safeParse(validRequest);
+    expect(result.success).toBe(true);
+  });
+
+  it.each([0, 101])('rejects an out-of-bounds vibrationIntensity (%d)', (vibrationIntensity) => {
+    const result = AlarmRequestSchema.safeParse({ ...validRequest, vibrationIntensity });
+    expect(result.success).toBe(false);
+  });
+
+  it.each([1, 100])('accepts a boundary vibrationIntensity (%d)', (vibrationIntensity) => {
+    const result = AlarmRequestSchema.safeParse({ ...validRequest, vibrationIntensity });
+    expect(result.success).toBe(true);
+  });
+
+  it("rejects a vibrationPattern this client doesn't recognize", () => {
+    const result = AlarmRequestSchema.safeParse({ ...validRequest, vibrationPattern: 'pulse' });
+    expect(result.success).toBe(false);
+  });
+
+  it('rejects an out-of-bounds duration', () => {
+    const result = AlarmRequestSchema.safeParse({ ...validRequest, duration: 181 });
+    expect(result.success).toBe(false);
+  });
+
+  it('rejects an unknown key', () => {
+    const result = AlarmRequestSchema.safeParse({ ...validRequest, extra: true });
+    expect(result.success).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------------------
+// hub-accessory: DeviceStatusPatchSchema's isPriming field, standalone (tasks.md 1.3)
+// ---------------------------------------------------------------------------------------
+
+describe("DeviceStatusPatchSchema's isPriming field, standalone (hub-accessory, tasks.md 1.3)", () => {
+  it('parses a patch carrying only isPriming', () => {
+    const result = DeviceStatusPatchSchema.safeParse({ isPriming: true });
+    expect(result.success).toBe(true);
+    if (result.success) {
+      expect(result.data).toEqual({ isPriming: true });
+    }
   });
 });
 

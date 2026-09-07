@@ -21,10 +21,12 @@ import { PLATFORM_NAME, PLUGIN_NAME } from '../src/settings.js';
 import {
   DeviceStatusSchema,
   SchedulesSchema,
+  ServerStatusSchema,
   ServicesSchema,
   SettingsSchema,
   type DeviceStatus,
   type Schedules,
+  type ServerStatus,
   type Services as PodServices,
   type Settings,
 } from '../src/pod/types.js';
@@ -46,6 +48,7 @@ const fixtureSettings: Settings = SettingsSchema.parse(loadFixture('settings.jso
 const fixtureDeviceStatus: DeviceStatus = DeviceStatusSchema.parse(loadFixture('deviceStatus.json'));
 const fixtureSchedules: Schedules = SchedulesSchema.parse(loadFixture('schedules.json'));
 const fixtureServices: PodServices = ServicesSchema.parse(loadFixture('services.json'));
+const fixtureServerStatus: ServerStatus = ServerStatusSchema.parse(loadFixture('serverStatus.json'));
 
 function baseConfig(overrides: Record<string, unknown> = {}): PlatformConfig {
   return { platform: PLATFORM_NAME, host: 'pod.local', ...overrides };
@@ -63,8 +66,10 @@ function neverResolvingPodClient(): MinimalPodClient {
     getSettings: () => new Promise<Settings>(() => {}),
     getSchedules: () => new Promise<Schedules>(() => {}),
     getServices: () => new Promise<PodServices>(() => {}),
+    getServerStatus: () => new Promise<ServerStatus>(() => {}),
     postDeviceStatus: () => new Promise<void>(() => {}),
     postSettings: () => new Promise<void>(() => {}),
+    postAlarm: () => new Promise<void>(() => {}),
   };
 }
 
@@ -78,8 +83,10 @@ function resolvingPodClient(settings: Settings = fixtureSettings): MinimalPodCli
     },
     getSchedules: () => Promise.resolve(structuredClone(fixtureSchedules)),
     getServices: () => Promise.resolve(structuredClone(fixtureServices)),
+    getServerStatus: () => Promise.resolve(structuredClone(fixtureServerStatus)),
     postDeviceStatus: () => Promise.resolve(),
     postSettings: () => Promise.resolve(),
+    postAlarm: () => Promise.resolve(),
   };
   return client;
 }
@@ -93,8 +100,10 @@ function rejectingPodClient(message = 'Pod unreachable'): MinimalPodClient {
     getSettings: reject,
     getSchedules: reject,
     getServices: reject,
+    getServerStatus: reject,
     postDeviceStatus: reject,
     postSettings: reject,
+    postAlarm: reject,
   };
 }
 
@@ -221,7 +230,7 @@ describe('configureAccessory', () => {
 });
 
 describe('fresh install, sides: both', () => {
-  it('registers exactly three accessories, named Pod Left/Pod Right/Pod, each with AccessoryInformation plus its role-enabled service', async () => {
+  it('registers exactly three accessories, named Pod Left/Pod Right/Pod, each with AccessoryInformation plus its role-enabled service(s)', async () => {
     const { api } = await simulateRestart(factoryWithPodClient(rejectingPodClient()), baseConfig(), []);
 
     expect(api.registeredAccessories).toHaveLength(3);
@@ -233,8 +242,14 @@ describe('fresh install, sides: both', () => {
         (s) => s.UUID !== api.hap.Service.AccessoryInformation.UUID,
       );
       if (accessory.displayName === 'Pod') {
-        expect(nonInfoServices).toHaveLength(1);
-        expect(nonInfoServices[0]?.UUID).toBe(api.hap.Service.ContactSensor.UUID);
+        // hub-accessory: the hub always carries the connection sensor and the water-low sensor
+        // (default `waterLowSensorType: 'contact'`) — both `ContactSensor`, distinguished by
+        // subtype — with the other four hub services disabled by default.
+        expect(nonInfoServices).toHaveLength(2);
+        for (const service of nonInfoServices) {
+          expect(service.UUID).toBe(api.hap.Service.ContactSensor.UUID);
+        }
+        expect(new Set(nonInfoServices.map((s) => s.subtype))).toEqual(new Set(['connection', 'waterLow']));
       } else {
         expect(nonInfoServices).toHaveLength(1);
         expect(nonInfoServices[0]?.UUID).toBe(api.hap.Service.Thermostat.UUID);

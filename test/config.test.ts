@@ -485,6 +485,97 @@ describe('config.schema.json <-> FreeSleepConfigSchema parity', () => {
   });
 });
 
+// ---------------------------------------------------------------------------------------
+// hub-accessory: four new hub-service keys (tasks.md 7.1)
+// ---------------------------------------------------------------------------------------
+
+const HUB_SERVICE_KEYS = ['primeSwitch', 'ledLightbulb', 'testAlarmSwitch', 'serverFaultSensor'] as const;
+
+describe('FreeSleepConfigSchema — hub-service keys (hub-accessory)', () => {
+  it('all four default to false when omitted', () => {
+    const result = FreeSleepConfigSchema.safeParse({ host: 'pod.local' });
+    expect(result.success).toBe(true);
+    if (!result.success) return;
+    for (const key of HUB_SERVICE_KEYS) {
+      expect(result.data[key]).toBe(false);
+    }
+  });
+
+  it.each(HUB_SERVICE_KEYS)('%s can be independently enabled, leaving the other three at their default false', (key) => {
+    const result = FreeSleepConfigSchema.safeParse({ host: 'pod.local', [key]: true });
+    expect(result.success).toBe(true);
+    if (!result.success) return;
+    for (const otherKey of HUB_SERVICE_KEYS) {
+      expect(result.data[otherKey]).toBe(otherKey === key);
+    }
+  });
+
+  it.each(HUB_SERVICE_KEYS)('rejects a non-boolean %s, naming that key', (key) => {
+    const result = FreeSleepConfigSchema.safeParse({ host: 'pod.local', [key]: 'yes' });
+    expect(result.success).toBe(false);
+    if (!result.success) {
+      expect(result.error.issues.some((issue) => issue.path.join('.') === key)).toBe(true);
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------------------
+// hub-accessory: pollIntervals.deviceWriteDebounceMs (tasks.md 7.2)
+// ---------------------------------------------------------------------------------------
+
+describe('FreeSleepConfigSchema — pollIntervals.deviceWriteDebounceMs (hub-accessory)', () => {
+  it('defaults through (omitted) when pollIntervals omits it', () => {
+    const result = FreeSleepConfigSchema.safeParse({ host: 'pod.local' });
+    expect(result.success).toBe(true);
+    if (result.success) {
+      expect(result.data.pollIntervals.deviceWriteDebounceMs).toBeUndefined();
+    }
+  });
+
+  it('rejects a value below 500', () => {
+    const result = FreeSleepConfigSchema.safeParse({
+      host: 'pod.local',
+      pollIntervals: { deviceWriteDebounceMs: 499 },
+    });
+    expect(result.success).toBe(false);
+    if (!result.success) {
+      expect(
+        result.error.issues.some((issue) => issue.path.join('.') === 'pollIntervals.deviceWriteDebounceMs'),
+      ).toBe(true);
+    }
+  });
+
+  it('accepts exactly the 500ms floor and a value above it', () => {
+    for (const value of [500, 800]) {
+      const result = FreeSleepConfigSchema.safeParse({
+        host: 'pod.local',
+        pollIntervals: { deviceWriteDebounceMs: value },
+      });
+      expect(result.success).toBe(true);
+      if (result.success) {
+        expect(result.data.pollIntervals.deviceWriteDebounceMs).toBe(value);
+      }
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------------------
+// hub-accessory: waterLowSensorType is consumed (tasks.md 7.3) — shape unchanged, still exactly
+// a two-value enum; the existing "reserved keys" describe block above already covers its
+// defaulting/rejection cases unmodified.
+// ---------------------------------------------------------------------------------------
+
+describe('FreeSleepConfigSchema — waterLowSensorType is consumed, stays a two-value enum (hub-accessory)', () => {
+  it('accepts exactly "contact" and "leak", nothing else', () => {
+    for (const value of ['contact', 'leak']) {
+      const result = FreeSleepConfigSchema.safeParse({ host: 'pod.local', waterLowSensorType: value });
+      expect(result.success).toBe(true);
+    }
+    const rejected = FreeSleepConfigSchema.safeParse({ host: 'pod.local', waterLowSensorType: 'none' });
+    expect(rejected.success).toBe(false);
+  });
+});
+
 describe('unrecognizedConfigKeys', () => {
   it('ignores Homebridge-injected keys and schema-defined keys', () => {
     expect(

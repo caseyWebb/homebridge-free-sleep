@@ -33,9 +33,9 @@ import {
   type TimerApi,
   type TimerHandle,
 } from './snapshot.ts';
-import type { DeviceStatus, Schedules, Services, Settings } from './types.ts';
+import type { DeviceStatus, Schedules, ServerStatus, Services, Settings } from './types.ts';
 
-export type EndpointClassId = 'deviceStatus' | 'settings' | 'schedules' | 'services';
+export type EndpointClassId = 'deviceStatus' | 'settings' | 'schedules' | 'services' | 'serverStatus';
 
 /** The alarm window (#16) needs 3s; config must never be able to request that as a *base*. */
 const HARD_FLOOR_MS = 3000;
@@ -55,6 +55,15 @@ export interface PollerOptions {
   maxBackoffMs?: number;
   /** Bootstrap deadline. Default 10 000. */
   bootstrapTimeoutMs?: number;
+  /**
+   * Whether the `serverStatus` class is enabled — threaded from `src/config.ts`'s
+   * `serverFaultSensor` at construction (`hub-accessory` design.md, matching how other
+   * config-derived poller behavior is threaded from `src/platform.ts` today). Default `false`:
+   * the class's schedule still runs (pod-poller spec's "a disabled class skips the actual
+   * request but keeps its schedule running"), it just never issues a request until this is
+   * `true`.
+   */
+  serverFaultSensorEnabled?: boolean;
 }
 
 interface EndpointClassSpec<T> {
@@ -166,6 +175,22 @@ export class PodPoller {
       baseIntervalMs: this.slowPollIntervalMs,
       read: (client, signal) => client.getServices(signal),
       apply: (snapshot, value) => snapshot.observeServices(value as Services),
+    });
+    const serverFaultSensorEnabled = options.serverFaultSensorEnabled ?? false;
+    this.registerClass({
+      id: 'serverStatus',
+      baseIntervalMs: this.slowPollIntervalMs,
+      read: (client, signal) => client.getServerStatus(signal),
+      apply: (snapshot, value) => snapshot.observeServerStatus(value as ServerStatus),
+      recordFailure: (snapshot, kind) => snapshot.recordServerStatusFailure(kind),
+      // Static for this launch's lifetime — `serverFaultSensor` is a config key, not something
+      // that changes while the platform runs — but expressed as a predicate (rather than simply
+      // omitting `registerClass` when disabled) so the class's schedule still runs while
+      // disabled, per this extension point's own contract (pod-poller spec's "the class's own
+      // schedule continues running so that enabling the sensor later resumes polling without
+      // restarting the plugin" — moot for a config value that can't change without a restart
+      // today, but keeps this class consistent with every other use of `enabled`).
+      enabled: () => serverFaultSensorEnabled,
     });
   }
 

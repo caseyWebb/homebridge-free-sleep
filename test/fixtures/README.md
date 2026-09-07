@@ -49,6 +49,12 @@ unit or household: names are the literal defaults (`"Left"`/`"Right"`), and `sch
   design.md's Open Question 3 guessed. Nothing in the codebase branches on this value, so the
   guess being wrong was benign — see the ADR's 2026-09-06 update.
 
+## `serverStatus.json` (`hub-accessory`, #20)
+
+| File | Status | Date | Notes |
+|---|---|---|---|
+| `serverStatus.json` | synthetic, **permanent** | 2026-09-06 | Not a real capture — `GET /api/serverStatus` was never queried against real hardware for this change (the hard rule against writing to the real Pod does not bar a read-only GET, but nothing in `hub-accessory`'s tasks called for one, and every subsystem's shape is already fully specified by `server/src/routes/serverStatus/serverStatusSchema.ts` and `server/src/serverStatus.ts`). All twelve always-present subsystems report `status: "healthy"`; the six biometrics-gated keys (`analyzeSleepLeft`, `analyzeSleepRight`, `biometricsInstallation`, `biometricsStream`, `biometricsCalibrationLeft`, `biometricsCalibrationRight`) are **omitted** — the deliberate choice named in `hub-accessory`'s tasks.md 6.1 — to exercise the optional-key leniency path (`ServerStatusSchema`'s `.optional()` on each of them) rather than default to `services.json`'s own `biometrics.enabled: true`. Contains no identifying information by construction. |
+
 ## Do not hand-edit further
 
 Do **not** hand-edit a captured fixture beyond the two documented, deliberate edits above

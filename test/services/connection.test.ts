@@ -3,6 +3,7 @@ import type { CharacteristicGetHandler } from '@homebridge/hap-nodejs';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { FreeSleepConfigSchema, type FreeSleepConfig } from '../../src/config.js';
+import type { MinimalPodClient } from '../../src/platform.js';
 import { AwayModeGuard } from '../../src/pod/awayModeGuard.js';
 import { SnapshotStore } from '../../src/pod/snapshot.js';
 import { DeviceStatusSchema, SchedulesSchema, ServicesSchema, SettingsSchema } from '../../src/pod/types.js';
@@ -68,6 +69,7 @@ function contextFor(setupResult: Setup, config: Record<string, unknown> = {}): S
     awayModeGuard,
     timers: setupResult.timers,
     config: baseConfig(config),
+    podClient: fake.client as unknown as MinimalPodClient,
   };
 }
 

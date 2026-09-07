@@ -17,15 +17,19 @@ import { createServer, type IncomingMessage, type ServerResponse, type Server } 
 import type { AddressInfo } from 'node:net';
 
 import {
+  AlarmRequestSchema,
   DeviceStatusSchema,
   SchedulesSchema,
+  ServerStatusSchema,
   ServicesSchema,
   SettingsPatchSchema,
   SettingsSchema,
   UpstreamDeviceStatusPatchSchema,
+  type AlarmRequest,
   type DeviceStatus,
   type DeviceStatusPatch,
   type Schedules,
+  type ServerStatus,
   type Services,
   type Settings,
   type Side,
@@ -90,6 +94,7 @@ export interface MockPodState {
   settings: Settings;
   schedules: Schedules;
   services: Services;
+  serverStatus: ServerStatus;
 }
 
 interface SideStatusOverride {
@@ -128,6 +133,9 @@ export interface StartMockPodOptions {
     schedules?: Schedules;
     /** Whole-document override; no partial-merge convenience needed by any current test. */
     services?: Services;
+    /** Whole-document override; mirrors the existing `services`/`schedules` convention
+     * (`hub-accessory`, pod-test-double spec's "mock serves subsystem health" requirement). */
+    serverStatus?: ServerStatus;
   };
 }
 
@@ -216,6 +224,7 @@ function buildInitialState(overrides?: StartMockPodOptions['state']): MockPodSta
   const settingsFixture = SettingsSchema.parse(loadFixture('settings.json'));
   const schedulesFixture = SchedulesSchema.parse(loadFixture('schedules.json'));
   const servicesFixture = ServicesSchema.parse(loadFixture('services.json'));
+  const serverStatusFixture = ServerStatusSchema.parse(loadFixture('serverStatus.json'));
 
   const mergedDeviceStatus = deepMergeInto(
     deviceStatusFixture as unknown as Record<string, unknown>,
@@ -229,6 +238,7 @@ function buildInitialState(overrides?: StartMockPodOptions['state']): MockPodSta
     : settingsFixture;
   const schedules = overrides?.schedules ?? schedulesFixture;
   const services = overrides?.services ?? servicesFixture;
+  const serverStatus = overrides?.serverStatus ?? serverStatusFixture;
 
   return {
     deviceStatus: {
@@ -245,6 +255,7 @@ function buildInitialState(overrides?: StartMockPodOptions['state']): MockPodSta
     settings: mergedSettings,
     schedules,
     services,
+    serverStatus,
   };
 }
 
@@ -325,6 +336,10 @@ function applyDeviceStatusPatch(
   patch: DeviceStatusPatch,
   commands: Command[],
 ): void {
+  // Truthiness guard copied verbatim from `updateDeviceStatus.ts`'s own
+  // `if (deviceStatus.isPriming) await executeFunction('PRIME')` — there is no `else` branch and
+  // no stop command, so `{isPriming: false}` is a proven no-op with respect to priming
+  // (`hub-accessory`'s design.md Context; pod-test-double spec's "no-op-when-false" requirement).
   if (patch.isPriming) {
     commands.push({ name: 'PRIME' });
   }
@@ -338,6 +353,27 @@ function applyDeviceStatusPatch(
     Object.assign(state.deviceStatus.settings, patch.settings);
     commands.push({ name: 'SET_SETTINGS', value: JSON.stringify(patch.settings) });
   }
+}
+
+/**
+ * `POST /api/alarm` (`hub-accessory`, pod-test-double spec's "mock reproduces the alarm-trigger
+ * endpoint's override and non-idempotent behavior"). Reproduces `executeAlarm`'s own override
+ * check (`server/src/jobs/alarmScheduler.ts`): silently no-ops when the addressed side is off or
+ * away, *unless* `force` is set — the mock always records the raw HTTP request (handled by the
+ * generic `record()` call in `handleRequest`, unrelated to this function), but only pushes the
+ * hardware command when the trigger is actually allowed to reach the side.
+ */
+function applyAlarmRequest(state: MockPodState, request: AlarmRequest, commands: Command[]): void {
+  const sideStatus = state.deviceStatus[request.side];
+  const sideSettings = state.settings[request.side];
+  const isOn = sideStatus.secondsRemaining > 0;
+  const allowed = request.force || (isOn && !sideSettings.awayMode);
+  if (!allowed) return;
+  commands.push({
+    name: request.side === 'left' ? 'ALARM_LEFT' : 'ALARM_RIGHT',
+    side: request.side,
+    value: String(request.vibrationIntensity),
+  });
 }
 
 // ---------------------------------------------------------------------------------------
@@ -368,8 +404,10 @@ const KNOWN_ENDPOINTS = new Set([
   'GET /api/settings',
   'GET /api/schedules',
   'GET /api/services',
+  'GET /api/serverStatus',
   'POST /api/deviceStatus',
   'POST /api/settings',
+  'POST /api/alarm',
 ]);
 
 export async function startMockPod(options: StartMockPodOptions = {}): Promise<MockPod> {
@@ -479,6 +517,10 @@ export async function startMockPod(options: StartMockPodOptions = {}): Promise<M
         responseBody = state.services;
         break;
 
+      case 'GET /api/serverStatus':
+        responseBody = state.serverStatus;
+        break;
+
       case 'POST /api/deviceStatus': {
         // Validate against the full upstream contract (every DeviceStatusSchema field,
         // deep-partial, strict) — not PodClient's own narrower outgoing schema. See
@@ -523,6 +565,24 @@ export async function startMockPod(options: StartMockPodOptions = {}): Promise<M
         // — the stored document, id intact (settings.ts). Only the request-side delete
         // happens; the response is never stripped.
         responseBody = state.settings;
+        break;
+      }
+
+      case 'POST /api/alarm': {
+        const result = AlarmRequestSchema.safeParse(body);
+        if (!result.success) {
+          status = 400;
+          responseBody = { error: 'Invalid request data', details: result.error.issues };
+          break;
+        }
+        // Recorded as a command only when actually allowed to reach the side (see
+        // `applyAlarmRequest`'s doc); the raw HTTP request itself is always recorded below,
+        // regardless of outcome — matching upstream's own route, which responds `200` before
+        // `executeAlarm`'s promise even settles (design.md's Context).
+        applyAlarmRequest(state, result.data, commands);
+        status = 200;
+        // Matches `server/src/routes/alarm/alarm.ts`'s own response shape.
+        responseBody = state.schedules;
         break;
       }
 
@@ -582,6 +642,7 @@ export async function startMockPod(options: StartMockPodOptions = {}): Promise<M
     state.settings = fresh.settings;
     state.schedules = fresh.schedules;
     state.services = fresh.services;
+    state.serverStatus = fresh.serverStatus;
     requests.length = 0;
     commands.length = 0;
     faults.clear();

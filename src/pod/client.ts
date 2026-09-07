@@ -20,15 +20,19 @@
 import { ZodError } from 'zod';
 
 import {
+  AlarmRequestSchema,
   DeviceStatusPatchSchema,
   DeviceStatusSchema,
   SchedulesSchema,
+  ServerStatusSchema,
   ServicesSchema,
   SettingsPatchSchema,
   SettingsSchema,
+  type AlarmRequest,
   type DeviceStatus,
   type DeviceStatusPatch,
   type Schedules,
+  type ServerStatus,
   type Services,
   type Settings,
   type SettingsPatch,
@@ -139,6 +143,15 @@ export class PodClient {
   }
 
   /**
+   * `GET /api/serverStatus`. Not free — a real SQLite round-trip on every call upstream
+   * (`hub-accessory` design.md's Context) — callers poll this on the slow cadence only, never
+   * per-characteristic.
+   */
+  async getServerStatus(signal?: AbortSignal): Promise<ServerStatus> {
+    return this.getJson('/api/serverStatus', ServerStatusSchema, signal);
+  }
+
+  /**
    * `POST /api/deviceStatus`. Cheap — a device command, not a LowDB write (proposal.md's
    * endpoint table). Pre-flight-validated against the strict request schema; never sends a
    * request for a payload the Pod would reject anyway.
@@ -168,6 +181,22 @@ export class PodClient {
       throw new PodRequestError(`Invalid settings patch: ${formatZodIssues(result.error)}`);
     }
     await this.request('POST', '/api/settings', result.data, signal);
+  }
+
+  /**
+   * `POST /api/alarm`. Fire-and-forget, non-idempotent at the hardware layer (`hub-accessory`
+   * design.md's Decision 6 and Context: `executeAlarm` silently returns before its own promise
+   * settles, so a retried POST landing while the first is still in progress risks a double-fire).
+   * Unlike every other write this client exposes, a failed attempt is **never retried** — this
+   * calls `singleAttempt` directly, still through the same per-endpoint `enqueue` serialization
+   * every other endpoint gets, rather than `requestWithRetry`.
+   */
+  async postAlarm(request: AlarmRequest, signal?: AbortSignal): Promise<void> {
+    const result = AlarmRequestSchema.safeParse(request);
+    if (!result.success) {
+      throw new PodRequestError(`Invalid alarm request: ${formatZodIssues(result.error)}`);
+    }
+    await this.request('POST', '/api/alarm', result.data, signal, { retry: false });
   }
 
   // -----------------------------------------------------------------------------------
@@ -273,10 +302,14 @@ export class PodClient {
     pathname: string,
     body: unknown,
     signal?: AbortSignal,
+    options?: { retry?: boolean },
   ): Promise<string> {
     const key = `${method} ${pathname}`;
+    const retry = options?.retry ?? true;
     const { status, text } = await this.enqueue(key, () =>
-      this.requestWithRetry(method, pathname, body, signal),
+      retry
+        ? this.requestWithRetry(method, pathname, body, signal)
+        : this.singleAttempt(method, pathname, body, signal),
     );
 
     if (status === 400) {

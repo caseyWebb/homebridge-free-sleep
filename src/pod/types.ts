@@ -7,19 +7,25 @@
  * runtime zod rather than hand-written `interface`s, and for the read-vs-request leniency
  * rule applied throughout this file.
  *
- * Four blocks, one per upstream source file:
+ * Five blocks, one per upstream source file:
  *
- *   | Block         | Upstream source                                                |
- *   |---------------|-----------------------------------------------------------------|
- *   | device status | server/src/routes/deviceStatus/deviceStatusSchema.ts             |
- *   | settings      | server/src/db/settingsSchema.ts                                  |
- *   | schedules     | server/src/db/schedulesSchema.ts                                 |
- *   | services      | server/src/db/servicesSchema.ts                                  |
+ *   | Block           | Upstream source                                                |
+ *   |-----------------|-----------------------------------------------------------------|
+ *   | device status   | server/src/routes/deviceStatus/deviceStatusSchema.ts             |
+ *   | settings        | server/src/db/settingsSchema.ts                                  |
+ *   | schedules       | server/src/db/schedulesSchema.ts                                 |
+ *   | services        | server/src/db/servicesSchema.ts                                  |
+ *   | subsystem health| server/src/routes/serverStatus/serverStatusSchema.ts             |
  *
  * `services` also transitively needs the per-job status shape from
  * server/src/routes/serverStatus/serverStatusSchema.ts (`StatusInfoSchema`); that shape is
- * reproduced locally in the services block below rather than added as a fifth top-level
- * block, since nothing outside `ServicesSchema` needs it.
+ * reproduced locally in the services block below rather than reused from the subsystem-health
+ * block, since `services` predates the subsystem-health block and the two are structurally
+ * identical but deliberately not merged (`hub-accessory`'s design.md, Decision 8: each block
+ * should stay independently diffable against its own cited upstream file, not implicitly
+ * coupled to another block that happens to look alike today). The alarm-trigger request shape
+ * (`POST /api/alarm`) is likewise vendored, request-only, near the subsystem-health block below —
+ * see `AlarmRequestSchema`.
  *
  * Read schemas (`DeviceStatusSchema`, `SettingsSchema`, `SchedulesSchema`, `ServicesSchema`)
  * are **lenient** throughout — not just for device status. Every unknown-key surface uses
@@ -468,6 +474,89 @@ export const ServicesSchema = z.object({
 });
 
 export type Services = z.infer<typeof ServicesSchema>;
+
+// ---------------------------------------------------------------------------------------
+// subsystem health — server/src/routes/serverStatus/serverStatusSchema.ts
+// (`hub-accessory`'s design.md, Decision 8: a genuine fifth top-level block, not a sub-shape of
+// any of the four above)
+// ---------------------------------------------------------------------------------------
+
+/**
+ * Structurally identical to the `services` block's own local `StatusInfoSchema` above — both are
+ * `{name, status, description, message, timestamp?}`, `status` a lenient `z.string()` rather
+ * than upstream's own enum (matching this file's read-side leniency convention: a status value
+ * this client has never heard of must still parse). Deliberately **not** shared as one type
+ * between the two blocks (design.md's Decision 8) — each stays independently diffable against
+ * its own cited upstream file.
+ */
+const ServerStatusInfoSchema = z.object({
+  name: z.string(),
+  status: z.string(),
+  description: z.string(),
+  message: z.string(),
+  timestamp: z.string().optional(),
+});
+
+export type ServerStatusInfo = z.infer<typeof ServerStatusInfoSchema>;
+
+/**
+ * Twelve subsystems are always present. The six biometrics-gated ones (`analyzeSleepLeft`,
+ * `analyzeSleepRight`, `biometricsInstallation`, `biometricsStream`, `biometricsCalibrationLeft`,
+ * `biometricsCalibrationRight`) are present only when `servicesDB.data.biometrics.enabled`
+ * (`server/src/serverStatus.ts`'s `updateServices()`) — `.optional()`, matching this file's
+ * read-side leniency everywhere else: an absent key parses fine, and the "any subsystem
+ * `status === 'failed'`" derivation (`src/pod/snapshot.ts`) simply has fewer subsystems to check
+ * when they're absent.
+ */
+export const ServerStatusSchema = z.object({
+  alarmSchedule: ServerStatusInfoSchema,
+  database: ServerStatusInfoSchema,
+  express: ServerStatusInfoSchema,
+  franken: ServerStatusInfoSchema,
+  frankenMonitor: ServerStatusInfoSchema,
+  jobs: ServerStatusInfoSchema,
+  logger: ServerStatusInfoSchema,
+  powerSchedule: ServerStatusInfoSchema,
+  primeSchedule: ServerStatusInfoSchema,
+  rebootSchedule: ServerStatusInfoSchema,
+  systemDate: ServerStatusInfoSchema,
+  temperatureSchedule: ServerStatusInfoSchema,
+  analyzeSleepLeft: ServerStatusInfoSchema.optional(),
+  analyzeSleepRight: ServerStatusInfoSchema.optional(),
+  biometricsInstallation: ServerStatusInfoSchema.optional(),
+  biometricsStream: ServerStatusInfoSchema.optional(),
+  biometricsCalibrationLeft: ServerStatusInfoSchema.optional(),
+  biometricsCalibrationRight: ServerStatusInfoSchema.optional(),
+});
+
+export type ServerStatus = z.infer<typeof ServerStatusSchema>;
+
+// ---------------------------------------------------------------------------------------
+// alarm trigger (request-only) — server/src/routes/alarm/alarm.ts, cross-checked against
+// server/src/db/schedulesSchema.ts's AlarmJobSchema bounds and docs/POD-API.md
+// ---------------------------------------------------------------------------------------
+
+/**
+ * Request-only: `PodClient.postAlarm` returns `void` (design.md's Decision 6) — this plugin
+ * never reads a response body shaped like this. Strict, like every other request schema in this
+ * file, and vendored with the same upstream-provenance discipline even though there is no read
+ * counterpart to cross-check leniency against.
+ */
+export const AlarmRequestSchema = z
+  .object({
+    side: SideSchema,
+    vibrationIntensity: z.number().int().min(1, { message: 'vibrationIntensity must be at least 1' }).max(100, {
+      message: 'vibrationIntensity cannot exceed 100',
+    }),
+    vibrationPattern: z.enum(['double', 'rise']),
+    duration: z.number().int().min(0, { message: 'duration must be non-negative' }).max(180, {
+      message: 'duration cannot exceed 180',
+    }),
+    force: z.boolean(),
+  })
+  .strict();
+
+export type AlarmRequest = z.infer<typeof AlarmRequestSchema>;
 
 // ---------------------------------------------------------------------------------------
 // waterLevel interpretation
