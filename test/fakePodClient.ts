@@ -13,7 +13,16 @@
  */
 
 import type { PodClient } from '../src/pod/client.ts';
-import type { DeviceStatus, DeviceStatusPatch, Schedules, Services, Settings, SettingsPatch } from '../src/pod/types.ts';
+import type {
+  DeviceStatus,
+  DeviceStatusPatch,
+  PresenceData,
+  Schedules,
+  Services,
+  Settings,
+  SettingsPatch,
+  VitalsResponse,
+} from '../src/pod/types.ts';
 
 type Outcome<T> =
   | { kind: 'value'; value: T }
@@ -92,10 +101,16 @@ export interface FakePodClient {
   settings: FakeEndpoint<Settings>;
   schedules: FakeEndpoint<Schedules>;
   services: FakeEndpoint<Services>;
+  /** Occupancy change (#19). */
+  presence: FakeEndpoint<PresenceData>;
+  /** Occupancy change (#19). */
+  vitals: FakeEndpoint<VitalsResponse>;
   postDeviceStatusCalls: DeviceStatusPatch[];
   postSettingsCalls: SettingsPatch[];
   postDeviceStatusOutcome: { kind: 'success' } | { kind: 'error'; error: unknown };
   postSettingsOutcome: { kind: 'success' } | { kind: 'error'; error: unknown };
+  /** Every `getVitals` call's query, recorded in order (occupancy change, #19). */
+  vitalsQueries: Array<{ side?: string; startTime?: string; endTime?: string }>;
 }
 
 export interface FakePodClientFixtures {
@@ -103,6 +118,10 @@ export interface FakePodClientFixtures {
   settings: Settings;
   schedules: Schedules;
   services: Services;
+  /** Occupancy change (#19). Optional — most tests don't exercise these classes. */
+  presence?: PresenceData;
+  /** Occupancy change (#19). Optional — most tests don't exercise these classes. */
+  vitals?: VitalsResponse;
 }
 
 export function createFakePodClient(fixtures: FakePodClientFixtures): FakePodClient {
@@ -110,23 +129,31 @@ export function createFakePodClient(fixtures: FakePodClientFixtures): FakePodCli
   const settings = new FakeEndpoint<Settings>();
   const schedules = new FakeEndpoint<Schedules>();
   const services = new FakeEndpoint<Services>();
+  const presence = new FakeEndpoint<PresenceData>();
+  const vitals = new FakeEndpoint<VitalsResponse>();
   deviceStatus.setFallback(fixtures.deviceStatus);
   settings.setFallback(fixtures.settings);
   schedules.setFallback(fixtures.schedules);
   services.setFallback(fixtures.services);
+  if (fixtures.presence !== undefined) presence.setFallback(fixtures.presence);
+  if (fixtures.vitals !== undefined) vitals.setFallback(fixtures.vitals);
 
   const postDeviceStatusCalls: DeviceStatusPatch[] = [];
   const postSettingsCalls: SettingsPatch[] = [];
+  const vitalsQueries: Array<{ side?: string; startTime?: string; endTime?: string }> = [];
   const state: FakePodClient = {
     client: undefined as unknown as PodClient,
     deviceStatus,
     settings,
     schedules,
     services,
+    presence,
+    vitals,
     postDeviceStatusCalls,
     postSettingsCalls,
     postDeviceStatusOutcome: { kind: 'success' },
     postSettingsOutcome: { kind: 'success' },
+    vitalsQueries,
   };
 
   const client = {
@@ -134,6 +161,11 @@ export function createFakePodClient(fixtures: FakePodClientFixtures): FakePodCli
     getSettings: (signal?: AbortSignal) => settings.run(signal),
     getSchedules: (signal?: AbortSignal) => schedules.run(signal),
     getServices: (signal?: AbortSignal) => services.run(signal),
+    getPresence: (signal?: AbortSignal) => presence.run(signal),
+    getVitals: (query?: { side?: string; startTime?: string; endTime?: string }, signal?: AbortSignal) => {
+      vitalsQueries.push(query ?? {});
+      return vitals.run(signal);
+    },
     postDeviceStatus: async (patch: DeviceStatusPatch) => {
       postDeviceStatusCalls.push(patch);
       if (state.postDeviceStatusOutcome.kind === 'error') throw state.postDeviceStatusOutcome.error;

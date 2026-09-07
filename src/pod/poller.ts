@@ -2,7 +2,8 @@
  * `PodPoller` — decides when the plugin talks to the Pod at all (pod-poller spec).
  *
  * One self-rescheduling poll per endpoint class (`deviceStatus`, `settings`, `schedules`,
- * `services`), never two in flight for a class at once, ±10% jitter, exponential backoff to a
+ * `services`, and — occupancy change, #19 — `presence`/`vitals`), never two in flight for a
+ * class at once, ±10% jitter, exponential backoff to a
  * configurable cap with snap-back on the first success, a deadline-bounded bootstrap, and a
  * stacking poll-mode API (`requestMode`) that expresses fast-poll-after-write and
  * fast-poll-while-priming today with no new mechanism needed for the alarm window later
@@ -33,9 +34,17 @@ import {
   type TimerApi,
   type TimerHandle,
 } from './snapshot.ts';
-import type { DeviceStatus, Schedules, Services, Settings } from './types.ts';
+import type { DeviceStatus, PresenceData, Schedules, Services, Settings, VitalsResponse } from './types.ts';
 
-export type EndpointClassId = 'deviceStatus' | 'settings' | 'schedules' | 'services';
+export type EndpointClassId = 'deviceStatus' | 'settings' | 'schedules' | 'services' | 'presence' | 'vitals';
+
+/**
+ * The vitals class's query window (occupancy change, #19; design.md's "One combined vitals
+ * query per poll, windowed to the 'recent' threshold itself") — issue #8's own "~3 min",
+ * roughly 3x the 60s insertion cadence upstream writes at, tolerant of one or two missed
+ * insertions. A fixed internal constant, not a config field (proposal.md's Non-Goals).
+ */
+const VITALS_OCCUPIED_WINDOW_MS = 180_000;
 
 /** The alarm window (#16) needs 3s; config must never be able to request that as a *base*. */
 const HARD_FLOOR_MS = 3000;
@@ -55,6 +64,12 @@ export interface PollerOptions {
   maxBackoffMs?: number;
   /** Bootstrap deadline. Default 10 000. */
   bootstrapTimeoutMs?: number;
+  /**
+   * Which occupancy source, if any, is configured (occupancy change, #19). Default `'none'` —
+   * a plain value, following the same "poller doesn't import config.ts" discipline every
+   * existing option already follows (design.md).
+   */
+  occupancySource?: 'none' | 'presence' | 'vitals';
 }
 
 interface EndpointClassSpec<T> {
@@ -64,12 +79,13 @@ interface EndpointClassSpec<T> {
   apply: (snapshot: SnapshotStore, value: T) => void;
   recordFailure?: (snapshot: SnapshotStore, kind: ErrorKind) => void;
   /**
-   * Extension point for #19 (design.md, "The poller is a registry of endpoint-class
+   * Extension point named for #19 (design.md, "The poller is a registry of endpoint-class
    * descriptors"): evaluated against the current snapshot before each poll of this class. A
    * class with no `enabled` is always enabled. A disabled class skips the actual request but
    * keeps its schedule running — the next scheduled tick re-evaluates the predicate, so the
    * class polls again on its own as soon as it flips back to enabled, with no external kick
-   * needed. None of the four shipped classes uses this today.
+   * needed. The `presence`/`vitals` classes below are its first real consumers, each gated on
+   * both the configured `occupancySource` and the last-observed `services.biometrics.enabled`.
    */
   enabled?: (snapshot: EffectiveSnapshot) => boolean;
 }
@@ -124,6 +140,7 @@ export class PodPoller {
   private readonly fastPollIntervalMs: number;
   private readonly maxBackoffMs: number;
   private readonly bootstrapTimeoutMs: number;
+  private readonly occupancySource: 'none' | 'presence' | 'vitals';
 
   private readonly classes = new Map<EndpointClassId, ClassRuntime>();
   private primingRelease: (() => void) | null = null;
@@ -141,6 +158,7 @@ export class PodPoller {
     this.fastPollIntervalMs = options.fastPollIntervalMs ?? 5000;
     this.maxBackoffMs = options.maxBackoffMs ?? 60_000;
     this.bootstrapTimeoutMs = options.bootstrapTimeoutMs ?? 10_000;
+    this.occupancySource = options.occupancySource ?? 'none';
 
     this.registerClass({
       id: 'deviceStatus',
@@ -166,6 +184,42 @@ export class PodPoller {
       baseIntervalMs: this.slowPollIntervalMs,
       read: (client, signal) => client.getServices(signal),
       apply: (snapshot, value) => snapshot.observeServices(value as Services),
+    });
+
+    // Occupancy change (#19): both registered unconditionally, mirroring the four classes
+    // above — the `enabled` predicate decides whether either actually fires (design.md, "The
+    // poller is a registry of endpoint-class descriptors"). Neither defines `recordFailure`:
+    // matching `settings`/`schedules`/`services`, a failed poll simply leaves the last-known
+    // observation in place (pod-snapshot's general "a failure does not erase known state" rule).
+    this.registerClass({
+      id: 'presence',
+      baseIntervalMs: 30_000,
+      read: (client, signal) => client.getPresence(signal),
+      apply: (snapshot, value) => snapshot.observePresence(value as PresenceData),
+      enabled: (snapshot) =>
+        this.occupancySource === 'presence' && snapshot.documents.services?.biometrics.enabled === true,
+    });
+    this.registerClass({
+      id: 'vitals',
+      baseIntervalMs: 60_000,
+      read: (client, signal) => {
+        // `new globalThis.Date(...)` rather than the bare `Date` identifier this file's own
+        // ESLint rule forbids (no-restricted-globals) — a property access on `globalThis` is
+        // the accepted escape hatch (mirrors `defaultTimerApi`'s own `globalThis.Date.now()` in
+        // `snapshot.ts`), used here only to format `this.timers.now()`'s already-injected
+        // epoch-ms value as ISO 8601, not to read the clock itself.
+        const now = this.timers.now();
+        return client.getVitals(
+          {
+            startTime: new globalThis.Date(now - VITALS_OCCUPIED_WINDOW_MS).toISOString(),
+            endTime: new globalThis.Date(now).toISOString(),
+          },
+          signal,
+        );
+      },
+      apply: (snapshot, value) => snapshot.observeVitals(value as VitalsResponse),
+      enabled: (snapshot) =>
+        this.occupancySource === 'vitals' && snapshot.documents.services?.biometrics.enabled === true,
     });
   }
 

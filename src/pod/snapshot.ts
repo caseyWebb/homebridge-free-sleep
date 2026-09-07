@@ -28,10 +28,12 @@
 import {
   interpretWaterLevel,
   type DeviceStatus,
+  type PresenceData,
   type Schedules,
   type Services,
   type Settings,
   type Side,
+  type VitalsResponse,
   type WaterLevel,
 } from './types.ts';
 
@@ -123,6 +125,10 @@ interface RawState {
   settings: Settings | undefined;
   schedules: Schedules | undefined;
   services: Services | undefined;
+  /** Occupancy change (#19). */
+  presence: PresenceData | undefined;
+  /** Occupancy change (#19). */
+  vitals: VitalsResponse | undefined;
   connection: ConnectionState;
 }
 
@@ -132,6 +138,8 @@ function initialRawState(): RawState {
     settings: undefined,
     schedules: undefined,
     services: undefined,
+    presence: undefined,
+    vitals: undefined,
     connection: initialConnectionState,
   };
 }
@@ -182,6 +190,30 @@ export interface EffectiveSideStatus {
   isOn: boolean | undefined;
   isAlarmVibrating: boolean | undefined;
   awayMode: boolean | undefined;
+  /**
+   * Occupancy change (#19). The raw, current `present` flag from the presence endpoint —
+   * `undefined` until first observed. See `presenceActive` for whether this value has been
+   * proven trustworthy (design.md, "Presence `StatusActive`").
+   */
+  presencePresent: boolean | undefined;
+  /**
+   * Occupancy change (#19). `undefined` until the presence endpoint has been observed at all;
+   * `false` until a later observation's `lastUpdatedAt` differs from this launch's first-ever
+   * observation for this side; `true` from that point on, sticky (design.md).
+   */
+  presenceActive: boolean | undefined;
+  /**
+   * Occupancy change (#19). Derived: `true` iff the most recent vitals poll's window included a
+   * row for this side with a non-null `heart_rate`; `undefined` until the vitals endpoint has
+   * been observed at all.
+   */
+  vitalsOccupied: boolean | undefined;
+  /**
+   * Occupancy change (#19). `undefined` until the vitals endpoint has been observed at all;
+   * `true` from the first poll that ever included a row for this side, sticky thereafter
+   * (design.md, "Vitals `StatusActive`") — never re-derived per-poll.
+   */
+  vitalsActive: boolean | undefined;
 }
 
 /** The full last-observed documents, untouched by the overlay — for anything not flattened above. */
@@ -190,6 +222,10 @@ export interface EffectiveDocuments {
   settings: Settings | undefined;
   schedules: Schedules | undefined;
   services: Services | undefined;
+  /** Occupancy change (#19). Readable, not watched — mirrors `schedules`/`services`. */
+  presence: PresenceData | undefined;
+  /** Occupancy change (#19). Readable, not watched — mirrors `schedules`/`services`. */
+  vitals: VitalsResponse | undefined;
 }
 
 export interface EffectiveSnapshot {
@@ -210,7 +246,11 @@ export type SideChangeField =
   | 'targetTemperatureF'
   | 'isOn'
   | 'isAlarmVibrating'
-  | 'awayMode';
+  | 'awayMode'
+  | 'presencePresent'
+  | 'presenceActive'
+  | 'vitalsOccupied'
+  | 'vitalsActive';
 
 export type DeviceChangeField = 'waterLevelState' | 'isPriming' | 'connectionOnline';
 
@@ -242,6 +282,10 @@ export type Change =
   | SideChange<'isOn', boolean>
   | SideChange<'isAlarmVibrating', boolean>
   | SideChange<'awayMode', boolean>
+  | SideChange<'presencePresent', boolean>
+  | SideChange<'presenceActive', boolean>
+  | SideChange<'vitalsOccupied', boolean>
+  | SideChange<'vitalsActive', boolean>
   | DeviceChange<'waterLevelState', WaterLevel>
   | DeviceChange<'isPriming', boolean>
   | DeviceChange<'connectionOnline', boolean>;
@@ -287,6 +331,17 @@ export class SnapshotStore {
   private readonly logger: Logger;
 
   private raw: RawState = initialRawState();
+  /**
+   * Occupancy change (#19): per-side proof-of-life bookkeeping, kept outside `raw` because
+   * neither is itself part of the last-observed *document* — both are derived state about
+   * whether a source has ever proven trustworthy this launch (design.md, "Presence
+   * `StatusActive`" / "Vitals `StatusActive`"). `presenceBaseline` is this launch's first-ever
+   * observed `lastUpdatedAt` per side, recorded once and never updated again; `presenceProven`/
+   * `vitalsProven` are sticky — set once true, never unset.
+   */
+  private readonly presenceBaseline: Record<Side, string | undefined> = { left: undefined, right: undefined };
+  private readonly presenceProven: Record<Side, boolean> = { left: false, right: false };
+  private readonly vitalsProven: Record<Side, boolean> = { left: false, right: false };
   private readonly overlay = new Map<OverlayKey, OverlayEntry>();
   /**
    * A single monotonic counter backing every `OverlayHandle.generation`, reserved synchronously
@@ -349,6 +404,51 @@ export class SnapshotStore {
   observeServices(data: Services): void {
     this.commit(() => {
       this.raw.services = data;
+    });
+  }
+
+  /**
+   * Occupancy change (#19; design.md, "Presence `StatusActive`: prove a *change* from the
+   * launch baseline"). For each side with a defined entry in `data`: the *first-ever*
+   * observation this launch records that side's `lastUpdatedAt` as its baseline without
+   * proving anything (the in-memory store's own reset-on-restart default is a valid response
+   * that carries no information about a real transition). Every later observation compares
+   * against that fixed baseline — once it differs even once, `presenceProven[side]` latches
+   * `true` forever, regardless of what any subsequent observation reports (never re-baselined,
+   * never unset).
+   */
+  observePresence(data: PresenceData): void {
+    this.commit(() => {
+      for (const side of SIDES) {
+        const entry = data[side];
+        if (entry === undefined) continue;
+        const baseline = this.presenceBaseline[side];
+        if (baseline === undefined) {
+          this.presenceBaseline[side] = entry.lastUpdatedAt;
+        } else if (!this.presenceProven[side] && entry.lastUpdatedAt !== baseline) {
+          this.presenceProven[side] = true;
+        }
+      }
+      this.raw.presence = data;
+    });
+  }
+
+  /**
+   * Occupancy change (#19; design.md, "Vitals `StatusActive`: proven once any row is ever
+   * observed, sticky"). For each side, the *first* poll whose window includes any row for that
+   * side latches `vitalsProven[side] = true` forever — a later poll with no row for that side
+   * never un-proves it, since an empty window is the pipeline's expected steady state for a
+   * genuinely, correctly idle side (`biometric_processor.py`'s `present_for` gate; design.md's
+   * Context).
+   */
+  observeVitals(records: VitalsResponse): void {
+    this.commit(() => {
+      for (const side of SIDES) {
+        if (!this.vitalsProven[side] && records.some((r) => r.side === side)) {
+          this.vitalsProven[side] = true;
+        }
+      }
+      this.raw.vitals = records;
     });
   }
 
@@ -492,6 +592,8 @@ export class SnapshotStore {
         settings: this.raw.settings,
         schedules: this.raw.schedules,
         services: this.raw.services,
+        presence: this.raw.presence,
+        vitals: this.raw.vitals,
       },
     };
   }
@@ -510,6 +612,10 @@ export class SnapshotStore {
       isOn: (isOn?.value as boolean | undefined) ?? rawSide?.isOn,
       isAlarmVibrating: (alarm?.value as boolean | undefined) ?? rawSide?.isAlarmVibrating,
       awayMode: (away?.value as boolean | undefined) ?? rawSettingsSide?.awayMode,
+      presencePresent: this.raw.presence?.[side]?.present,
+      presenceActive: this.presenceProven[side] ? true : this.raw.presence === undefined ? undefined : false,
+      vitalsOccupied: this.raw.vitals?.some((r) => r.side === side && r.heart_rate != null),
+      vitalsActive: this.vitalsProven[side] ? true : this.raw.vitals === undefined ? undefined : false,
     };
   }
 }
@@ -526,6 +632,10 @@ function diffWatched(previous: EffectiveSnapshot, current: EffectiveSnapshot): C
     pushSideChange(changes, side, 'isOn', previous[side].isOn, current[side].isOn);
     pushSideChange(changes, side, 'isAlarmVibrating', previous[side].isAlarmVibrating, current[side].isAlarmVibrating);
     pushSideChange(changes, side, 'awayMode', previous[side].awayMode, current[side].awayMode);
+    pushSideChange(changes, side, 'presencePresent', previous[side].presencePresent, current[side].presencePresent);
+    pushSideChange(changes, side, 'presenceActive', previous[side].presenceActive, current[side].presenceActive);
+    pushSideChange(changes, side, 'vitalsOccupied', previous[side].vitalsOccupied, current[side].vitalsOccupied);
+    pushSideChange(changes, side, 'vitalsActive', previous[side].vitalsActive, current[side].vitalsActive);
   }
   pushDeviceChange(changes, 'waterLevelState', previous.waterLevelState, current.waterLevelState);
   pushDeviceChange(changes, 'isPriming', previous.isPriming, current.isPriming);

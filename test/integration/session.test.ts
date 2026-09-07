@@ -17,6 +17,7 @@ import { PodClient } from '../../src/pod/client.js';
 import { FreeSleepPlatform } from '../../src/platform.js';
 import { F_MAX, F_MIN, cToF, fToC } from '../../src/pod/temperature.js';
 import { SettingsSchema } from '../../src/pod/types.js';
+import { OCCUPANCY_SUBTYPE } from '../../src/services/occupancy.js';
 import { PLATFORM_NAME } from '../../src/settings.js';
 import {
   createFakeLogging,
@@ -381,4 +382,84 @@ describe('offline-then-escalate (8.6)', () => {
       await pod.close();
     }
   }, 30_000);
+});
+
+// ---------------------------------------------------------------------------------------
+// Occupancy change (#19): tasks.md 10.2 — one end-to-end scenario per source
+// ---------------------------------------------------------------------------------------
+
+describe('occupancy sensor end-to-end (tasks.md 10.2)', () => {
+  it(
+    "presence source: a transition posted into the mock's state flips OccupancyDetected within one presence-poll interval, and StatusActive only becomes true after it, never before",
+    async () => {
+      // `services.json`'s biometrics.enabled is already true, so this needs no override —
+      // matching the seeded fixture is enough to let the presence class's `enabled` predicate
+      // pass once `services` has been observed (already true by the bootstrap's own concurrent
+      // poll of that class).
+      const { pod, api, timers } = await bootSession({ occupancySource: 'presence' });
+      try {
+        const left = accessoryByName(api, LEFT_NAME);
+        const hap = api.hap;
+        const occupancyService = left.getServiceById(hap.Service.OccupancySensor, OCCUPANCY_SUBTYPE)!;
+        const occupancyDetected = occupancyService.getCharacteristic(hap.Characteristic.OccupancyDetected);
+        const statusActive = occupancyService.getCharacteristic(hap.Characteristic.StatusActive);
+
+        // One presence-poll interval (fixed 30s) past bootstrap: the fixture's own seeded
+        // `present: false` is observed as this launch's baseline — not yet a proven transition.
+        await timers.advance(30_000);
+        expect(await occupancyDetected.handleGetRequest()).toBe(hap.Characteristic.OccupancyDetected.OCCUPANCY_NOT_DETECTED);
+        expect(await statusActive.handleGetRequest()).toBe(false);
+
+        // A real transition, posted directly into the mock's state (mirrors the stale-reading
+        // injection technique above: this is what a poll will observe next, not a write this
+        // plugin performed).
+        pod.state.presence.left = { present: true, lastUpdatedAt: new Date(timers.now() + 1).toISOString() };
+        await timers.advance(30_000);
+
+        expect(await occupancyDetected.handleGetRequest()).toBe(hap.Characteristic.OccupancyDetected.OCCUPANCY_DETECTED);
+        expect(await statusActive.handleGetRequest()).toBe(true);
+      } finally {
+        await pod.close();
+      }
+    },
+    15_000,
+  );
+
+  it(
+    'vitals source: a fresh row flips occupancy within one vitals-poll interval, and StatusActive becomes true on the very first row',
+    async () => {
+      const { pod, api, timers } = await bootSession({ occupancySource: 'vitals' });
+      try {
+        const left = accessoryByName(api, LEFT_NAME);
+        const hap = api.hap;
+        const occupancyService = left.getServiceById(hap.Service.OccupancySensor, OCCUPANCY_SUBTYPE)!;
+        const occupancyDetected = occupancyService.getCharacteristic(hap.Characteristic.OccupancyDetected);
+        const statusActive = occupancyService.getCharacteristic(hap.Characteristic.StatusActive);
+
+        // One vitals-poll interval (fixed 60s) past bootstrap: the fixture's seeded rows carry
+        // real 2026 timestamps, far outside this test's virtual clock (which starts at the Unix
+        // epoch), so the mock's own recent-window filtering naturally reports zero rows — not
+        // yet proven, matching that the *vitals* rule's own asymmetry ("no requirement to
+        // observe a change") is not an exemption from ever needing a real row at all.
+        await timers.advance(60_000);
+        expect(await occupancyDetected.handleGetRequest()).toBe(hap.Characteristic.OccupancyDetected.OCCUPANCY_NOT_DETECTED);
+        expect(await statusActive.handleGetRequest()).toBe(false);
+
+        // A fresh row, timestamped against this test's own virtual clock so it falls inside the
+        // next poll's recent window, posted directly into the mock's state.
+        pod.state.vitals = [
+          { id: 99, side: 'left', timestamp: new Date(timers.now()).toISOString(), heart_rate: 65, hrv: 40, breathing_rate: 14 },
+        ];
+        await timers.advance(60_000);
+
+        expect(await occupancyDetected.handleGetRequest()).toBe(hap.Characteristic.OccupancyDetected.OCCUPANCY_DETECTED);
+        // Proven on the very first row — no "wait for a change across two readings" requirement,
+        // unlike the presence source above (design.md's asymmetry).
+        expect(await statusActive.handleGetRequest()).toBe(true);
+      } finally {
+        await pod.close();
+      }
+    },
+    15_000,
+  );
 });

@@ -22,16 +22,21 @@ import { ZodError } from 'zod';
 import {
   DeviceStatusPatchSchema,
   DeviceStatusSchema,
+  PresenceSchema,
   SchedulesSchema,
   ServicesSchema,
   SettingsPatchSchema,
   SettingsSchema,
+  VitalsResponseSchema,
   type DeviceStatus,
   type DeviceStatusPatch,
+  type PresenceData,
   type Schedules,
   type Services,
   type Settings,
   type SettingsPatch,
+  type Side,
+  type VitalsResponse,
 } from './types.ts';
 import {
   PodAbortError,
@@ -136,6 +141,32 @@ export class PodClient {
 
   async getServices(signal?: AbortSignal): Promise<Services> {
     return this.getJson('/api/services', ServicesSchema, signal);
+  }
+
+  /**
+   * `GET /api/metrics/presence` (occupancy change, #19). Read-only — no `postPresence` exists;
+   * the biometrics stream is upstream's only writer of this endpoint (proposal.md's Non-Goals).
+   */
+  async getPresence(signal?: AbortSignal): Promise<PresenceData> {
+    return this.getJson('/api/metrics/presence', PresenceSchema, signal);
+  }
+
+  /**
+   * `GET /api/metrics/vitals`, with `side`/`startTime`/`endTime` sent as query params only when
+   * given (occupancy change, #19; pod-client spec, "Vitals reads accept optional filters"). No
+   * `side` filter omits the parameter entirely rather than sending it empty — mirrors upstream's
+   * own optional-query-param shape (`server/src/routes/metrics/vitals.ts`).
+   */
+  async getVitals(
+    query?: { side?: Side; startTime?: string; endTime?: string },
+    signal?: AbortSignal,
+  ): Promise<VitalsResponse> {
+    const params = new URLSearchParams();
+    if (query?.side !== undefined) params.set('side', query.side);
+    if (query?.startTime !== undefined) params.set('startTime', query.startTime);
+    if (query?.endTime !== undefined) params.set('endTime', query.endTime);
+    const qs = params.toString();
+    return this.getJson(`/api/metrics/vitals${qs.length > 0 ? `?${qs}` : ''}`, VitalsResponseSchema, signal);
   }
 
   /**

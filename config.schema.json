@@ -2,7 +2,7 @@
   "pluginAlias": "FreeSleep",
   "pluginType": "platform",
   "singular": true,
-  "headerDisplay": "Exposes an Eight Sleep Pod running the free-sleep firmware to Apple HomeKit. `host` is the only field most installs need. `sides`, the poll/write timing overrides, the No Response delay, and keep-alive are live; the remaining fields are reserved for a future release and have no effect yet.",
+  "headerDisplay": "Exposes an Eight Sleep Pod running the free-sleep firmware to Apple HomeKit. `host` is the only field most installs need. `sides`, the poll/write timing overrides, the No Response delay, keep-alive, and the occupancy source are live; the remaining fields are reserved for a future release and have no effect yet.",
   "schema": {
     "type": "object",
     "properties": {
@@ -88,14 +88,15 @@
         "description": "0 disables the No Response escalation."
       },
       "occupancySource": {
-        "title": "Occupancy source (reserved, no effect yet)",
+        "title": "Occupancy source",
         "type": "string",
         "default": "none",
         "oneOf": [
           { "title": "None", "enum": ["none"] },
           { "title": "Presence", "enum": ["presence"] },
           { "title": "Vitals", "enum": ["vitals"] }
-        ]
+        ],
+        "description": "Publishes an OccupancySensor per side, driven by the chosen source. 'None' (default) publishes no sensor. Both sources require biometrics enabled on the Pod; StatusActive reports inactive until the source has proven itself live, so an occupancy sensor is never confidently, permanently wrong."
       },
       "waterLowSensorType": {
         "title": "Water-low sensor type (reserved, no effect yet)",

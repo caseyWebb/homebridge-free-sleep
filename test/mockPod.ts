@@ -18,18 +18,22 @@ import type { AddressInfo } from 'node:net';
 
 import {
   DeviceStatusSchema,
+  PresenceSchema,
   SchedulesSchema,
   ServicesSchema,
   SettingsPatchSchema,
   SettingsSchema,
   UpstreamDeviceStatusPatchSchema,
+  VitalsResponseSchema,
   type DeviceStatus,
   type DeviceStatusPatch,
+  type PresenceData,
   type Schedules,
   type Services,
   type Settings,
   type Side,
   type SideStatus,
+  type VitalsResponse,
 } from '../src/pod/types.js';
 import { loadFixture } from './loadFixture.js';
 
@@ -90,6 +94,10 @@ export interface MockPodState {
   settings: Settings;
   schedules: Schedules;
   services: Services;
+  /** Occupancy change (#19). */
+  presence: PresenceData;
+  /** Occupancy change (#19). */
+  vitals: VitalsResponse;
 }
 
 interface SideStatusOverride {
@@ -128,6 +136,10 @@ export interface StartMockPodOptions {
     schedules?: Schedules;
     /** Whole-document override; no partial-merge convenience needed by any current test. */
     services?: Services;
+    /** Whole-document override; no partial-merge convenience needed (occupancy change, #19). */
+    presence?: PresenceData;
+    /** Whole-array override; no partial-merge convenience needed (occupancy change, #19). */
+    vitals?: VitalsResponse;
   };
 }
 
@@ -216,6 +228,8 @@ function buildInitialState(overrides?: StartMockPodOptions['state']): MockPodSta
   const settingsFixture = SettingsSchema.parse(loadFixture('settings.json'));
   const schedulesFixture = SchedulesSchema.parse(loadFixture('schedules.json'));
   const servicesFixture = ServicesSchema.parse(loadFixture('services.json'));
+  const presenceFixture = PresenceSchema.parse(loadFixture('metricsPresence.json'));
+  const vitalsFixture = VitalsResponseSchema.parse(loadFixture('metricsVitals.json'));
 
   const mergedDeviceStatus = deepMergeInto(
     deviceStatusFixture as unknown as Record<string, unknown>,
@@ -229,6 +243,8 @@ function buildInitialState(overrides?: StartMockPodOptions['state']): MockPodSta
     : settingsFixture;
   const schedules = overrides?.schedules ?? schedulesFixture;
   const services = overrides?.services ?? servicesFixture;
+  const presence = overrides?.presence ?? presenceFixture;
+  const vitals = overrides?.vitals ?? vitalsFixture;
 
   return {
     deviceStatus: {
@@ -245,6 +261,8 @@ function buildInitialState(overrides?: StartMockPodOptions['state']): MockPodSta
     settings: mergedSettings,
     schedules,
     services,
+    presence,
+    vitals,
   };
 }
 
@@ -341,6 +359,30 @@ function applyDeviceStatusPatch(
 }
 
 // ---------------------------------------------------------------------------------------
+// Vitals query filtering (occupancy change, #19) — mirrors the real endpoint's Prisma
+// `vitalsWhereInput` (`server/src/routes/metrics/vitals.ts`, design.md's Context): `side` is an
+// exact string match when given, `startTime`/`endTime` bound `timestamp` inclusively when
+// given, sorted ascending by timestamp. No filter at all returns every seeded row for both
+// sides, in seed order (upstream orders by `timestamp asc`; the mock does the same rather than
+// preserving the fixture's own on-disk order, matching what a real query would return).
+// ---------------------------------------------------------------------------------------
+
+function filterVitals(rows: VitalsResponse, query: URLSearchParams): VitalsResponse {
+  const side = query.get('side');
+  const startTime = query.get('startTime');
+  const endTime = query.get('endTime');
+  const startMs = startTime !== null ? Date.parse(startTime) : undefined;
+  const endMs = endTime !== null ? Date.parse(endTime) : undefined;
+
+  return rows
+    .filter((row) => side === null || row.side === side)
+    .filter((row) => startMs === undefined || Date.parse(row.timestamp) >= startMs)
+    .filter((row) => endMs === undefined || Date.parse(row.timestamp) <= endMs)
+    .slice()
+    .sort((a, b) => Date.parse(a.timestamp) - Date.parse(b.timestamp));
+}
+
+// ---------------------------------------------------------------------------------------
 // HTTP transport
 // ---------------------------------------------------------------------------------------
 
@@ -368,6 +410,8 @@ const KNOWN_ENDPOINTS = new Set([
   'GET /api/settings',
   'GET /api/schedules',
   'GET /api/services',
+  'GET /api/metrics/presence',
+  'GET /api/metrics/vitals',
   'POST /api/deviceStatus',
   'POST /api/settings',
 ]);
@@ -479,6 +523,14 @@ export async function startMockPod(options: StartMockPodOptions = {}): Promise<M
         responseBody = state.services;
         break;
 
+      case 'GET /api/metrics/presence':
+        responseBody = state.presence;
+        break;
+
+      case 'GET /api/metrics/vitals':
+        responseBody = filterVitals(state.vitals, url.searchParams);
+        break;
+
       case 'POST /api/deviceStatus': {
         // Validate against the full upstream contract (every DeviceStatusSchema field,
         // deep-partial, strict) — not PodClient's own narrower outgoing schema. See
@@ -582,6 +634,8 @@ export async function startMockPod(options: StartMockPodOptions = {}): Promise<M
     state.settings = fresh.settings;
     state.schedules = fresh.schedules;
     state.services = fresh.services;
+    state.presence = fresh.presence;
+    state.vitals = fresh.vitals;
     requests.length = 0;
     commands.length = 0;
     faults.clear();

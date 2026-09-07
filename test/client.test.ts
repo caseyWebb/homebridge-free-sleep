@@ -459,6 +459,65 @@ describe('pre-flight rejection of isOn + secondsRemaining (6.9)', () => {
   });
 });
 
+describe('presence and vitals reads (occupancy change, #19, tasks.md 3.1/3.2)', () => {
+  it('getPresence resolves with the seeded fixture', async () => {
+    const pod = await start();
+    const client = clientFor(pod);
+    expect(await client.getPresence()).toEqual(loadFixture('metricsPresence.json'));
+  });
+
+  it('getVitals with no filters returns rows for both sides and sends no query string', async () => {
+    const pod = await start();
+    const client = clientFor(pod);
+    const result = await client.getVitals();
+    expect(result).toEqual(loadFixture('metricsVitals.json'));
+  });
+
+  it('getVitals sends exactly the given filters as query params, omitting the rest', async () => {
+    // `RecordedRequest.path` is the routing pathname only, with no query string (mockPod.ts) —
+    // so the actual URL each call reached the transport with is captured directly off `fetch`
+    // instead, the same technique the per-endpoint-serialisation tests above already use.
+    const pod = await start();
+    const client = clientFor(pod);
+    const urls: string[] = [];
+    const realFetch = globalThis.fetch;
+    globalThis.fetch = ((...args: Parameters<typeof fetch>) => {
+      urls.push(String(args[0]));
+      return realFetch(...args);
+    }) as typeof fetch;
+
+    try {
+      await client.getVitals({ side: 'left' });
+      await client.getVitals({ startTime: '2026-09-06T00:00:00Z', endTime: '2026-09-06T23:59:59Z' });
+      await client.getVitals({ side: 'right', startTime: '2026-09-06T00:00:00Z', endTime: '2026-09-06T23:59:59Z' });
+      await client.getVitals();
+    } finally {
+      globalThis.fetch = realFetch;
+    }
+
+    const searches = urls.map((u) => new URL(u).search);
+
+    expect(new URLSearchParams(searches[0]).get('side')).toBe('left');
+    expect(new URLSearchParams(searches[0]).has('startTime')).toBe(false);
+
+    expect(new URLSearchParams(searches[1]).has('side')).toBe(false);
+    expect(new URLSearchParams(searches[1]).get('startTime')).toBe('2026-09-06T00:00:00Z');
+    expect(new URLSearchParams(searches[1]).get('endTime')).toBe('2026-09-06T23:59:59Z');
+
+    expect(new URLSearchParams(searches[2]).get('side')).toBe('right');
+    expect(new URLSearchParams(searches[2]).get('startTime')).toBe('2026-09-06T00:00:00Z');
+    expect(new URLSearchParams(searches[2]).get('endTime')).toBe('2026-09-06T23:59:59Z');
+
+    expect(searches[3]).toBe('');
+  });
+
+  it('the client offers no write to either endpoint', async () => {
+    const client = new (await import('../src/pod/client.js')).PodClient({ host: '127.0.0.1' });
+    expect((client as unknown as Record<string, unknown>).postPresence).toBeUndefined();
+    expect((client as unknown as Record<string, unknown>).postVitals).toBeUndefined();
+  });
+});
+
 describe('no credentials ever sent (6.10)', () => {
   it('no client method sends an authorization or cookie header, or userinfo in the URL', async () => {
     const pod = await start();
