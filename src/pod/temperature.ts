@@ -20,6 +20,20 @@ export const fToC = (f: number): number => ((f - 32) * 5) / 9;
 export const cToF = (c: number): number => (c * 9) / 5 + 32;
 
 /**
+ * Clamps an observed target temperature to the settable range's bounds — the fix for #33
+ * (`anti-jitter` change, design.md's "#33: clamp at three read sites in thermostat.ts").
+ *
+ * `src/pod/types.ts`'s `SideStatusSchema` (the read schema) is deliberately lenient about
+ * `targetTemperatureF`, so a Pod reporting a value outside `[F_MIN, F_MAX]` parses without
+ * error. HAP's `TargetTemperature` characteristic cannot represent that value — its `setProps`
+ * bounds mean the closest it can ever report is one of `F_MIN`/`F_MAX` — so `src/services/
+ * thermostat.ts` calls this at the HomeKit service boundary, before comparing an observed
+ * degree against (or writing it into) the `publishedF.targetF` shadow, never in this read
+ * schema itself.
+ */
+export const clampTargetF = (f: number): number => Math.min(F_MAX, Math.max(F_MIN, f));
+
+/**
  * The properties every future `TargetTemperature` characteristic must pass to `setProps`.
  *
  * `minStep` and the `+0.2` margin on `maxValue` are load-bearing and must not be changed
