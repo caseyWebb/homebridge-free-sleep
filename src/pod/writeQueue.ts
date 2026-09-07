@@ -41,6 +41,29 @@
  * the write mutex for its entire async lifetime (see `pumpMutex` below) — so no separate
  * `runExclusive` call is needed to make the check atomic against another in-flight dispatch.
  *
+ * **Drain-before-decide (`settings-switches` change, #17/#18, tech-lead resolution 1):** the away-
+ * mode guard's dispatch-time read above is sufficient only as long as nothing can install a
+ * `left.awayMode`/`right.awayMode`-touching overlay *after* a side lane's dispatch has already
+ * begun deciding but *before* the settings write that produced it has actually settled — which
+ * `submitSettings({awayMode})` (the Away Mode `Switch`'s own write; `src/services/awayMode.ts`)
+ * is the first real caller to ever do. Immediately before a side lane's `dispatch()` calls
+ * `awayModeGuard.decide()`, it first drains any settings-lane write — still accumulating behind
+ * its own debounce, or already flushed and sitting in `mutexQueue` but not yet run — that touches
+ * either side's `awayMode`, running it to full settlement *inline*, from within the side lane's
+ * own already-held mutex slot, before `decide()` ever runs (`drainAwayModeSettingsIfPending`).
+ * This is not a new kind of concurrency the mutex wasn't already designed to serialize: because
+ * the side lane still holds `mutexBusy` the entire time, this is equivalent to widening its own
+ * exclusive dispatch step by one settings write. Draining *inline* — splicing the settings task
+ * out of `mutexQueue` and invoking its `run()` directly, rather than awaiting its own eventual
+ * turn through `pumpMutex` — is what avoids deadlock: a task already popped and running under the
+ * mutex can never be advanced past by `pumpMutex` awaiting a *different*, still-queued task's turn
+ * (nothing shifts `mutexQueue` again until the current task's `run()` promise resolves), so
+ * awaiting a separately-queued task from inside a running one would wait forever. The reverse
+ * submission order (settings write submitted first) was already safe before this change — its own
+ * debounce timer starts first, so its mutex task is enqueued and *runs* first too — and this
+ * mechanism costs one cheap field check with no side effect whenever there is nothing to drain,
+ * which is true for the overwhelming majority of every side dispatch.
+ *
  * **Alarm-only exemption (`alarm-events` change, tech-lead resolution 1):** a reduced side patch
  * whose only field is `isAlarmVibrating` bypasses `awayModeGuard.decide()` entirely — see
  * `isAlarmOnlySidePatch`'s doc below. Upstream never away-scopes this field and never mirrors it
@@ -196,6 +219,15 @@ interface LaneRuntime<P> {
 interface MutexTask {
   run: () => Promise<void>;
   abandon: () => void;
+  /**
+   * `settings-switches`' drain-before-decide mechanism (module doc's "Drain-before-decide"
+   * section): present — and always the settings lane's *own reduced patch object*, never merely
+   * a boolean — only for a mutex task created from a settings-lane flush; `undefined` for every
+   * `left`/`right`/`device`-lane task and for the mirror's own one-shot task. `dispatch()` reads
+   * this to find and drain a not-yet-run settings write touching either side's `awayMode` before
+   * a side lane consults `awayModeGuard.decide()` — see `drainAwayModeSettingsIfPending`.
+   */
+  settingsPatch?: SettingsPatch;
 }
 
 type SideOverlayField = 'targetTemperatureF' | 'isOn' | 'isAlarmVibrating' | 'awayMode';
@@ -258,6 +290,16 @@ function isSideLane(lane: LaneId): lane is Side {
 function isAlarmOnlySidePatch(patch: SidePatch): boolean {
   const keys = Object.keys(patch);
   return keys.length === 1 && keys[0] === 'isAlarmVibrating';
+}
+
+/**
+ * `settings-switches`' drain-before-decide mechanism: whether a settings-lane patch touches
+ * either side's `awayMode` — the only settings field this mechanism cares about draining early
+ * (design.md's "The ordering hazard"; a patch touching only, say, `primePodDaily` never needs to
+ * race a side lane's `decide()` at all).
+ */
+function touchesAwayMode(patch: SettingsPatch): boolean {
+  return patch.left?.awayMode !== undefined || patch.right?.awayMode !== undefined;
 }
 
 function describeError(error: unknown): string {
@@ -490,9 +532,56 @@ export class WriteQueue {
     const task: MutexTask = {
       run: () => this.dispatch(lane, patch, waiters, ownership, fieldOrigin),
       abandon: () => waiters.forEach((w) => w.reject(new WriteQueueStoppedError())),
+      ...(lane === 'settings' ? { settingsPatch: patch as SettingsPatch } : {}),
     };
     this.mutexQueue.push(task);
     this.pumpMutex();
+  }
+
+  /**
+   * Drain-before-decide (design.md's "The ordering hazard: mechanism, and why the two candidate
+   * fixes differ..."; tech-lead resolution 1): called only from inside `dispatch()`, immediately
+   * before a side lane consults `awayModeGuard.decide()` — never from anywhere else, and never
+   * for the settings lane's own dispatch (which never calls this). At that call site this method
+   * always runs from *inside* an already-running mutex task (`mutexBusy` is `true` for this
+   * call's entire duration, since `dispatch()` only ever runs as a `MutexTask.run()` body) — so
+   * nothing else can be popped from `mutexQueue` while this `await` is outstanding. Forcing a
+   * settings write to run *inline*, right now, rather than merely awaiting its own eventual mutex
+   * turn is what avoids deadlock: that write's own task, if already enqueued, is spliced out of
+   * `mutexQueue` first and its `run()` is invoked directly (a plain recursive call into
+   * `dispatch()` for the settings lane, not a re-entry into `pumpMutex`) — so it is not dispatched
+   * a second time later, and the calling side lane's own mutex slot is simply widened by one
+   * settings write, exactly as design.md describes, not a new kind of concurrency.
+   *
+   * Two states are possible for a settings-lane write that touches `awayMode` at the moment a
+   * side lane is about to decide (a third — "currently dispatching" — cannot coexist with the
+   * side lane's own dispatch already running, since the mutex is exclusive):
+   *
+   *   1. Still accumulating: `settingsLane.pending` is non-null and its debounce timer has not
+   *      yet fired. `flush()` is called directly (bypassing the debounce wait, but not skipping
+   *      any of its bookkeeping) to turn it into case 2 immediately.
+   *   2. Already flushed, sitting in `mutexQueue` behind (or ahead of, order does not matter)
+   *      other queued tasks, not yet run. Found via each task's own `settingsPatch` tag (set by
+   *      `enqueueDispatch` only for a settings-lane task) rather than a single dedicated pointer,
+   *      since — rarely — more than one settings-lane write can be queued at once (a second
+   *      submission's own cycle flushing while an earlier one is still waiting its mutex turn);
+   *      the loop below drains every matching one, in order, not just the first.
+   *
+   * The common case — no settings-lane write pending or queued at all, or one pending/queued that
+   * does not touch `awayMode` — costs one cheap field check (`settingsLane.pending`) plus an
+   * `Array.prototype.findIndex` over whatever is currently in `mutexQueue` (typically empty or
+   * very small), with no side effect and no `await` actually suspending anything.
+   */
+  private async drainAwayModeSettingsIfPending(): Promise<void> {
+    if (this.settingsLane.pending !== null && touchesAwayMode(this.settingsLane.pending)) {
+      this.flush('settings', this.settingsLane);
+    }
+    for (;;) {
+      const idx = this.mutexQueue.findIndex((t) => t.settingsPatch !== undefined && touchesAwayMode(t.settingsPatch));
+      if (idx === -1) return;
+      const [task] = this.mutexQueue.splice(idx, 1);
+      if (task) await task.run();
+    }
   }
 
   private async dispatch(
@@ -555,6 +644,14 @@ export class WriteQueue {
         // above instead.
         awayDecision = 'plain';
       } else {
+        // settings-switches' drain-before-decide (tech-lead resolution 1): widen this dispatch's
+        // own exclusive mutex section by one settings write, if (and only if) one touching either
+        // side's `awayMode` is currently pending or queued but not yet settled — see
+        // `drainAwayModeSettingsIfPending`'s own doc for the full mechanism and why this avoids
+        // deadlock. A no-op, zero-`await`-suspension check in the overwhelming common case (no
+        // such write outstanding).
+        await this.drainAwayModeSettingsIfPending();
+
         // Away-mode guard consultation (see the module doc's "Away-mode guard" section): a
         // synchronous decision, made and acted on before any request for this write is issued.
         awayDecision = this.awayModeGuard.decide();

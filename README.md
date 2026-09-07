@@ -29,7 +29,9 @@ Implemented and tested against **free-sleep v2.1.5**.
 Each side also carries an alarm-press event (fires "When … is pressed" in the Home app's
 automation picker) and a "Dismiss Alarm" switch, backed by a scheduler that briefly polls the
 Pod faster around each predicted alarm instant so the short-lived vibration event is not missed
-(`alarmEvents`, on by default — see Config keys below). See [docs/ROADMAP.md](docs/ROADMAP.md)
+(`alarmEvents`, on by default — see Config keys below), plus an "Away Mode" switch and a "Skip
+Next Alarm" switch (`awayModeSwitch`/`skipAlarmSwitch`, both on by default). See
+[docs/ROADMAP.md](docs/ROADMAP.md)
 for what's still planned (milestone M4) and why some things are deliberately non-goals.
 
 ### Honesty caveat — read this before installing
@@ -115,6 +117,9 @@ Minimal config — everything but `host` is optional:
 | `keepAliveMs` | number (ms) | `43200000` (12h) | The duration re-posted as a side's remaining time when it is re-armed, matching the Pod's own 12-hour duration. |
 | `keepAliveThresholdMs` | number (ms) | `1800000` (30min) | A side is re-armed once its remaining time drops below this. Must be strictly less than `keepAliveMs`; the config UI cannot enforce that, so an invalid combination fails loudly at Homebridge startup instead. Minimum `120000` (2min) — below that, the plugin's own internally-derived check cadence can no longer guarantee it catches every side before it expires. |
 | `awayModeWritePolicy` | `'mirror'` \| `'block'` | `'mirror'` | Governs a write to one side while either side has away mode on (the Pod itself always applies such a write to both sides). `'mirror'` (default) lets the write through and issues a second real `POST /api/deviceStatus` to the other side, updating its cached state to match, so HomeKit shows the truth immediately. `'block'` refuses the write before it reaches the Pod, surfacing "not allowed" in the Home app instead. Either way, an away-mode change made outside this plugin (e.g. free-sleep's own web UI) is only detected on the next settings poll (default every 300s), not sooner. |
+| `awayModeSwitch` | boolean | `true` | Publishes a per-side "Away Mode" switch, bound to `settings.{side}.awayMode` — pauses that side's schedules and alarms, the same field free-sleep's own web UI toggles. Writes are debounced locally (at least 2s) and rate-limited to at most one settings write per side per 10s window. |
+| `skipAlarmSwitch` | boolean | `true` | Publishes a per-side "Skip Next Alarm" switch. Turning it on computes that side's next scheduled alarm occurrence and writes `scheduleOverrides.alarm.expiresAt` so free-sleep's own recurring alarm job skips it; turning it off clears the override. Self-clears (reads back off) once the computed time passes, with no write. Writes are debounced locally (at least 2s). |
+| `awayModeTurnsSideOff` | boolean | `false` | When `awayModeSwitch` is enabled, turning a side's Away Mode switch on first turns that side off (confirmed), then enables away mode, as two sequenced writes — the reverse order would let the Pod's own both-sides mirroring turn the *other* side off too, which enabling away mode alone should not do. Turning Away Mode off never touches power, regardless of this setting. |
 
 Reserved keys are validated now (a typo fails loudly) so a future release can start reading
 them without a config migration, but they currently have no effect.

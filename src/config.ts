@@ -20,6 +20,9 @@
  *   | `ledLightbulb`       | `hub-accessory` (#20)           |
  *   | `testAlarmSwitch`    | `hub-accessory` (#20)           |
  *   | `serverFaultSensor`  | `hub-accessory` (#20)           |
+ *   | `awayModeSwitch`     | `settings-switches` (#18)       |
+ *   | `skipAlarmSwitch`    | `settings-switches` (#17)       |
+ *   | `awayModeTurnsSideOff` | `settings-switches` (#18)     |
  *
  * Every reserved key is nonetheless genuinely validated — a `z.object`/`z.enum` per key, not
  * `z.unknown()` — so a typo'd future config value fails loudly today rather than silently
@@ -274,6 +277,34 @@ export const FreeSleepConfigSchema = z.object({
    * is right; the flag exists for opt-out and for keeping a soak profile frozen.
    */
   alarmEvents: z.boolean().default(true),
+
+  /**
+   * Consumed starting with `settings-switches` (#18, tech-lead resolution 3): gates the per-side
+   * Away Mode `Switch` (`src/services/awayMode.ts`), bound to `settings.{side}.awayMode`. Default
+   * `true` — unlike the hub's opt-in extras, this is neither loud nor physically disruptive, and
+   * is directly what issue #18 was filed to add; hiding it by default would mean most users have
+   * to edit `config.json` to get the feature they asked for.
+   */
+  awayModeSwitch: z.boolean().default(true),
+
+  /**
+   * Consumed starting with `settings-switches` (#17, tech-lead resolution 3): gates the per-side
+   * Skip Next Alarm `Switch` (`src/services/skipAlarm.ts`), bound to
+   * `settings.{side}.scheduleOverrides.alarm.expiresAt`. Default `true` — same rationale as
+   * `awayModeSwitch` above.
+   */
+  skipAlarmSwitch: z.boolean().default(true),
+
+  /**
+   * Consumed starting with `settings-switches` (#18, tech-lead resolution 3): when `true`,
+   * turning a side's Away Mode switch on first ensures that side is off (a sequenced
+   * `submitSide(side, {isOn: false})` write, confirmed before the `awayMode: true` settings
+   * write is submitted); turning Away Mode off never touches power, regardless of this flag.
+   * Default `false`, matching issue #18's own stated default — it changes write *sequencing* in
+   * a way a household should opt into deliberately, not receive silently. Has no effect when
+   * `awayModeSwitch` is `false` (there is then no switch to toggle).
+   */
+  awayModeTurnsSideOff: z.boolean().default(false),
 }).superRefine((data, ctx) => {
   if (data.keepAliveThresholdMs >= data.keepAliveMs) {
     ctx.addIssue({

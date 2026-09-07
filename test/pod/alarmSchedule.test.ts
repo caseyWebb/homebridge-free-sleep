@@ -10,6 +10,7 @@ import {
   deriveUpcomingAlarms,
   isAlarmEligible,
   isRegularOccurrenceSuppressed,
+  nextAlarmSkipInstant,
   nextOccurrenceOfTime,
   nextOccurrenceOfWeekdayTime,
   WEEKDAYS,
@@ -435,6 +436,62 @@ describe('deriveUpcomingAlarms — end-to-end (tasks.md 3.2, 3.5)', () => {
 // (a bare RangeError from `Intl.DateTimeFormat`, previously uncaught) — and must not silently
 // corrupt the derivation with a non-finite instant either.
 // ---------------------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------------------
+// nextAlarmSkipInstant — settings-switches (#17, tech-lead resolution 3): the Skip Next Alarm
+// switch's own next-occurrence rule, a direct port of AlarmNotification.tsx's "sleep day"
+// convention (now minus 12h decides which weekday's `alarm.time` to read) composed with
+// AlarmDisabledDialog.tsx's own noon-based target-date rule (today if before noon, else
+// tomorrow, +2 minutes) — see the function's own doc for the exact upstream citations.
+// tasks.md 1.1's own verification table: before noon, at/after noon, an alarm exactly at
+// midnight, and a time zone with a non-whole-hour UTC offset.
+// ---------------------------------------------------------------------------------------
+
+describe('nextAlarmSkipInstant (settings-switches, tasks.md 1.1)', () => {
+  // Distinct alarm.time per weekday so a test can prove *which* day's entry was actually read:
+  // tuesday and wednesday differ (06:45 vs 07:15); every other day is irrelevant to these tests.
+  const sideSchedule = inertSideSchedule({
+    tuesday: dailySchedule({ alarm: { time: '06:45' } }),
+    wednesday: dailySchedule({ alarm: { time: '07:15' } }),
+  });
+
+  it("before noon (mid-morning): targets today's date, using the sleep-day (now minus 12h = tuesday) schedule's alarm time", () => {
+    // 2026-01-07T00:00:00Z = Wednesday 2026-01-07 09:00 JST. now-12h = Tuesday 21:00 JST.
+    const nowMs = Date.UTC(2026, 0, 7, 0, 0, 0);
+    const instant = nextAlarmSkipInstant('Asia/Tokyo', sideSchedule, nowMs);
+    // Tuesday's 06:45 + 2min = 06:47, applied to *today's* (Wednesday's) calendar date.
+    expect(instant).toBe(Date.UTC(2026, 0, 6, 21, 47, 0)); // 2026-01-07 06:47 JST - 9h
+  });
+
+  it("at/after noon (afternoon): targets tomorrow's date, using the sleep-day (now minus 12h = wednesday, same calendar day) schedule's alarm time", () => {
+    // 2026-01-07 15:00 JST. now-12h = 2026-01-07 03:00 JST -> still Wednesday.
+    const nowMs = Date.UTC(2026, 0, 7, 6, 0, 0);
+    const instant = nextAlarmSkipInstant('Asia/Tokyo', sideSchedule, nowMs);
+    // Wednesday's 07:15 + 2min = 07:17, applied to *tomorrow's* (Thursday's) calendar date.
+    expect(instant).toBe(Date.UTC(2026, 0, 7, 22, 17, 0)); // 2026-01-08 07:17 JST - 9h
+  });
+
+  it('exactly noon counts as "at or after" — targets tomorrow, matching upstream\'s isSameOrAfter', () => {
+    const nowMs = Date.UTC(2026, 0, 7, 3, 0, 0); // 2026-01-07 12:00:00 JST exactly
+    const instant = nextAlarmSkipInstant('Asia/Tokyo', sideSchedule, nowMs);
+    expect(instant).toBe(Date.UTC(2026, 0, 7, 22, 17, 0)); // same as the after-noon case above
+  });
+
+  it('an alarm scheduled exactly at midnight resolves to 00:02 on the target date', () => {
+    const midnightSchedule = inertSideSchedule({ tuesday: dailySchedule({ alarm: { time: '00:00' } }) });
+    const nowMs = Date.UTC(2026, 0, 7, 0, 0, 0); // Wednesday 09:00 JST, before noon -> today; sleep-day tuesday
+    const instant = nextAlarmSkipInstant('Asia/Tokyo', midnightSchedule, nowMs);
+    expect(instant).toBe(Date.UTC(2026, 0, 6, 15, 2, 0)); // 2026-01-07 00:02 JST - 9h
+  });
+
+  it('a non-whole-hour UTC offset zone (Asia/Kolkata, UTC+5:30) resolves correctly', () => {
+    // 2026-01-07 09:00 IST, before noon. now-12h = 2026-01-06 21:00 IST -> Tuesday.
+    const nowMs = Date.UTC(2026, 0, 7, 3, 30, 0);
+    const instant = nextAlarmSkipInstant('Asia/Kolkata', sideSchedule, nowMs);
+    // Tuesday's 06:45 + 2min = 06:47 IST, today's (Wednesday's) date.
+    expect(instant).toBe(Date.UTC(2026, 0, 7, 1, 17, 0)); // 2026-01-07 06:47 IST - 5:30
+  });
+});
 
 describe('deriveUpcomingAlarms — B1: a bad entry is skipped, not thrown, and does not affect siblings', () => {
   const nowMs = Date.UTC(2026, 0, 7, 0, 0, 0); // Wed 09:00 JST

@@ -1,11 +1,16 @@
 /**
  * Pure derivation of "which alarm instant(s) are upcoming" from the already-cached `schedules`/
  * `settings` documents — no I/O, no timer, no poller call. `AlarmWindowScheduler`
- * (`./alarmWindowScheduler.ts`) is the only consumer today; `settings-switches`' "Skip Next
- * Alarm" computation is a planned second consumer (tech-lead resolution 3, alarm-events
- * design.md's final "Resolutions" section) — which is exactly why this eligibility/day-shift/
- * override-skip/timezone logic lives in its own module rather than inside the scheduler that
- * happens to have shipped first.
+ * (`./alarmWindowScheduler.ts`) is the only consumer of `deriveUpcomingAlarms` itself;
+ * `settings-switches`' "Skip Next Alarm" switch (`src/services/skipAlarm.ts`) is the second
+ * consumer this module was named and shaped to accommodate (tech-lead resolution 3, alarm-events
+ * design.md's final "Resolutions" section; settled against `settings-switches` in that same
+ * resolution's addendum: `alarm-events` owns this module, `settings-switches` consumes it) — which
+ * is exactly why this eligibility/day-shift/override-skip/timezone logic lives in its own module
+ * rather than inside the scheduler that happens to have shipped first. That second consumer needs
+ * a genuinely different rule than `deriveUpcomingAlarms` provides (see `nextAlarmSkipInstant`
+ * below's own doc for why) — added here as a second, independent export rather than folded into
+ * `deriveUpcomingAlarms` or a fork of it.
  *
  * Every behavioural rule below is a direct, literal port of a specific upstream function —
  * chosen deliberately (design.md, "Deriving instants") so a future upstream change to any one of
@@ -33,7 +38,7 @@
  * tasks.md 2.4's pinned regression test both flag this explicitly rather than assuming it.
  */
 
-import type { DailySchedule, Schedules, Settings, Side, SideSettings } from './types.ts';
+import type { DailySchedule, Schedules, Settings, Side, SideSchedule, SideSettings } from './types.ts';
 
 // ---------------------------------------------------------------------------------------
 // Weekday plumbing
@@ -200,6 +205,48 @@ export function nextOccurrenceOfTime(timeZone: string, hhmm: string, nowMs: numb
     instant = zonedTimeToInstant(timeZone, { ...tomorrow, hour, minute, second: 0 });
   }
   return instant;
+}
+
+/**
+ * Skip-Next-Alarm target instant (`settings-switches` change, #17) — a direct port of two
+ * upstream call sites working together (`~/Code/free-sleep`, pinned v2.1.5/`dc0c710`), added to
+ * this module per its own tech-lead-resolved ownership (settings-switches CONSUMES this module;
+ * the `alarm-events` change owns it — see this file's own module doc). Deliberately **not**
+ * `deriveUpcomingAlarms` above: that function is eligibility-aware (skips a day whose
+ * `power.enabled`/`alarm.enabled` is false, or whose occurrence is itself already suppressed by
+ * an existing override) and uses the job-scheduler's own weekday-shift convention
+ * (`alarmWeekdayFor`) — settings-switches' own spec explicitly requires neither: "A day with
+ * alarms disabled ... SHALL still produce a computed occurrence," and the upstream UI this
+ * mirrors uses a different day-shift convention entirely (below). Reusing `deriveUpcomingAlarms`
+ * here would silently change the written `expiresAt` from what the spec's own scenarios pin.
+ *
+ * The two upstream sources, read together:
+ *
+ *   - `app/src/pages/ControlTempPage/AlarmNotification.tsx`'s `currentDay`: which day's
+ *     `alarm.time` to read is `now` minus 12 hours, formatted as a weekday name in `timeZone` —
+ *     the "sleep day" a session started on, not necessarily today's calendar weekday. This is a
+ *     *different* day-shift convention than this module's own `alarmWeekdayFor` (which shifts a
+ *     schedule's own weekday key by its `power.off` hour, for the job scheduler's weekday-keyed
+ *     registration) — the two are independently sourced upstream and must not be conflated.
+ *   - `AlarmDisabledDialog.tsx`'s `handleSave`: given that one resolved `HH:mm`, decide whether
+ *     the *date* to apply it to is today's or tomorrow's calendar date in `timeZone` — today if
+ *     `now` is strictly before noon, tomorrow if at or after (upstream: `now.isSameOrAfter
+ *     (noonToday)`) — then add 2 minutes. Upstream resolves that one `HH:mm` value once and reuses
+ *     it unconditionally for both the today and tomorrow branches; it does not re-look-up a
+ *     different weekday's `alarm.time` when the target date shifts to tomorrow. This port
+ *     preserves that exactly (a faithful port, not an idealized fix) — the only claim this
+ *     project can verify is parity with upstream's actual, checked-in behavior.
+ */
+export function nextAlarmSkipInstant(timeZone: string, sideSchedule: SideSchedule, nowMs: number): number {
+  const sleepDayFields = wallClockFieldsInZone(nowMs - 12 * 60 * 60 * 1000, timeZone);
+  const { hour, minute } = parseHhMm(sideSchedule[sleepDayFields.weekday].alarm.time);
+
+  const now = wallClockFieldsInZone(nowMs, timeZone);
+  const noonInstant = zonedTimeToInstant(timeZone, { ...now, hour: 12, minute: 0, second: 0 });
+  const targetDate = nowMs < noonInstant ? { year: now.year, month: now.month, day: now.day } : addCalendarDays(now, 1);
+
+  const base = zonedTimeToInstant(timeZone, { ...targetDate, hour, minute, second: 0 });
+  return base + 2 * 60 * 1000;
 }
 
 function parseTimestamp(raw: string | undefined): number | undefined {

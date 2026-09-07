@@ -249,6 +249,45 @@ routinely miss the entire alarm.**
   updateDeviceStatus.ts`), so this is parity, not a carve-out. Without it, a user could not stop
   a ringing alarm from HomeKit while either side was away under the `'block'` policy.
 
+## Away Mode and Skip Next Alarm: two per-side `Switch`es over `POST /api/settings` (`settings-switches`, #17/#18)
+
+Both bind a field only reachable through the expensive settings write (`docs/POD-API.md`: any
+`settingsDB.json` write makes the Pod cancel and rebuild every scheduled job), so both debounce
+locally (>= 2s, via the shared `TimerApi`) *above* `WriteQueue`'s own much shorter per-lane
+debounce before ever calling `submitSettings` — the service-level timer, not the queue's, is
+what satisfies each issue's own anti-storm requirement. `AwayModeService` additionally
+rate-limits to one settings write per side per 10s.
+
+- **Away Mode `Switch`** — `settings.{side}.awayMode`. `onGet` reads the cached, overlay-applied
+  snapshot directly (the field is already in `snapshot.ts`'s `OverlayableField` union, unshipped
+  by any prior change until this one's first real `submitSettings({awayMode})` caller). An
+  optional `awayModeTurnsSideOff` config flag (default `false`) sequences a `submitSide(side,
+  {isOn: false})` power-off *before* the `awayMode: true` settings write, confirmed first — the
+  reverse order would let the Pod's own `controlBothSides` mirror `isOn: false` onto the *other*
+  side too, which enabling away mode alone should not do. Turning Away Mode off never touches
+  power, regardless of the flag.
+- **Skip Next Alarm `Switch`** — reflects whether `settings.{side}.scheduleOverrides.alarm.
+  expiresAt` is a non-empty, still-future timestamp; `ON` computes the next occurrence (a direct
+  port of `AlarmNotification.tsx`'s "sleep day" convention + `AlarmDisabledDialog.tsx`'s
+  noon-based target-date rule — see `src/pod/alarmSchedule.ts`'s `nextAlarmSkipInstant`) and
+  posts `{disabled: true, timeOverride: '', expiresAt}`; `OFF` posts `{disabled: false,
+  timeOverride: '', expiresAt: ''}`. `expiresAt` is not an `OverlayableField` (a
+  continuously-recomputed derived boolean does not fit that raw-value-plus-settle-window model
+  cleanly) — this switch instead keeps a small local optimistic shadow, live for
+  `writeSettleMs`, mirroring `ThermostatService`'s own `publishedF` shadow pattern rather than
+  extending `snapshot.ts` for one caller.
+- **Error mapping**: `AwayModeGuard`'s `AwayModeBlockedError` -> `NOT_ALLOWED_IN_CURRENT_STATE`
+  mapping gates `submitSide` only — neither switch's own `submitSettings` write is ever gated by
+  it, so a failed settings write always surfaces as plain `SERVICE_COMMUNICATION_FAILURE`. The
+  one exception: `awayModeTurnsSideOff`'s power-off pre-step *is* a guarded `submitSide` call, so
+  a block there does map to `NOT_ALLOWED_IN_CURRENT_STATE`, same as `ThermostatService`.
+- **The ordering hazard this change closes** (`src/pod/writeQueue.ts`'s "Drain-before-decide"):
+  the first real `submitSettings({awayMode})` caller exposed a race between the settings lane's
+  overlay-at-submission behavior and a concurrently-pending side write's away-mode decision —
+  closed by draining any pending/queued `awayMode`-touching settings write to full settlement,
+  inline, before a side lane ever consults `awayModeGuard.decide()`. See that module's own doc
+  for the full mechanism and why draining inline (not merely awaiting) avoids deadlock.
+
 ## Other service choices
 
 | Signal | Service | Why |
@@ -258,6 +297,8 @@ routinely miss the entire alarm.**
 | LED | `Lightbulb` + `Brightness` (default **off**) | Joins the Lights category, so "Hey Siri, turn off all the lights" hits it and it pollutes the Home tab's Lights status. Fine, but opt-in. |
 | Prime | `Switch` (default off) | Write is one-way; there is no stop command. Writing OFF should refuse. Loud, runs for minutes. |
 | Test alarm | Two per-side `Switch`es, "Test Alarm Left"/"Test Alarm Right" (default **off**) | One both-sides switch was rejected (PR #44 tech-lead ruling): a hub-level trigger firing on both sides risks vibrating a sleeping partner's side as a side effect of testing the other. Needs `force: true` since `executeAlarm` refuses when the side is off. `postAlarm`'s rejection is logged and swallowed, never surfaced to HomeKit (N4) — the switch always reports its write as having "succeeded" regardless of whether the trigger actually reached the Pod. |
+| Away Mode | Two per-side `Switch`es, "Away Mode Left"/"Away Mode Right" (default **on**) | See above. |
+| Skip Next Alarm | Two per-side `Switch`es, "Skip Next Alarm Left"/"Skip Next Alarm Right" (default **on**) | See above. |
 | Connection | `ContactSensor` (default on) | See No Response above. |
 | Server fault | `ContactSensor` (default off) | Any `/api/serverStatus` subsystem `=== 'failed'`. |
 | Heart rate / HRV / breathing | **nothing in v1** | See below. |

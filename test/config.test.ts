@@ -663,6 +663,68 @@ describe('FreeSleepConfigSchema — pollIntervals.alarmPollIntervalMs is consume
   });
 });
 
+// ---------------------------------------------------------------------------------------
+// settings-switches (#17/#18, tech-lead resolution 3): awayModeSwitch, skipAlarmSwitch,
+// awayModeTurnsSideOff (tasks.md 3.1)
+// ---------------------------------------------------------------------------------------
+
+const SWITCH_ENABLE_KEYS = ['awayModeSwitch', 'skipAlarmSwitch'] as const;
+
+describe('FreeSleepConfigSchema — awayModeSwitch / skipAlarmSwitch (settings-switches)', () => {
+  it('both default to true when omitted', () => {
+    const result = FreeSleepConfigSchema.safeParse({ host: 'pod.local' });
+    expect(result.success).toBe(true);
+    if (!result.success) return;
+    for (const key of SWITCH_ENABLE_KEYS) {
+      expect(result.data[key]).toBe(true);
+    }
+  });
+
+  it.each(SWITCH_ENABLE_KEYS)('%s can be independently disabled, leaving the other at its default true', (key) => {
+    const result = FreeSleepConfigSchema.safeParse({ host: 'pod.local', [key]: false });
+    expect(result.success).toBe(true);
+    if (!result.success) return;
+    for (const otherKey of SWITCH_ENABLE_KEYS) {
+      expect(result.data[otherKey]).toBe(otherKey !== key);
+    }
+  });
+
+  it.each(SWITCH_ENABLE_KEYS)('rejects a non-boolean %s, naming that key', (key) => {
+    const result = FreeSleepConfigSchema.safeParse({ host: 'pod.local', [key]: 'yes' });
+    expect(result.success).toBe(false);
+    if (!result.success) {
+      expect(result.error.issues.some((issue) => issue.path.join('.') === key)).toBe(true);
+    }
+  });
+});
+
+describe('FreeSleepConfigSchema — awayModeTurnsSideOff (settings-switches)', () => {
+  it('defaults to false when omitted', () => {
+    const result = FreeSleepConfigSchema.safeParse({ host: 'pod.local' });
+    expect(result.success).toBe(true);
+    if (result.success) {
+      expect(result.data.awayModeTurnsSideOff).toBe(false);
+    }
+  });
+
+  it('parses an explicit true unchanged, independent of awayModeSwitch', () => {
+    const result = FreeSleepConfigSchema.safeParse({ host: 'pod.local', awayModeTurnsSideOff: true, awayModeSwitch: false });
+    expect(result.success).toBe(true);
+    if (result.success) {
+      expect(result.data.awayModeTurnsSideOff).toBe(true);
+      expect(result.data.awayModeSwitch).toBe(false);
+    }
+  });
+
+  it('rejects a non-boolean value, naming the key', () => {
+    const result = FreeSleepConfigSchema.safeParse({ host: 'pod.local', awayModeTurnsSideOff: 'yes' });
+    expect(result.success).toBe(false);
+    if (!result.success) {
+      expect(result.error.issues.some((issue) => issue.path.join('.') === 'awayModeTurnsSideOff')).toBe(true);
+    }
+  });
+});
+
 describe('unrecognizedConfigKeys', () => {
   it('ignores Homebridge-injected keys and schema-defined keys', () => {
     expect(

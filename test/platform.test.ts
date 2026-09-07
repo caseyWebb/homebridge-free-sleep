@@ -253,10 +253,13 @@ describe('fresh install, sides: both', () => {
       } else {
         // alarm-events: a side accessory also carries its alarm programmable switch and its
         // dismiss switch by default (`alarmEvents: true` — tech-lead resolution 2).
-        expect(nonInfoServices).toHaveLength(3);
+        // settings-switches: plus its Away Mode and Skip Next Alarm switches, also default true
+        // (tech-lead resolution 3) — three `Switch`-typed services in total (dismiss, away mode,
+        // skip next alarm), distinguished by subtype.
+        expect(nonInfoServices).toHaveLength(5);
         expect(nonInfoServices.some((s) => s.UUID === api.hap.Service.Thermostat.UUID)).toBe(true);
         expect(nonInfoServices.some((s) => s.UUID === api.hap.Service.StatelessProgrammableSwitch.UUID)).toBe(true);
-        expect(nonInfoServices.filter((s) => s.UUID === api.hap.Service.Switch.UUID)).toHaveLength(1);
+        expect(nonInfoServices.filter((s) => s.UUID === api.hap.Service.Switch.UUID)).toHaveLength(3);
       }
     }
   });
