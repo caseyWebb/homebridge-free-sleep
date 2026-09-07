@@ -66,6 +66,7 @@ function contextFor(setupResult: Setup, config: Record<string, unknown> = {}): S
     awayModeGuard,
     timers: setupResult.timers,
     config: baseConfig(config),
+    podClient: fake.client,
   };
 }
 

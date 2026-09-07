@@ -30,6 +30,7 @@ import {
   type DeviceStatus,
   type PresenceData,
   type Schedules,
+  type ServerStatus,
   type Services,
   type Settings,
   type Side,
@@ -125,11 +126,19 @@ interface RawState {
   settings: Settings | undefined;
   schedules: Schedules | undefined;
   services: Services | undefined;
+  serverStatus: ServerStatus | undefined;
   /** Occupancy change (#19). */
   presence: PresenceData | undefined;
   /** Occupancy change (#19). */
   vitals: VitalsResponse | undefined;
   connection: ConnectionState;
+  /**
+   * Reachability of the subsystem-health (`GET /api/serverStatus`) poll, tracked independently
+   * of `connection` (which stays device-status-specific) — `hub-accessory` design.md's Decision
+   * 7 and the modified pod-snapshot spec's "Subsystem-health reachability" requirement: a poll
+   * of one endpoint failing must not be reported as a failure of the other.
+   */
+  serverStatusConnection: ConnectionState;
 }
 
 function initialRawState(): RawState {
@@ -138,9 +147,11 @@ function initialRawState(): RawState {
     settings: undefined,
     schedules: undefined,
     services: undefined,
+    serverStatus: undefined,
     presence: undefined,
     vitals: undefined,
     connection: initialConnectionState,
+    serverStatusConnection: initialConnectionState,
   };
 }
 
@@ -222,6 +233,7 @@ export interface EffectiveDocuments {
   settings: Settings | undefined;
   schedules: Schedules | undefined;
   services: Services | undefined;
+  serverStatus: ServerStatus | undefined;
   /** Occupancy change (#19). Readable, not watched — mirrors `schedules`/`services`. */
   presence: PresenceData | undefined;
   /** Occupancy change (#19). Readable, not watched — mirrors `schedules`/`services`. */
@@ -233,7 +245,17 @@ export interface EffectiveSnapshot {
   right: EffectiveSideStatus;
   waterLevelState: WaterLevel | undefined;
   isPriming: boolean | undefined;
+  /**
+   * Derived as "any subsystem in `documents.serverStatus` has `status === 'failed'`", `false`
+   * when `serverStatus` has never been observed (`hub-accessory` design.md's Decision 7). This is
+   * the payload signal; `serverStatusConnection` below is the independent reachability signal
+   * for the poll that produces it.
+   */
+  serverFault: boolean;
   connection: ConnectionState;
+  /** Reachability of the subsystem-health poll, tracked independently of `connection` — see
+   * `RawState.serverStatusConnection`'s doc. */
+  serverStatusConnection: ConnectionState;
   documents: EffectiveDocuments;
 }
 
@@ -252,7 +274,27 @@ export type SideChangeField =
   | 'vitalsOccupied'
   | 'vitalsActive';
 
-export type DeviceChangeField = 'waterLevelState' | 'isPriming' | 'connectionOnline';
+export type DeviceChangeField =
+  | 'waterLevelState'
+  | 'isPriming'
+  | 'connectionOnline'
+  | 'serverFault'
+  /**
+   * S1 (hub-accessory PR #44 review): the `serverStatus` poll's own reachability
+   * (`serverStatusConnection.online`) was tracked in `RawState`/`EffectiveSnapshot` but never
+   * diffed as a watched field, so `ServerFaultService`'s `StatusFault`/`StatusActive` were never
+   * pushed on a reachability transition — only a `serverFault` (payload) change routed to
+   * `refresh()`. Named distinctly from `connectionOnline` (which stays `deviceStatus`-specific).
+   */
+  | 'serverStatusOnline'
+  /**
+   * S2 (hub-accessory PR #44 review): `ledBrightness` was deliberately left unwatched
+   * (design.md's Decision 2 — no *overlay* for it) but that also meant no poll-driven `refresh()`
+   * ever ran after construction, so an external brightness/on-off change (e.g. free-sleep's own
+   * web UI) never reached the "Pod LED" tile. This is a plain watched-field diff like any other
+   * device-level field, unrelated to Decision 2's overlay non-goal.
+   */
+  | 'ledBrightness';
 
 interface SideChange<F extends SideChangeField, V> {
   scope: 'side';
@@ -288,7 +330,10 @@ export type Change =
   | SideChange<'vitalsActive', boolean>
   | DeviceChange<'waterLevelState', WaterLevel>
   | DeviceChange<'isPriming', boolean>
-  | DeviceChange<'connectionOnline', boolean>;
+  | DeviceChange<'connectionOnline', boolean>
+  | DeviceChange<'serverFault', boolean>
+  | DeviceChange<'serverStatusOnline', boolean>
+  | DeviceChange<'ledBrightness', number>;
 
 export type Listener = (changes: readonly Change[]) => void;
 
@@ -416,6 +461,18 @@ export class SnapshotStore {
     });
   }
 
+  observeServerStatus(data: ServerStatus): void {
+    this.commit(() => {
+      this.raw.serverStatus = data;
+      this.raw.serverStatusConnection = {
+        online: true,
+        consecutiveFailures: 0,
+        lastSuccessAt: this.timers.now(),
+        lastErrorKind: this.raw.serverStatusConnection.lastErrorKind,
+      };
+    });
+  }
+
   /**
    * Occupancy change (#19; design.md, "Presence `StatusActive`: prove a *change* from the
    * launch baseline"). For each side with a defined entry in `data`: the *first-ever*
@@ -484,6 +541,19 @@ export class SnapshotStore {
         online: false,
         consecutiveFailures: this.raw.connection.consecutiveFailures + 1,
         lastSuccessAt: this.raw.connection.lastSuccessAt,
+        lastErrorKind: kind,
+      };
+    });
+  }
+
+  /** Tracked independently of `recordDeviceStatusFailure` — a `serverStatus` poll failure never
+   * touches `connection`, and vice versa (`hub-accessory` design.md's Decision 7). */
+  recordServerStatusFailure(kind: ErrorKind): void {
+    this.commit(() => {
+      this.raw.serverStatusConnection = {
+        online: false,
+        consecutiveFailures: this.raw.serverStatusConnection.consecutiveFailures + 1,
+        lastSuccessAt: this.raw.serverStatusConnection.lastSuccessAt,
         lastErrorKind: kind,
       };
     });
@@ -612,12 +682,15 @@ export class SnapshotStore {
       right: this.computeSide('right', overlay),
       waterLevelState: this.raw.deviceStatus ? interpretWaterLevel(this.raw.deviceStatus.waterLevel) : undefined,
       isPriming: this.raw.deviceStatus?.isPriming,
+      serverFault: computeServerFault(this.raw.serverStatus),
       connection: this.raw.connection,
+      serverStatusConnection: this.raw.serverStatusConnection,
       documents: {
         deviceStatus: this.raw.deviceStatus,
         settings: this.raw.settings,
         schedules: this.raw.schedules,
         services: this.raw.services,
+        serverStatus: this.raw.serverStatus,
         presence: this.raw.presence,
         vitals: this.raw.vitals,
       },
@@ -673,7 +746,27 @@ function diffWatched(previous: EffectiveSnapshot, current: EffectiveSnapshot): C
   pushDeviceChange(changes, 'waterLevelState', previous.waterLevelState, current.waterLevelState);
   pushDeviceChange(changes, 'isPriming', previous.isPriming, current.isPriming);
   pushDeviceChange(changes, 'connectionOnline', previous.connection.online, current.connection.online);
+  pushDeviceChange(changes, 'serverFault', previous.serverFault, current.serverFault);
+  // S1 fix: reachability of the serverStatus poll itself, independent of the payload signal above.
+  pushDeviceChange(changes, 'serverStatusOnline', previous.serverStatusConnection.online, current.serverStatusConnection.online);
+  // S2 fix: an externally-changed LED brightness/on-off must reach the "Pod LED" tile too, not
+  // just this plugin's own writes (which the write queue's fast-poll acceleration already covers).
+  pushDeviceChange(
+    changes,
+    'ledBrightness',
+    previous.documents.deviceStatus?.settings.ledBrightness,
+    current.documents.deviceStatus?.settings.ledBrightness,
+  );
   return changes;
+}
+
+/** "Any subsystem reports `'failed'`" (`hub-accessory` design.md's Decision 7) — `false` when
+ * `serverStatus` has never been observed. Isolated as its own function per design.md's Open
+ * Question 2, so a future narrowing of which statuses count as a fault (e.g. treating
+ * `'retrying'` the same as `'failed'`) is a one-function change. */
+function computeServerFault(serverStatus: ServerStatus | undefined): boolean {
+  if (!serverStatus) return false;
+  return Object.values(serverStatus).some((info) => info?.status === 'failed');
 }
 
 function pushSideChange<F extends SideChangeField, V extends number | boolean>(

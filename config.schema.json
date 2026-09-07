@@ -2,7 +2,7 @@
   "pluginAlias": "FreeSleep",
   "pluginType": "platform",
   "singular": true,
-  "headerDisplay": "Exposes an Eight Sleep Pod running the free-sleep firmware to Apple HomeKit. `host` is the only field most installs need. `sides`, the poll/write timing overrides, the No Response delay, keep-alive, and the occupancy source are live; the remaining fields are reserved for a future release and have no effect yet.",
+  "headerDisplay": "Exposes an Eight Sleep Pod running the free-sleep firmware to Apple HomeKit. `host` is the only field most installs need. `sides`, the poll/write timing overrides, the No Response delay, keep-alive, the occupancy source, the water-low sensor type, and the four hub-service toggles (prime, LED, test alarm, server fault) are live; the remaining fields are reserved for a future release and have no effect yet.",
   "schema": {
     "type": "object",
     "properties": {
@@ -71,6 +71,11 @@
             "title": "Bootstrap deadline (ms)",
             "type": "integer",
             "minimum": 1000
+          },
+          "deviceWriteDebounceMs": {
+            "title": "Device-lane write debounce (ms) — governs the Pod LED's brightness-drag coalescing specifically; other writes use the write debounce above",
+            "type": "integer",
+            "minimum": 500
           }
         }
       },
@@ -99,7 +104,7 @@
         "description": "Publishes an OccupancySensor per side, driven by the chosen source. 'None' (default) publishes no sensor. Both sources require biometrics enabled on the Pod; StatusActive reports inactive until the source has proven itself live, so an occupancy sensor is never confidently, permanently wrong."
       },
       "waterLowSensorType": {
-        "title": "Water-low sensor type (reserved, no effect yet)",
+        "title": "Water-low sensor type — the hub always publishes a water-low sensor; this chooses which HomeKit service type represents it",
         "type": "string",
         "default": "contact",
         "oneOf": [
@@ -135,6 +140,30 @@
           { "title": "Mirror", "enum": ["mirror"] },
           { "title": "Block", "enum": ["block"] }
         ]
+      },
+      "primeSwitch": {
+        "title": "Pod Prime switch",
+        "type": "boolean",
+        "default": false,
+        "description": "Publishes a hub switch that starts a prime cycle when turned on. The Pod has no stop command, so turning it off is refused rather than sent. Off by default — priming is loud and runs for minutes."
+      },
+      "ledLightbulb": {
+        "title": "Pod LED lightbulb",
+        "type": "boolean",
+        "default": false,
+        "description": "Publishes a hub lightbulb controlling the Pod's LED brightness. Every write re-posts the Pod's full device-settings object, debounced by the device-lane write debounce below (minimum 500ms) — a brightness drag can take up to roughly the fast-poll window (default ~5s) to visibly settle in the Home app, since this field has no optimistic feedback. Off by default."
+      },
+      "testAlarmSwitch": {
+        "title": "Pod Test Alarm switches",
+        "type": "boolean",
+        "default": false,
+        "description": "Publishes two momentary hub switches, Test Alarm Left and Test Alarm Right, that each manually trigger the Pod's alarm vibration for that side only, overriding away mode and power state. Each tile self-resets to off after about a second regardless of outcome; the physical vibration itself lasts at least 10 seconds. Off by default."
+      },
+      "serverFaultSensor": {
+        "title": "Pod Server Fault sensor",
+        "type": "boolean",
+        "default": false,
+        "description": "Publishes a hub sensor reflecting the Pod's own self-reported subsystem health. Polled on the slow cadence, only while enabled — the endpoint is not free. Off by default."
       }
     },
     "required": ["host"]

@@ -90,10 +90,108 @@ describe('write queue: lanes and per-submission promises (7.1)', () => {
     const { queue, fake } = setup();
     const pDevice = queue.submitDeviceSettings({ ledBrightness: 40 });
     const pSettings = queue.submitSettings({ primePodDaily: { enabled: false } });
-    await vi.advanceTimersByTimeAsync(400);
+    // The device lane's own debounce (default 500ms, hub-accessory design.md's Decision 4) is
+    // stricter than the shared 400ms default every other lane still uses.
+    await vi.advanceTimersByTimeAsync(500);
     await Promise.all([pDevice, pSettings]);
-    expect(fake.postDeviceStatusCalls).toEqual([{ settings: { ledBrightness: 40 } }]);
+    // S4 fix (PR #44 review): a partial device-settings submission is backfilled at dispatch time
+    // from the currently-observed `deviceStatus.settings` (`deviceStatusFixture`'s own
+    // `{v:1, gainLeft:400, gainRight:400}`) — see the dedicated "S4" describe block below for the
+    // fresh-vs-stale-gain regression this backfill exists to fix.
+    expect(fake.postDeviceStatusCalls).toEqual([{ settings: { v: 1, gainLeft: 400, gainRight: 400, ledBrightness: 40 } }]);
     expect(fake.postSettingsCalls).toEqual([{ primePodDaily: { enabled: false } }]);
+    queue.stop();
+  });
+});
+
+// ---------------------------------------------------------------------------------------
+// hub-accessory: device-lane widening (tasks.md 2.1, 2.2, 2.3)
+// ---------------------------------------------------------------------------------------
+
+describe('write queue: device-lane widening carries isPriming alongside settings fields (2.1)', () => {
+  it('a device-lane submission carrying only isPriming dispatches {isPriming: true} with no settings key', async () => {
+    const { queue, fake } = setup();
+    const p = queue.submitDeviceSettings({ isPriming: true });
+    await vi.advanceTimersByTimeAsync(500);
+    await p;
+    expect(fake.postDeviceStatusCalls).toEqual([{ isPriming: true }]);
+    queue.stop();
+  });
+
+  it('a device-lane submission carrying only ledBrightness dispatches {settings: {...backfilled, ledBrightness: N}} with no isPriming key', async () => {
+    const { queue, fake } = setup();
+    const p = queue.submitDeviceSettings({ ledBrightness: 55 });
+    await vi.advanceTimersByTimeAsync(500);
+    await p;
+    // S4 fix: backfilled from the observed deviceStatus (`v`/`gainLeft`/`gainRight`), not a bare
+    // partial — see design.md's Decision 5 and the dedicated "S4" describe block below.
+    expect(fake.postDeviceStatusCalls).toEqual([{ settings: { v: 1, gainLeft: 400, gainRight: 400, ledBrightness: 55 } }]);
+    queue.stop();
+  });
+});
+
+describe('write queue: a priming trigger and a device-settings write merge on the same lane (2.2)', () => {
+  it('both fields submitted within the debounce window dispatch as one request carrying both', async () => {
+    const { queue, fake } = setup();
+    const p1 = queue.submitDeviceSettings({ isPriming: true });
+    await vi.advanceTimersByTimeAsync(100);
+    const p2 = queue.submitDeviceSettings({ ledBrightness: 70 });
+    await vi.advanceTimersByTimeAsync(500);
+    await Promise.all([p1, p2]);
+    expect(fake.postDeviceStatusCalls).toEqual([
+      { isPriming: true, settings: { v: 1, gainLeft: 400, gainRight: 400, ledBrightness: 70 } },
+    ]);
+    queue.stop();
+  });
+});
+
+describe('write queue: the device-lane debounce is independently configurable (2.3)', () => {
+  it('a device-lane write submitted twice 450ms apart (below the 500ms device default, above the 400ms shared default) is still merged into one dispatch', async () => {
+    const { queue, fake } = setup();
+    const p1 = queue.submitDeviceSettings({ ledBrightness: 10 });
+    await vi.advanceTimersByTimeAsync(450);
+    const p2 = queue.submitDeviceSettings({ ledBrightness: 20 });
+    await vi.advanceTimersByTimeAsync(500);
+    await Promise.all([p1, p2]);
+    expect(fake.postDeviceStatusCalls).toEqual([{ settings: { v: 1, gainLeft: 400, gainRight: 400, ledBrightness: 20 } }]);
+    queue.stop();
+  });
+
+  it('an equivalent side-lane write at the same 450ms spacing already flushes under the shared 400ms default — the two lanes demonstrably use different debounce windows', async () => {
+    const { queue, fake } = setup();
+    const p1 = queue.submitSide('left', { targetTemperatureF: 65 });
+    await vi.advanceTimersByTimeAsync(450); // already past the shared 400ms default
+    await p1;
+    expect(fake.postDeviceStatusCalls).toEqual([{ left: { targetTemperatureF: 65 } }]);
+    const p2 = queue.submitSide('left', { targetTemperatureF: 70 });
+    await vi.advanceTimersByTimeAsync(400);
+    await p2;
+    expect(fake.postDeviceStatusCalls).toEqual([
+      { left: { targetTemperatureF: 65 } },
+      { left: { targetTemperatureF: 70 } },
+    ]);
+    queue.stop();
+  });
+
+  it('a configured deviceWriteDebounceMs above 500 is honored', async () => {
+    const { queue, fake } = setup({ deviceWriteDebounceMs: 800 });
+    const p = queue.submitDeviceSettings({ ledBrightness: 30 });
+    await vi.advanceTimersByTimeAsync(700);
+    expect(fake.postDeviceStatusCalls).toHaveLength(0);
+    await vi.advanceTimersByTimeAsync(100);
+    await p;
+    expect(fake.postDeviceStatusCalls).toEqual([{ settings: { v: 1, gainLeft: 400, gainRight: 400, ledBrightness: 30 } }]);
+    queue.stop();
+  });
+
+  it('a configured deviceWriteDebounceMs below the 500ms floor is clamped to the floor', async () => {
+    const { queue, fake } = setup({ deviceWriteDebounceMs: 100 });
+    const p = queue.submitDeviceSettings({ ledBrightness: 30 });
+    await vi.advanceTimersByTimeAsync(499);
+    expect(fake.postDeviceStatusCalls).toHaveLength(0);
+    await vi.advanceTimersByTimeAsync(1);
+    await p;
+    expect(fake.postDeviceStatusCalls).toEqual([{ settings: { v: 1, gainLeft: 400, gainRight: 400, ledBrightness: 30 } }]);
     queue.stop();
   });
 });
@@ -485,7 +583,7 @@ describe('write queue: fast poll is lane-aware (S2 regression)', () => {
   it('a device-lane write requests the deviceStatus lane', async () => {
     const { queue, fastPollRequests } = setup();
     const p = queue.submitDeviceSettings({ ledBrightness: 40 });
-    await vi.advanceTimersByTimeAsync(400);
+    await vi.advanceTimersByTimeAsync(500);
     await p;
     expect(fastPollRequests).toHaveLength(1);
     expect(fastPollRequests[0]!.lane).toBe('deviceStatus');
@@ -848,5 +946,92 @@ describe('write queue: user-intent priority (10, keep-alive tech-lead resolution
     } finally {
       await pod.close();
     }
+  });
+});
+
+// ---------------------------------------------------------------------------------------
+// S4 (hub-accessory PR #44 review): a bounded pre-dispatch refresh keeps the device-lane's
+// read-modify-write from clobbering an externally-changed gain with a stale cached one.
+// ---------------------------------------------------------------------------------------
+
+describe('write queue: a pre-dispatch refresh keeps device-lane gains fresh (S4 fix)', () => {
+  it('awaits refreshDeviceStatus before dispatching, and the dispatched settings carry the freshly observed gain, not the value cached at submission time', async () => {
+    const timers = createTimerHarness();
+    const snapshot = new SnapshotStore({ timers });
+    // Submission-time cache: gainLeft is 400.
+    snapshot.observeDeviceStatus(structuredClone(deviceStatusFixture));
+    const fake = createFakePodClient({
+      deviceStatus: deviceStatusFixture,
+      settings: settingsFixture,
+      schedules: schedulesFixture,
+      services: servicesFixture,
+    });
+    let refreshCalls = 0;
+    const queue = new WriteQueue({
+      client: fake.client,
+      snapshot,
+      requestFastPoll: () => {},
+      timers,
+      refreshDeviceStatus: () => {
+        refreshCalls += 1;
+        // Simulates the poller's own bounded GET landing: gainLeft has since been changed
+        // externally (e.g. free-sleep's own web UI), independent of this plugin's write.
+        snapshot.observeDeviceStatus({
+          ...structuredClone(deviceStatusFixture),
+          settings: { ...deviceStatusFixture.settings, gainLeft: 999 },
+        });
+        return Promise.resolve();
+      },
+    });
+
+    const p = queue.submitDeviceSettings({ ledBrightness: 55 }); // the field this write actually changes
+    await vi.advanceTimersByTimeAsync(500);
+    await p;
+
+    expect(refreshCalls).toBe(1);
+    expect(fake.postDeviceStatusCalls).toEqual([
+      { settings: { v: 1, gainLeft: 999, gainRight: 400, ledBrightness: 55 } }, // fresh gainLeft, not the stale 400
+    ]);
+    queue.stop();
+  });
+
+  it('an isPriming-only dispatch never calls refreshDeviceStatus — nothing on that lane needs fresh gains', async () => {
+    const timers = createTimerHarness();
+    const snapshot = new SnapshotStore({ timers });
+    snapshot.observeDeviceStatus(structuredClone(deviceStatusFixture));
+    const fake = createFakePodClient({
+      deviceStatus: deviceStatusFixture,
+      settings: settingsFixture,
+      schedules: schedulesFixture,
+      services: servicesFixture,
+    });
+    let refreshCalls = 0;
+    const queue = new WriteQueue({
+      client: fake.client,
+      snapshot,
+      requestFastPoll: () => {},
+      timers,
+      refreshDeviceStatus: () => {
+        refreshCalls += 1;
+        return Promise.resolve();
+      },
+    });
+
+    const p = queue.submitDeviceSettings({ isPriming: true });
+    await vi.advanceTimersByTimeAsync(500);
+    await p;
+
+    expect(refreshCalls).toBe(0);
+    expect(fake.postDeviceStatusCalls).toEqual([{ isPriming: true }]);
+    queue.stop();
+  });
+
+  it('omitting refreshDeviceStatus entirely (no poller wired) falls back to whatever the snapshot already holds — every existing caller is unaffected', async () => {
+    const { queue, fake } = setup();
+    const p = queue.submitDeviceSettings({ ledBrightness: 55 });
+    await vi.advanceTimersByTimeAsync(500);
+    await p;
+    expect(fake.postDeviceStatusCalls).toEqual([{ settings: { v: 1, gainLeft: 400, gainRight: 400, ledBrightness: 55 } }]);
+    queue.stop();
   });
 });

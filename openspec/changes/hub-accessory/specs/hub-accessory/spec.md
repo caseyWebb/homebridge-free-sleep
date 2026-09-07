@@ -88,6 +88,16 @@ have finished, independently of how promptly the write that triggered it is conf
 - **THEN** the switch reports on once the start is observed, and off once the finish is
   observed
 
+#### Scenario: An unconfirmed prime-on write self-corrects within a bounded interval (S3, PR #44 review)
+
+- **WHEN** the prime switch is written on, and no subsequent observation within a bounded
+  interval after that write settles shows the Pod actually priming
+- **THEN** the switch's reported state is corrected back to off within that bounded interval,
+  without a further characteristic write from any controller
+- **WHEN** instead a subsequent observation within that same bounded interval does show the
+  Pod actually priming
+- **THEN** the switch's reported state remains on
+
 ### Requirement: Turning the prime switch off is refused, because the Pod has no way to stop a prime in progress
 
 The system SHALL NOT send any request to the Pod as a result of the prime switch being
@@ -120,9 +130,18 @@ Pod currently reports, so that no other device setting is ever altered as a side
 LED write.
 
 Turning the lightbulb on with no explicit brightness in the same write SHALL restore the
-most recent nonzero brightness this plugin has itself written, defaulting to full brightness
-if none has been written yet this accessory's lifetime. Turning the lightbulb off SHALL set
-the brightness to zero.
+most recent nonzero brightness observed for it — whether that value was most recently set by
+this plugin's own write or observed to have been changed some other way (**revised, N3, PR #44
+review** — originally only a value this plugin had itself written; a value changed externally,
+e.g. through free-sleep's own web UI, and then turned off through this plugin, was not
+restored) — defaulting to full brightness if no nonzero brightness has ever been observed this
+accessory's lifetime. Turning the lightbulb off SHALL set the brightness to zero.
+
+The external, currently-observed value used above and by the "every other device setting"
+guarantee above it SHALL be as freshly observed as a bounded pre-dispatch refresh can make it,
+per `pod-write-queue`'s own added requirement (S4, PR #44 review) — not necessarily the value
+that was current when the write was first made, since the two can differ by however long the
+write sat in its own debounce window.
 
 #### Scenario: Disabled by default
 
@@ -141,6 +160,15 @@ the brightness to zero.
   plugin, and is then turned on without a brightness accompanying that write
 - **THEN** the brightness sent to the Pod is that most recent nonzero value
 
+#### Scenario: An externally-changed brightness survives an off/on cycle through this plugin (N3, PR #44 review)
+
+- **WHEN** the lightbulb's brightness is changed to a nonzero value by something other than
+  this plugin, is then turned off through this plugin, and is then turned on again without a
+  brightness accompanying that write
+- **THEN** the brightness sent to the Pod is the externally-set value observed just before the
+  off-write, not a value this plugin had itself previously written (or the full-brightness
+  default, if this plugin had never itself written a nonzero brightness before)
+
 #### Scenario: Turning on for the first time with no prior brightness defaults to full
 
 - **WHEN** the lightbulb is turned on without an accompanying brightness, and this plugin has
@@ -152,35 +180,41 @@ the brightness to zero.
 - **WHEN** the lightbulb is turned off
 - **THEN** the brightness sent to the Pod is zero
 
-### Requirement: A test-alarm switch is published only when configured, is momentary, and self-resets independently of the trigger's outcome
+### Requirement: Two per-side test-alarm switches are published only when configured, are momentary, and each self-resets independently of its own trigger's outcome
 
-The hub accessory SHALL publish a momentary switch that manually triggers the Pod's alarm
-vibration only when a dedicated configuration value enables it; the default SHALL be
-disabled.
+**Revised (G0, tech-lead ruling, PR #44 review):** the hub accessory SHALL publish two
+independent momentary switches, one per side, that each manually trigger the Pod's alarm
+vibration for that side only, when a single dedicated configuration value enables them; the
+default SHALL be disabled for both. (A single both-sides switch was rejected: a hub-level
+trigger firing on both sides risks vibrating a sleeping partner's side as a side effect of
+testing the other — a config toggle cannot mitigate that risk, only removing the both-sides
+behavior can.)
 
-Writing the switch on SHALL send an immediate alarm trigger to the Pod, overriding the Pod's
-own away-mode and power-state refusal so that the trigger fires regardless of either side's
-current state. Approximately one second after being written on, the switch SHALL report off
-again, regardless of whether the triggering request succeeded, failed, or is still
-outstanding.
+Writing either switch on SHALL send an immediate alarm trigger to the Pod for that switch's own
+side only, overriding the Pod's own away-mode and power-state refusal so that the trigger fires
+regardless of that side's current state, and SHALL NOT trigger the other side. Approximately one
+second after being written on, that switch SHALL report off again, regardless of whether the
+triggering request succeeded, failed, or is still outstanding; the other side's switch is
+unaffected.
 
 #### Scenario: Disabled by default
 
 - **WHEN** the platform starts with no test-alarm configuration value set
-- **THEN** the hub accessory carries no test-alarm switch
+- **THEN** the hub accessory carries neither test-alarm switch
 
-#### Scenario: Turning the switch on sends an overriding trigger
+#### Scenario: Turning one side's switch on sends an overriding trigger to that side only
 
-- **WHEN** the test-alarm switch is enabled and written on
-- **THEN** an alarm trigger is sent to the Pod that is not refused by the addressed side being
-  off or in away mode
+- **WHEN** the test-alarm switches are enabled and one side's switch is written on
+- **THEN** an alarm trigger is sent to the Pod for that side only, not refused by that side
+  being off or in away mode, and no trigger is sent for the other side
 
-#### Scenario: The switch self-resets on the same short timeline regardless of outcome
+#### Scenario: Each switch self-resets on the same short timeline regardless of outcome
 
-- **WHEN** the test-alarm switch is written on, and separately, on another occasion, the
+- **WHEN** a side's test-alarm switch is written on, and separately, on another occasion, the
   triggering request fails
-- **THEN** in both cases the switch reports off again after approximately one second, with no
-  characteristic write required to bring that about
+- **THEN** in both cases that switch reports off again after approximately one second, with no
+  characteristic write required to bring that about, and the other side's switch is unaffected
+  either way
 
 ### Requirement: A server-fault sensor is published only when configured, and reports the Pod's self-reported subsystem health
 
@@ -217,3 +251,11 @@ without altering — its most recently observed fault-detected state.
   last successfully observed report showed no subsystem failure
 - **THEN** the sensor continues reporting no fault detected while additionally reporting a
   status fault, rather than reporting a fault-detected state it has no evidence for
+
+#### Scenario: A reachability transition promptly updates the sensor's status characteristics (S1, PR #44 review)
+
+- **WHEN** the plugin's attempt to observe subsystem health transitions from succeeding to
+  failing, or from failing to succeeding
+- **THEN** the sensor's status-fault and status-active characteristics are pushed promptly to
+  reflect that transition, not merely the next time some other field of this sensor happens to
+  change

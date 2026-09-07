@@ -20,6 +20,7 @@ const deviceStatusFixture = loadFixture('deviceStatus.json');
 const settingsFixture = loadFixture('settings.json');
 const schedulesFixture = loadFixture('schedules.json');
 const servicesFixture = loadFixture('services.json');
+const serverStatusFixture = loadFixture('serverStatus.json');
 
 let pods: MockPod[] = [];
 
@@ -47,6 +48,12 @@ describe('client shell and reads (6.2)', () => {
     expect(await client.getSettings()).toEqual(settingsFixture);
     expect(await client.getSchedules()).toEqual(schedulesFixture);
     expect(await client.getServices()).toEqual(servicesFixture);
+  });
+
+  it('getServerStatus deep-equals its fixture (hub-accessory, 3.1)', async () => {
+    const pod = await start();
+    const client = clientFor(pod);
+    expect(await client.getServerStatus()).toEqual(serverStatusFixture);
   });
 
   it('a malformed response body raises PodResponseError naming the property path', async () => {
@@ -458,6 +465,89 @@ describe('pre-flight rejection of isOn + secondsRemaining (6.9)', () => {
     ).resolves.toBeUndefined();
   });
 });
+
+describe('postAlarm never retries (hub-accessory, 3.2)', () => {
+  const validAlarm = {
+    side: 'left' as const,
+    vibrationIntensity: 60,
+    vibrationPattern: 'double' as const,
+    duration: 10,
+    force: true,
+  };
+
+  it('a successful trigger sends exactly one request', async () => {
+    const pod = await start();
+    const client = clientFor(pod);
+    await client.postAlarm(validAlarm);
+    expect(pod.requests.filter((r) => r.path === '/api/alarm')).toHaveLength(1);
+  });
+
+  it('a network error or 5xx from the alarm endpoint results in exactly one request and an immediate rejection', async () => {
+    const pod = await start();
+    pod.fault('POST /api/alarm', { kind: 'status', status: 500, times: 1 });
+    const client = clientFor(pod);
+    await expect(client.postAlarm(validAlarm)).rejects.toThrow(PodHttpError);
+    expect(pod.requests.filter((r) => r.path === '/api/alarm')).toHaveLength(1);
+  });
+
+  it('a reset (network-level error) from the alarm endpoint results in exactly one request and an immediate rejection', async () => {
+    const pod = await start();
+    pod.fault('POST /api/alarm', { kind: 'reset', times: 1 });
+    const client = clientFor(pod);
+    await expect(client.postAlarm(validAlarm)).rejects.toThrow(PodNetworkError);
+    expect(pod.requests.filter((r) => r.path === '/api/alarm')).toHaveLength(1);
+  });
+
+  it('regression-proofing: an identical fault against postSettings still retries once', async () => {
+    const pod = await start();
+    pod.fault('POST /api/settings', { kind: 'status', status: 500, times: 1 });
+    const client = clientFor(pod);
+    await expect(client.postSettings({ left: { awayMode: false } })).resolves.toBeUndefined();
+    expect(pod.requests.filter((r) => r.path === '/api/settings')).toHaveLength(2);
+  });
+
+  it('an invalid trigger is rejected locally, with no request made', async () => {
+    const pod = await start();
+    const client = clientFor(pod);
+    await expect(
+      client.postAlarm({ ...validAlarm, vibrationIntensity: 0 }),
+    ).rejects.toThrow(PodRequestError);
+    expect(pod.requests).toHaveLength(0);
+  });
+});
+
+describe('postAlarm is still serialized per-endpoint (hub-accessory, 3.3)', () => {
+  it('two concurrent alarm triggers are observed one after another, never overlapping', async () => {
+    const pod = await start();
+    const client = clientFor(pod);
+
+    let inFlight = 0;
+    let maxInFlight = 0;
+    const realFetch = globalThis.fetch;
+    globalThis.fetch = (async (...args: Parameters<typeof fetch>) => {
+      inFlight += 1;
+      maxInFlight = Math.max(maxInFlight, inFlight);
+      try {
+        return await realFetch(...args);
+      } finally {
+        inFlight -= 1;
+      }
+    }) as typeof fetch;
+
+    try {
+      await Promise.all([client.postAlarm(validAlarmFor('left')), client.postAlarm(validAlarmFor('right'))]);
+    } finally {
+      globalThis.fetch = realFetch;
+    }
+
+    expect(maxInFlight).toBe(1);
+    expect(pod.requests.filter((r) => r.path === '/api/alarm')).toHaveLength(2);
+  });
+});
+
+function validAlarmFor(side: 'left' | 'right') {
+  return { side, vibrationIntensity: 60, vibrationPattern: 'double' as const, duration: 10, force: true };
+}
 
 describe('presence and vitals reads (occupancy change, #19, tasks.md 3.1/3.2)', () => {
   it('getPresence resolves with the seeded fixture', async () => {

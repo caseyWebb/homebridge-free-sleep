@@ -58,3 +58,37 @@ given a stricter debounce without changing the responsiveness of a side write.
   the side lanes' shared debounce interval
 - **THEN** a device-wide-lane write is held for the device-wide lane's own configured
   interval, and a side write's debounce timing is unaffected
+
+## ADDED Requirements
+
+### Requirement: The device-wide lane's settings sub-object is backfilled from a freshly-refreshed observation immediately before dispatch (S4, PR #44 review)
+
+A caller submitting a device-settings field on the device-wide lane SHALL NOT need to supply
+every field of the settings sub-object itself to avoid a partial write silently dropping the
+fields it omits. Immediately before dispatching a device-wide-lane write that carries any
+settings sub-object field, the queue SHALL first attempt a bounded refresh of the
+device-status observation, then merge the currently-observed settings sub-object with the
+fields this write cycle explicitly supplied — the explicitly-supplied fields SHALL take
+precedence over the observed ones for the same field.
+
+This narrows, but does not eliminate, a race in which a settings sub-object field is changed
+by something other than this plugin between the observation this write merges against and the
+write actually reaching the Pod.
+
+#### Scenario: A caller supplying only the field it changes gets the other fields backfilled
+
+- **WHEN** a device-wide-lane write supplies only one settings sub-object field
+- **THEN** the dispatched request's settings sub-object carries that field's new value
+  together with the other settings sub-object fields from the current observation, unaltered
+
+#### Scenario: A freshly-observed value, not a value cached before dispatch, is used for the fields a write does not supply
+
+- **WHEN** a settings sub-object field this write does not itself supply changes, due to the
+  bounded pre-dispatch refresh, between this write's submission and its dispatch
+- **THEN** the dispatched request carries the freshly-observed value for that field, not the
+  value that was current at submission time
+
+#### Scenario: A device-wide-lane write carrying no settings sub-object field never triggers the refresh
+
+- **WHEN** a device-wide-lane write carries only the priming-trigger field
+- **THEN** no pre-dispatch refresh attempt is made for that write

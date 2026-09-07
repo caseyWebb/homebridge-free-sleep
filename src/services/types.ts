@@ -16,6 +16,13 @@
 import type { API, Logging, PlatformAccessory } from 'homebridge';
 
 import type { FreeSleepConfig } from '../config.ts';
+// TODO(N5, hub-accessory PR #44 review): this is a type-only import cycle with `platform.ts`
+// (which imports `ServiceContext` from this module) — erased at build time so it costs nothing
+// at runtime, but is nonetheless worth untangling by moving `MinimalPodClient` to its own module
+// or into `pod/client.ts`. Deliberately deferred out of this pass: a concurrent occupancy PR
+// touches both `platform.ts` and `services/types.ts`, and restructuring module boundaries here
+// at the same time would conflict with it for no behavioral gain.
+import type { MinimalPodClient } from '../platform.ts';
 import type { AwayModeGuard } from '../pod/awayModeGuard.ts';
 import type { SnapshotStore, TimerApi } from '../pod/snapshot.ts';
 import type { WriteQueue } from '../pod/writeQueue.ts';
@@ -26,6 +33,13 @@ export interface ServiceContext {
   readonly accessory: PlatformAccessory;
   readonly snapshot: SnapshotStore;
   readonly writeQueue: WriteQueue;
+  /**
+   * The platform's own injected/real Pod client — needed by any service that calls the client
+   * directly rather than solely through `writeQueue`/`snapshot` (`hub-accessory`'s
+   * `TestAlarmService` is the first: `postAlarm` is a one-off fire-and-forget write, not a
+   * debounced/merged field this queue's lane model fits).
+   */
+  readonly podClient: MinimalPodClient;
   /**
    * The same instance `writeQueue` itself consults on every side-lane dispatch (away-mode-guard
    * change, tech-lead resolution 2) — services never need to call this directly to be protected

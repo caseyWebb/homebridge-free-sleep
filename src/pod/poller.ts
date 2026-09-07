@@ -34,22 +34,35 @@ import {
   type TimerApi,
   type TimerHandle,
 } from './snapshot.ts';
-import type { DeviceStatus, PresenceData, Schedules, Services, Settings, VitalsResponse } from './types.ts';
+import type { DeviceStatus, PresenceData, Schedules, ServerStatus, Services, Settings, VitalsResponse } from './types.ts';
 
-export type EndpointClassId = 'deviceStatus' | 'settings' | 'schedules' | 'services' | 'presence' | 'vitals';
+export type EndpointClassId =
+  | 'deviceStatus'
+  | 'settings'
+  | 'schedules'
+  | 'services'
+  | 'serverStatus'
+  | 'presence'
+  | 'vitals';
 
 /**
  * S4 (occupancy code review): the subset of `PodClient`'s surface `PodPoller` actually calls.
- * `getDeviceStatus`/`getSettings`/`getSchedules`/`getServices` are required — every poller needs
- * all four, `occupancySource` or not. `getPresence`/`getVitals` are typed *optional*: they are
- * only ever called from behind an `enabled` predicate that itself checks `typeof === 'function'`
- * at runtime (see the `presence`/`vitals` class registrations below), so a client that doesn't
- * implement them — an older client version, or a deliberately reduced test double — is simply
- * never polled for either class instead of throwing a "not a function" `TypeError` out of
- * `runPoll`. Keeping these two optional here (rather than requiring the full `PodClient`) is
- * what makes that runtime check meaningful instead of redundant with the type system.
+ * `getDeviceStatus`/`getSettings`/`getSchedules`/`getServices`/`getServerStatus` are required —
+ * every poller needs all five, `occupancySource`/`serverFaultSensorEnabled` or not (the
+ * `serverStatus` class's own `enabled` predicate only gates whether it *fires*, not whether the
+ * method exists — unlike `presence`/`vitals` below). `getPresence`/`getVitals` are typed
+ * *optional*: they are only ever called from behind an `enabled` predicate that itself checks
+ * `typeof === 'function'` at runtime (see the `presence`/`vitals` class registrations below), so
+ * a client that doesn't implement them — an older client version, or a deliberately reduced test
+ * double — is simply never polled for either class instead of throwing a "not a function"
+ * `TypeError` out of `runPoll`. Keeping these two optional here (rather than requiring the full
+ * `PodClient`) is what makes that runtime check meaningful instead of redundant with the type
+ * system.
  */
-export type MinimalPodClient = Pick<PodClient, 'getDeviceStatus' | 'getSettings' | 'getSchedules' | 'getServices'> &
+export type MinimalPodClient = Pick<
+  PodClient,
+  'getDeviceStatus' | 'getSettings' | 'getSchedules' | 'getServices' | 'getServerStatus'
+> &
   Partial<Pick<PodClient, 'getPresence' | 'getVitals'>>;
 
 /**
@@ -78,6 +91,15 @@ export interface PollerOptions {
   maxBackoffMs?: number;
   /** Bootstrap deadline. Default 10 000. */
   bootstrapTimeoutMs?: number;
+  /**
+   * Whether the `serverStatus` class is enabled — threaded from `src/config.ts`'s
+   * `serverFaultSensor` at construction (`hub-accessory` design.md, matching how other
+   * config-derived poller behavior is threaded from `src/platform.ts` today). Default `false`:
+   * the class's schedule still runs (pod-poller spec's "a disabled class skips the actual
+   * request but keeps its schedule running"), it just never issues a request until this is
+   * `true`.
+   */
+  serverFaultSensorEnabled?: boolean;
   /**
    * Which occupancy source, if any, is configured (occupancy change, #19). Default `'none'` —
    * a plain value, following the same "poller doesn't import config.ts" discipline every
@@ -198,6 +220,22 @@ export class PodPoller {
       baseIntervalMs: this.slowPollIntervalMs,
       read: (client, signal) => client.getServices(signal),
       apply: (snapshot, value) => snapshot.observeServices(value as Services),
+    });
+    const serverFaultSensorEnabled = options.serverFaultSensorEnabled ?? false;
+    this.registerClass({
+      id: 'serverStatus',
+      baseIntervalMs: this.slowPollIntervalMs,
+      read: (client, signal) => client.getServerStatus(signal),
+      apply: (snapshot, value) => snapshot.observeServerStatus(value as ServerStatus),
+      recordFailure: (snapshot, kind) => snapshot.recordServerStatusFailure(kind),
+      // Static for this launch's lifetime — `serverFaultSensor` is a config key, not something
+      // that changes while the platform runs — but expressed as a predicate (rather than simply
+      // omitting `registerClass` when disabled) so the class's schedule still runs while
+      // disabled, per this extension point's own contract (pod-poller spec's "the class's own
+      // schedule continues running so that enabling the sensor later resumes polling without
+      // restarting the plugin" — moot for a config value that can't change without a restart
+      // today, but keeps this class consistent with every other use of `enabled`).
+      enabled: () => serverFaultSensorEnabled,
     });
 
     // Occupancy change (#19): both registered unconditionally, mirroring the four classes

@@ -3,6 +3,7 @@ import type { CharacteristicGetHandler, CharacteristicSetHandler } from '@homebr
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { FreeSleepConfigSchema, type FreeSleepConfig } from '../../src/config.js';
+import type { MinimalPodClient } from '../../src/platform.js';
 import { AwayModeGuard } from '../../src/pod/awayModeGuard.js';
 import { SnapshotStore } from '../../src/pod/snapshot.js';
 import { cToF, F_MAX, F_MIN, fToC } from '../../src/pod/temperature.js';
@@ -78,6 +79,7 @@ function setup(options: { config?: Record<string, unknown>; observe?: boolean } 
     awayModeGuard,
     timers,
     config,
+    podClient: fake.client as unknown as MinimalPodClient,
   };
   return { api, accessory, snapshot, timers, fake, writeQueue, fastPollRequests, ctx };
 }

@@ -8,6 +8,7 @@ import {
   DeviceStatusSchema,
   PresenceSchema,
   SchedulesSchema,
+  ServerStatusSchema,
   ServicesSchema,
   SettingsSchema,
   VitalsResponseSchema,
@@ -34,6 +35,7 @@ function schemaFor(name: string): ReadSchema {
   if (name === 'settings.json') return SettingsSchema;
   if (name === 'schedules.json') return SchedulesSchema;
   if (name === 'services.json') return ServicesSchema;
+  if (name === 'serverStatus.json') return ServerStatusSchema;
   if (name === 'metricsPresence.json') return PresenceSchema;
   if (name === 'metricsVitals.json') return VitalsResponseSchema;
   throw new Error(
@@ -75,6 +77,15 @@ describe('every fixture parses through its read schema', () => {
       message = String(error);
     }
     expect(message).toMatch(/isOn/);
+  });
+});
+
+describe('the default subsystem-health fixture reports no failure (pod-test-double spec)', () => {
+  it('every subsystem in serverStatus.json has a status other than failed', () => {
+    const serverStatus = ServerStatusSchema.parse(loadFixture('serverStatus.json'));
+    for (const info of Object.values(serverStatus)) {
+      expect(info?.status).not.toBe('failed');
+    }
   });
 });
 

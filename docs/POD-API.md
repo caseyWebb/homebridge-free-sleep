@@ -144,8 +144,10 @@ is due.
     /* ...rest of week */ }, "right": { /* ... */ } }
 ```
 
-`vibrationPattern` is `'double' | 'rise'`; `duration` is **0–180 seconds** (floored at 10 at
-execution time); `vibrationIntensity` is 1–100.
+`vibrationPattern` is `'double' | 'rise'`; `duration` is **1–180 seconds**
+(`server/src/db/schedulesSchema.ts`'s `AlarmSchema.duration`: `z.number().int().positive()
+.min(0).max(180)` — `.positive()` is the binding lower bound, so `0` itself is rejected; floored
+at 10 at execution time); `vibrationIntensity` is 1–100.
 
 ### `POST /api/alarm`
 

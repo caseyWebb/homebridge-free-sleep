@@ -41,13 +41,16 @@ without having to discover a config flag first.
   `accessory.context.lastNonZeroBrightness ?? 100`. The device lane's debounce is widened to a
   new, dedicated minimum for this lane specifically (500 ms+, per issue #10's own note on this
   feature) — see design.md.
-- Add a "Pod Test Alarm" `Switch` to the hub, config-gated (new key `testAlarmSwitch`, default
-  `false`), momentary/stateless. `On` write calls a new `PodClient.postAlarm` method
-  (`POST /api/alarm`, `{side, vibrationIntensity, vibrationPattern, duration, force: true}`);
-  the switch's own tile reverts to `Off` roughly a second later regardless of the write's outcome
-  — there is no reliable, timely way to confirm the physical alarm fired (see design.md). This is
-  a genuinely new, non-idempotent write: `PodClient` must not apply its existing retry-on-network-
-  error/5xx policy to it.
+- Add two per-side "Test Alarm Left"/"Test Alarm Right" `Switch`es to the hub, config-gated
+  (new key `testAlarmSwitch`, default `false`, gating both), momentary/stateless. **Revised (G0,
+  tech-lead ruling, PR #44 review)** from an original single both-sides switch: a hub-level
+  trigger firing on both sides risked vibrating a sleeping partner's side as a side effect of
+  testing the other. `On` write calls a new `PodClient.postAlarm` method (`POST /api/alarm`,
+  `{side, vibrationIntensity, vibrationPattern, duration, force: true}`) for that switch's own
+  side only; each switch's own tile reverts to `Off` roughly a second later regardless of the
+  write's outcome — there is no reliable, timely way to confirm the physical alarm fired (see
+  design.md). This is a genuinely new, non-idempotent write: `PodClient` must not apply its
+  existing retry-on-network-error/5xx policy to it.
 - Add a "Pod Server Fault" `ContactSensor` to the hub, config-gated (new key
   `serverFaultSensor`, default `false`). Backed by a new `GET /api/serverStatus` poll (new
   `PodClient.getServerStatus`, new `SnapshotStore` raw slot, new poller endpoint class on the

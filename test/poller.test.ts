@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { PodPoller } from '../src/pod/poller.js';
 import { SnapshotStore, type EffectiveSnapshot, type Logger, type TimerApi } from '../src/pod/snapshot.js';
-import type { DeviceStatus, Schedules, Services, Settings } from '../src/pod/types.js';
+import type { DeviceStatus, Schedules, ServerStatus, Services, Settings } from '../src/pod/types.js';
 import { createFakePodClient, type FakePodClient } from './fakePodClient.js';
 import { createTimerHarness, type TimerHarness } from './timerHarness.js';
 import { loadFixture } from './loadFixture.js';
@@ -11,6 +11,7 @@ const deviceStatusFixture = loadFixture('deviceStatus.json') as DeviceStatus;
 const settingsFixture = loadFixture('settings.json') as Settings;
 const schedulesFixture = loadFixture('schedules.json') as Schedules;
 const servicesFixture = loadFixture('services.json') as Services;
+const serverStatusFixture = loadFixture('serverStatus.json') as ServerStatus;
 
 interface Setup {
   timers: TimerHarness;
@@ -28,6 +29,7 @@ function setup(options: Partial<ConstructorParameters<typeof PodPoller>[0]> = {}
     settings: settingsFixture,
     schedules: schedulesFixture,
     services: servicesFixture,
+    serverStatus: serverStatusFixture,
   });
   const logs: { warn: string[]; debug: string[] } = { warn: [], debug: [] };
   const logger: Logger = { warn: (m) => logs.warn.push(m), debug: (m) => logs.debug.push(m) };
@@ -101,6 +103,54 @@ describe('poller: classes, cadence (5.1, 5.2)', () => {
     expect(fake.deviceStatus.calls).toBe(1);
     await vi.advanceTimersByTimeAsync(1);
     expect(fake.deviceStatus.calls).toBe(2);
+    poller.stop();
+  });
+});
+
+describe('poller: hub-accessory serverStatus class (5.1, 5.2)', () => {
+  it('polls when enabled, and applies the observation to the snapshot', async () => {
+    const { fake, snapshot, poller } = setup({ serverFaultSensorEnabled: true });
+    await poller.bootstrap();
+    expect(fake.serverStatus.calls).toBe(1);
+    expect(snapshot.get().documents.serverStatus).toEqual(serverStatusFixture);
+    poller.stop();
+  });
+
+  it('skips the request (while continuing to reschedule) when disabled', async () => {
+    const { fake, poller } = setup({ serverFaultSensorEnabled: false });
+    await poller.bootstrap();
+    expect(fake.serverStatus.calls).toBe(0);
+    // Still reschedules on its own cadence — advancing past the slow interval re-checks
+    // `enabled` again rather than the class going dormant forever.
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(fake.serverStatus.calls).toBe(0);
+    poller.stop();
+  });
+
+  it('defaults to disabled when serverFaultSensorEnabled is omitted', async () => {
+    const { fake, poller } = setup();
+    await poller.bootstrap();
+    expect(fake.serverStatus.calls).toBe(0);
+    poller.stop();
+  });
+
+  it("the serverStatus class's effective interval tracks slowPollIntervalMs, identically to settings/schedules/services", async () => {
+    const { fake, poller } = setup({ serverFaultSensorEnabled: true, slowPollIntervalMs: 90_000 });
+    await poller.bootstrap();
+    expect(fake.serverStatus.calls).toBe(1);
+    expect(fake.services.calls).toBe(1);
+    await vi.advanceTimersByTimeAsync(90_000);
+    expect(fake.serverStatus.calls).toBe(2);
+    expect(fake.services.calls).toBe(2);
+    poller.stop();
+  });
+
+  it('a failed serverStatus poll records the failure on the snapshot', async () => {
+    const { fake, snapshot, poller } = setup({ serverFaultSensorEnabled: true });
+    fake.serverStatus.clearQueue();
+    fake.serverStatus.queueError(new Error('unreachable'));
+    await poller.bootstrap();
+    expect(snapshot.get().serverStatusConnection.online).toBe(false);
     poller.stop();
   });
 });
@@ -697,7 +747,7 @@ describe('poller: presence/vitals endpoint classes (4.2, 4.3)', () => {
   // -------------------------------------------------------------------------------------
 
   describe('S4: a client without getPresence/getVitals never polls that class', () => {
-    /** A `MinimalPodClient` (`../src/pod/poller.ts`) that only implements the four required
+    /** A `MinimalPodClient` (`../src/pod/poller.ts`) that only implements the five required
      * methods — `getPresence`/`getVitals` are entirely absent, not merely stubbed, exercising
      * the `typeof === 'function'` check itself rather than a method that happens to be present
      * but unused. */
@@ -707,6 +757,7 @@ describe('poller: presence/vitals endpoint classes (4.2, 4.3)', () => {
         getSettings: fake.client.getSettings.bind(fake.client),
         getSchedules: fake.client.getSchedules.bind(fake.client),
         getServices: fake.client.getServices.bind(fake.client),
+        getServerStatus: fake.client.getServerStatus.bind(fake.client),
       };
     }
 

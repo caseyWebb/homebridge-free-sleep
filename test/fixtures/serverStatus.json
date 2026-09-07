@@ -1,0 +1,80 @@
+{
+  "alarmSchedule": {
+    "name": "alarmSchedule",
+    "status": "healthy",
+    "description": "Alarm scheduler",
+    "message": "OK"
+  },
+  "database": {
+    "name": "database",
+    "status": "healthy",
+    "description": "SQLite database",
+    "message": "OK"
+  },
+  "express": {
+    "name": "express",
+    "status": "healthy",
+    "description": "HTTP server",
+    "message": "OK"
+  },
+  "franken": {
+    "name": "franken",
+    "status": "healthy",
+    "description": "Franken hardware socket",
+    "message": "OK"
+  },
+  "frankenMonitor": {
+    "name": "frankenMonitor",
+    "status": "healthy",
+    "description": "Franken hardware monitor",
+    "message": "OK"
+  },
+  "jobs": {
+    "name": "jobs",
+    "status": "healthy",
+    "description": "Scheduled jobs",
+    "message": "OK"
+  },
+  "logger": {
+    "name": "logger",
+    "status": "healthy",
+    "description": "Logger",
+    "message": "OK"
+  },
+  "powerSchedule": {
+    "name": "powerSchedule",
+    "status": "healthy",
+    "description": "Power scheduler",
+    "message": "OK"
+  },
+  "primeSchedule": {
+    "name": "primeSchedule",
+    "status": "healthy",
+    "description": "Prime scheduler",
+    "message": "OK"
+  },
+  "rebootSchedule": {
+    "name": "rebootSchedule",
+    "status": "healthy",
+    "description": "Reboot scheduler",
+    "message": "OK"
+  },
+  "systemDate": {
+    "name": "systemDate",
+    "status": "healthy",
+    "description": "System date check",
+    "message": "OK"
+  },
+  "temperatureSchedule": {
+    "name": "temperatureSchedule",
+    "status": "healthy",
+    "description": "Temperature scheduler",
+    "message": "OK"
+  },
+  "biometricsInstallation": {
+    "name": "biometricsInstallation",
+    "status": "healthy",
+    "description": "Biometrics installation",
+    "message": "OK"
+  }
+}
