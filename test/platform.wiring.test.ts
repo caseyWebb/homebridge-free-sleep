@@ -29,12 +29,14 @@ import {
 import { ALARM_DISMISS_SUBTYPE } from '../src/services/alarm.js';
 import { AWAY_MODE_SUBTYPE } from '../src/services/awayMode.js';
 import { SKIP_ALARM_SUBTYPE } from '../src/services/skipAlarm.js';
+import { SNOOZE_SUBTYPE } from '../src/services/snooze.js';
 import { THERMOSTAT_SUBTYPE, type ThermostatService } from '../src/services/thermostat.js';
 import { CONNECTION_SUBTYPE } from '../src/services/connection.js';
 import { WATER_LOW_SUBTYPE } from '../src/services/waterLow.js';
 import { PRIME_SUBTYPE } from '../src/services/prime.js';
 import { LED_SUBTYPE } from '../src/services/led.js';
 import { TEST_ALARM_LEFT_SUBTYPE, TEST_ALARM_RIGHT_SUBTYPE } from '../src/services/testAlarm.js';
+import { WAKE_ALARM_SUBTYPE } from '../src/services/wakeAlarm.js';
 import { SERVER_FAULT_SUBTYPE } from '../src/services/serverFault.js';
 import { OCCUPANCY_SUBTYPE, type OccupancySensorService } from '../src/services/occupancy.js';
 import { fToC } from '../src/pod/temperature.js';
@@ -100,6 +102,8 @@ interface PlatformInternals {
   alarmWindowScheduler: { stop: () => void } | undefined;
   awayModeServices: Map<Side, { refresh: () => void; stop: () => void }>;
   skipAlarmServices: Map<Side, { refresh: () => void; stop: () => void }>;
+  wakeAlarmServices: Map<Side, { stop: () => void }>;
+  snoozeServices: Map<Side, { stop: () => void }>;
   handleSnapshotChanges: (changes: readonly Change[]) => void;
 }
 
@@ -1515,6 +1519,125 @@ describe('shutdown stops each side\'s AwayModeService and SkipAlarmService (sett
     await api.fireShutdown();
     for (const spy of stopSpies) {
       expect(spy).toHaveBeenCalledTimes(1);
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------------------
+// wake-alarm-controls: construction, prune-on-restore, and shutdown for the per-side
+// Wake Alarm and Snooze switches (both default off).
+// ---------------------------------------------------------------------------------------
+
+describe('wake-alarm-controls: construction', () => {
+  it('neither switch is constructed by default (wakeAlarmSwitch/snoozeSwitch default false)', async () => {
+    const { platform, api } = await simulateRestart(factory(resolvedFakeClient()), baseConfig(), []);
+    const i = internals(platform);
+    expect(i.wakeAlarmServices.size).toBe(0);
+    expect(i.snoozeServices.size).toBe(0);
+    const hap = api.hap;
+    const left = api.registeredAccessories.find((a) => a.displayName === 'Left')!;
+    expect(left.getServiceById(hap.Service.Switch, WAKE_ALARM_SUBTYPE)).toBeUndefined();
+    expect(left.getServiceById(hap.Service.Switch, SNOOZE_SUBTYPE)).toBeUndefined();
+  });
+
+  it('wakeAlarmSwitch: true constructs a WakeAlarmService per side and nothing on the hub; snooze is unaffected', async () => {
+    const { platform, api } = await simulateRestart(factory(resolvedFakeClient()), baseConfig({ wakeAlarmSwitch: true }), []);
+    const i = internals(platform);
+    expect([...i.wakeAlarmServices.keys()].sort()).toEqual(['left', 'right']);
+    expect(i.snoozeServices.size).toBe(0);
+    const hap = api.hap;
+    const hub = api.registeredAccessories.find((a) => a.displayName === 'Pod')!;
+    expect(hub.getServiceById(hap.Service.Switch, WAKE_ALARM_SUBTYPE)).toBeUndefined();
+    for (const name of ['Left', 'Right']) {
+      const side = api.registeredAccessories.find((a) => a.displayName === name)!;
+      expect(side.getServiceById(hap.Service.Switch, WAKE_ALARM_SUBTYPE)).toBeDefined();
+    }
+  });
+
+  it('snoozeSwitch: true constructs a SnoozeService per side; wake alarm is unaffected', async () => {
+    const { platform, api } = await simulateRestart(factory(resolvedFakeClient()), baseConfig({ snoozeSwitch: true }), []);
+    const i = internals(platform);
+    expect([...i.snoozeServices.keys()].sort()).toEqual(['left', 'right']);
+    expect(i.wakeAlarmServices.size).toBe(0);
+    const hap = api.hap;
+    const right = api.registeredAccessories.find((a) => a.displayName === 'Right')!;
+    expect(right.getServiceById(hap.Service.Switch, SNOOZE_SUBTYPE)).toBeDefined();
+  });
+
+  it('sides: "right" constructs both switches for the right side only', async () => {
+    const { platform } = await simulateRestart(
+      factory(resolvedFakeClient()),
+      baseConfig({ sides: 'right', wakeAlarmSwitch: true, snoozeSwitch: true }),
+      [],
+    );
+    const i = internals(platform);
+    expect([...i.wakeAlarmServices.keys()]).toEqual(['right']);
+    expect([...i.snoozeServices.keys()]).toEqual(['right']);
+  });
+});
+
+describe('wake-alarm-controls: disabling a switch prunes it on restore, leaving the thermostat untouched', () => {
+  it.each([
+    ['wakeAlarmSwitch', WAKE_ALARM_SUBTYPE],
+    ['snoozeSwitch', SNOOZE_SUBTYPE],
+  ] as const)('%s: true -> false prunes the %s service', async (key, subtype) => {
+    const first = await simulateRestart(factory(resolvedFakeClient()), baseConfig({ [key]: true }), []);
+    const previous = first.api.registeredAccessories;
+    const hap = first.api.hap;
+    const left = previous.find((a) => a.displayName === 'Left')!;
+    expect(left.getServiceById(hap.Service.Switch, subtype)).toBeDefined();
+
+    const second = await simulateRestart(factory(resolvedFakeClient()), baseConfig({ [key]: false }), previous);
+    const i = internals(second.platform);
+    expect(i.wakeAlarmServices.size + i.snoozeServices.size).toBe(0);
+    expect(left.getServiceById(hap.Service.Switch, subtype)).toBeUndefined();
+    expect(left.getServiceById(hap.Service.Thermostat, THERMOSTAT_SUBTYPE)).toBeDefined();
+  });
+
+  it('false -> true restores the switch onto the cached accessory without duplicating it', async () => {
+    const first = await simulateRestart(factory(resolvedFakeClient()), baseConfig(), []);
+    const previous = first.api.registeredAccessories;
+    await simulateRestart(factory(resolvedFakeClient()), baseConfig({ wakeAlarmSwitch: true, snoozeSwitch: true }), previous);
+    // Restored accessories are not re-registered; the services land on the cached objects.
+    const left = previous.find((a) => a.displayName === 'Left')!;
+    expect(left.services.filter((sv) => sv.subtype === WAKE_ALARM_SUBTYPE)).toHaveLength(1);
+    expect(left.services.filter((sv) => sv.subtype === SNOOZE_SUBTYPE)).toHaveLength(1);
+  });
+});
+
+describe('wake-alarm-controls: shutdown stops both switches\' self-reset timers', () => {
+  it('no pending timer remains after shutdown with a Wake Alarm and a Snooze press both just made', async () => {
+    vi.useFakeTimers();
+    try {
+      const timers = createTimerHarness();
+      const api = new FakeHomebridgeApi();
+      const log = createFakeLogging();
+      const client = resolvedFakeClient();
+      const platform = new FreeSleepPlatform(
+        log,
+        baseConfig({ wakeAlarmSwitch: true, snoozeSwitch: true }),
+        api.asApi(),
+        client,
+        timers,
+      );
+      await api.fireDidFinishLaunching();
+      const perAccessoryOverhead = api.registeredAccessories.length;
+
+      const hap = api.hap;
+      const right = api.registeredAccessories.find((a) => a.displayName === 'Right')!;
+      const wakeOn = right.getServiceById(hap.Service.Switch, WAKE_ALARM_SUBTYPE)!.getCharacteristic(hap.Characteristic.On);
+      const snoozeOn = right.getServiceById(hap.Service.Switch, SNOOZE_SUBTYPE)!.getCharacteristic(hap.Characteristic.On);
+      const wakePending = wakeOn.handleSetRequest(true).catch(() => undefined);
+      const snoozePending = snoozeOn.handleSetRequest(true).catch(() => undefined);
+      await vi.advanceTimersByTimeAsync(0);
+      expect(timers.pendingCount()).toBeGreaterThan(perAccessoryOverhead);
+
+      await api.fireShutdown();
+      await Promise.all([wakePending, snoozePending]);
+      expect(timers.pendingCount()).toBe(perAccessoryOverhead);
+      void platform;
+    } finally {
+      vi.useRealTimers();
     }
   });
 });

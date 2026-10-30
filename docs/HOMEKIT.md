@@ -249,6 +249,47 @@ routinely miss the entire alarm.**
   updateDeviceStatus.ts`), so this is parity, not a carve-out. Without it, a user could not stop
   a ringing alarm from HomeKit while either side was away under the `'block'` policy.
 
+## Wake Alarm and Snooze: two per-side momentary `Switch`es (`wake-alarm-controls`)
+
+Both live on the side accessory next to the Thermostat, the alarm event and "Dismiss Alarm",
+both are momentary (self-reset to off after ~1s regardless of outcome, the hub "Test Alarm"
+pattern), and both ship **off** by default because each can physically act on a sleeping
+person's bed. They exist so the iPhone's own Sleep alarm — the only alarm with a real
+lock-screen UI, Siri, and "goes off / is snoozed / is dismissed" Shortcuts triggers — can drive
+the bed entirely through Home actions:
+
+| iOS Sleep-alarm trigger | Home actions |
+|---|---|
+| Goes off | Wake Alarm → on |
+| Is snoozed | Snooze → on |
+| Is dismissed | Dismiss Alarm → off, Thermostat → Off |
+
+- **`Switch` "Wake Alarm"** — writing ON posts `POST /api/alarm` for this side with the configured
+  `wakeAlarm` parameters and `force: true` (`executeAlarm` silently no-ops an off or away side
+  without it, `server/src/jobs/alarmScheduler.ts`). Unlike "Test Alarm", a rejected `postAlarm`
+  is *not* swallowed: it surfaces as `SERVICE_COMMUNICATION_FAILURE`, so a wake automation can
+  fail visibly rather than leave the sleeper asleep. The vibration's own state is reflected by
+  "Dismiss Alarm", not by this tile. `postAlarm` never retries.
+- **`Switch` "Snooze"** — writing ON submits one `submitSide` patch,
+  `{isAlarmVibrating: false, isOn: true, targetTemperatureF: clamp(current + delta)}`, where
+  `current` is the side's *effective* cached target (overlays included, so quick presses stack)
+  and `delta` is `snoozeTemperatureDeltaF`. HomeKit scenes can only set absolute targets, which
+  is why the relative bump lives in the plugin. `isOn: true` is included so the bump still heats
+  when the side's 12-hour duration has already lapsed. `WriteQueue.dispatch`'s existing N8 peel
+  sends the dismiss as its own guard-exempt request before consulting `AwayModeGuard` for the
+  remainder, so under `'block'` with the partner away the alarm still stops and only the bump is
+  refused (`NOT_ALLOWED_IN_CURRENT_STATE`). With no cached target yet, the press degrades to a
+  plain dismiss and logs a warning.
+- **Real-hardware caveat:** stopping a *ringing* vibration depends on the Pod's free-sleep build.
+  Stock free-sleep's dismiss (`ALARM_CLEAR`) is a no-op on a Pod 3
+  ([upstream #54](https://github.com/throwaway31265/free-sleep/issues/54)); the plugin's dismiss
+  write is correct either way, but it only takes effect on a build that re-fires a 1-second alarm
+  on dismiss — see `docs/POD-API.md`.
+- **Needs confirming on a paired device:** that a Shortcuts personal automation's "Control Home"
+  action turns these momentary switches on reliably when the phone is away from the LAN (it
+  routes through the home hub), and that the ~1s self-reset never races the automation's own
+  write acknowledgement.
+
 ## Away Mode and Skip Next Alarm: two per-side `Switch`es over `POST /api/settings` (`settings-switches`, #17/#18)
 
 Both bind a field only reachable through the expensive settings write (`docs/POD-API.md`: any
@@ -457,6 +498,8 @@ Siri-hostile — uniqueness matters within an accessory, not globally. Every ser
 | Water Level (`ContactSensor`/`LeakSensor`) | hub | "Water Level" |
 | Server Fault (`ContactSensor`) | hub | "Server Fault" |
 | Test Alarm Left/Right (`Switch` × 2) | hub | "Test Alarm Left" / "Test Alarm Right" |
+| Wake Alarm (`Switch`) | side | "Wake Alarm" |
+| Snooze (`Switch`) | side | "Snooze" |
 
 Test Alarm is the one pair that keeps its `Left`/`Right` suffix — it is the only case where two
 services sharing this convention's short label would collide on the *same* accessory (the hub

@@ -4,7 +4,7 @@ import { fileURLToPath } from 'node:url';
 
 import { describe, expect, it } from 'vitest';
 
-import { FreeSleepConfigSchema, PollIntervalsFieldsSchema, unrecognizedConfigKeys } from '../src/config.js';
+import { FreeSleepConfigSchema, PollIntervalsFieldsSchema, unrecognizedConfigKeys, WakeAlarmFieldsSchema } from '../src/config.js';
 import { PLATFORM_NAME } from '../src/settings.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -722,6 +722,75 @@ describe('FreeSleepConfigSchema — awayModeTurnsSideOff (settings-switches)', (
     if (!result.success) {
       expect(result.error.issues.some((issue) => issue.path.join('.') === 'awayModeTurnsSideOff')).toBe(true);
     }
+  });
+});
+
+// ---------------------------------------------------------------------------------------
+// wake-alarm-controls: wakeAlarmSwitch, wakeAlarm, snoozeSwitch, snoozeTemperatureDeltaF
+// ---------------------------------------------------------------------------------------
+
+describe('FreeSleepConfigSchema — wake-alarm-controls keys', () => {
+  it('both switches default to false and the alarm/delta defaults are fully populated', () => {
+    const result = FreeSleepConfigSchema.safeParse({ host: 'pod.local' });
+    expect(result.success).toBe(true);
+    if (!result.success) return;
+    expect(result.data.wakeAlarmSwitch).toBe(false);
+    expect(result.data.snoozeSwitch).toBe(false);
+    expect(result.data.wakeAlarm).toEqual({ duration: 180, vibrationIntensity: 100, vibrationPattern: 'double' });
+    expect(result.data.snoozeTemperatureDeltaF).toBe(10);
+  });
+
+  it('a partial wakeAlarm object fills the remaining fields from their defaults', () => {
+    const result = FreeSleepConfigSchema.safeParse({ host: 'pod.local', wakeAlarm: { duration: 30 } });
+    expect(result.success).toBe(true);
+    if (result.success) {
+      expect(result.data.wakeAlarm).toEqual({ duration: 30, vibrationIntensity: 100, vibrationPattern: 'double' });
+    }
+  });
+
+  it.each([
+    ['duration', 0],
+    ['duration', 181],
+    ['duration', 1.5],
+    ['vibrationIntensity', 0],
+    ['vibrationIntensity', 101],
+    ['vibrationPattern', 'triple'],
+  ])('rejects wakeAlarm.%s = %s, naming the path', (field, value) => {
+    const result = FreeSleepConfigSchema.safeParse({ host: 'pod.local', wakeAlarm: { [field]: value } });
+    expect(result.success).toBe(false);
+    if (!result.success) {
+      expect(result.error.issues.some((issue) => issue.path.join('.') === `wakeAlarm.${field}`)).toBe(true);
+    }
+  });
+
+  it.each([0, 56, -56, 2.5, '10'])('rejects snoozeTemperatureDeltaF = %s, naming the key', (value) => {
+    const result = FreeSleepConfigSchema.safeParse({ host: 'pod.local', snoozeTemperatureDeltaF: value });
+    expect(result.success).toBe(false);
+    if (!result.success) {
+      expect(result.error.issues.some((issue) => issue.path.join('.') === 'snoozeTemperatureDeltaF')).toBe(true);
+    }
+  });
+
+  it('accepts a negative, non-zero delta', () => {
+    const result = FreeSleepConfigSchema.safeParse({ host: 'pod.local', snoozeTemperatureDeltaF: -8 });
+    expect(result.success).toBe(true);
+    if (result.success) expect(result.data.snoozeTemperatureDeltaF).toBe(-8);
+  });
+
+  it('rejects a non-boolean for either switch key, naming the key', () => {
+    for (const key of ['wakeAlarmSwitch', 'snoozeSwitch']) {
+      const result = FreeSleepConfigSchema.safeParse({ host: 'pod.local', [key]: 'yes' });
+      expect(result.success).toBe(false);
+      if (!result.success) {
+        expect(result.error.issues.some((issue) => issue.path.join('.') === key)).toBe(true);
+      }
+    }
+  });
+
+  it("config.schema.json's wakeAlarm.properties match WakeAlarmFieldsSchema's shape", () => {
+    const uiProps = (readConfigSchemaJson().schema.properties.wakeAlarm as { properties?: Record<string, unknown> }).properties;
+    expect(uiProps).toBeDefined();
+    expect(new Set(Object.keys(uiProps ?? {}))).toEqual(new Set(Object.keys(WakeAlarmFieldsSchema.shape)));
   });
 });
 

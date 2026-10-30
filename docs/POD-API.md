@@ -67,7 +67,7 @@ Deep partial of the read shape. Semantics from
 | `isOn: true` | Sets the heat duration to `'43200'` — **12 hours**, then the side turns itself off. |
 | `isOn: false` | Sets duration to `'0'`. |
 | `secondsRemaining` | Sets an arbitrary duration. This is the hook for a keep-alive. |
-| `isAlarmVibrating: false` | Sends `ALARM_CLEAR`. `true` is unsupported and logged as such. |
+| `isAlarmVibrating: false` | Sends `ALARM_CLEAR`. `true` is unsupported and logged as such. **On a Pod 3 this does not stop a vibration already in progress** — `ALARM_CLEAR` only clears the pod's pending alarm settings ([upstream #54](https://github.com/throwaway31265/free-sleep/issues/54), open). The fork `caseyWebb/free-sleep` (`server/src/8sleep/alarm.ts`) makes this write re-fire `ALARM_{SIDE}` with a 1-second duration first, which does stop it; the plugin's "Dismiss Alarm" and "Snooze" switches rely on that behaviour to actually silence the bed. |
 | `isPriming: true` | Sends `PRIME`. |
 | `settings` | Key-remapped (`ledBrightness`→`lb`, `gainLeft`→`gl`, `gainRight`→`gr`), CBOR-encoded, sent as `SET_SETTINGS`. |
 

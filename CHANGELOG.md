@@ -8,6 +8,13 @@ All notable user-facing changes to this project are documented here. Format loos
 
 ### Added
 
+- Two opt-in momentary switches per side, for driving the bed from the iPhone's own Sleep alarm
+  through plain Home actions (no HTTP Shortcuts): **Wake Alarm** (`wakeAlarmSwitch`, fires the
+  alarm configured under `wakeAlarm` on that side, `force: true`, failures surfaced to HomeKit)
+  and **Snooze** (`snoozeSwitch`, stops the ringing alarm and raises the side's target by
+  `snoozeTemperatureDeltaF`, default +10 °F, turning the side on if it had timed out). Both
+  default off. Stopping a ringing alarm on a Pod 3 additionally needs a free-sleep build that
+  fixes upstream #54 — see `docs/POD-API.md`. (`wake-alarm-controls`)
 - Every HAP service on every accessory now carries a distinct `ConfiguredName`, seeded once at
   construction and never overwritten afterward — controller (Home app) renames persist exactly
   like accessory-level renames already do. Fixes tiles that previously all showed the same

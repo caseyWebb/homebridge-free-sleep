@@ -128,6 +128,43 @@ export const PollIntervalsFieldsSchema = z
 
 export const PollIntervalsSchema = PollIntervalsFieldsSchema.default({});
 
+/**
+ * The alarm the per-side "Wake Alarm" switch fires (`wake-alarm-controls`). Exported
+ * un-defaulted, like `PollIntervalsFieldsSchema`, so a test can inspect its `.shape`. Bounds
+ * mirror upstream's own `AlarmSchema` (`server/src/db/schedulesSchema.ts`: intensity 1-100,
+ * duration a positive integer up to 180) and `AlarmRequestSchema` in `src/pod/types.ts`.
+ */
+export const WakeAlarmFieldsSchema = z.object({
+  /** Seconds. Upstream clamps the real vibration to at least 10s regardless. Default 180. */
+  duration: z
+    .number()
+    .int()
+    .min(1, { message: 'wakeAlarm.duration must be at least 1' })
+    .max(180, { message: 'wakeAlarm.duration cannot exceed 180' })
+    .default(180),
+  /** 1-100. Upstream treats this as a ramp ceiling, not a fixed level. Default 100. */
+  vibrationIntensity: z
+    .number()
+    .int()
+    .min(1, { message: 'wakeAlarm.vibrationIntensity must be at least 1' })
+    .max(100, { message: 'wakeAlarm.vibrationIntensity cannot exceed 100' })
+    .default(100),
+  /**
+   * Default `'double'` — the only pattern a Pod 3's firmware actually implements; `'rise'` is
+   * accepted by free-sleep but silently never vibrates there
+   * (https://github.com/throwaway31265/free-sleep/issues/55).
+   */
+  vibrationPattern: z.enum(['double', 'rise']).default('double'),
+});
+
+/** A fully-specified default (not `{}`): zod v4's `.default()` returns its value without
+ * re-parsing it, so an empty object would skip the per-field defaults above. */
+export const WakeAlarmSchema = WakeAlarmFieldsSchema.default({
+  duration: 180,
+  vibrationIntensity: 100,
+  vibrationPattern: 'double',
+});
+
 export const FreeSleepConfigSchema = z.object({
   /**
    * The Pod's LAN hostname or IP address. Required, non-empty, un-defaulted (config spec,
@@ -305,6 +342,38 @@ export const FreeSleepConfigSchema = z.object({
    * `awayModeSwitch` is `false` (there is then no switch to toggle).
    */
   awayModeTurnsSideOff: z.boolean().default(false),
+
+  /**
+   * Consumed by `wake-alarm-controls`: gates the per-side momentary "Wake Alarm" `Switch`
+   * (`src/services/wakeAlarm.ts`), which fires the alarm described by `wakeAlarm` below on
+   * that side, overriding away mode and power state (`force: true`). Default `false` — like
+   * `testAlarmSwitch`, a manual trigger that can vibrate a bed at any hour ships opt-in.
+   */
+  wakeAlarmSwitch: z.boolean().default(false),
+
+  /** The alarm the "Wake Alarm" switch fires. Ignored when `wakeAlarmSwitch` is `false`. */
+  wakeAlarm: WakeAlarmSchema,
+
+  /**
+   * Consumed by `wake-alarm-controls`: gates the per-side momentary "Snooze" `Switch`
+   * (`src/services/snooze.ts`), which stops a ringing alarm and raises that side's target
+   * temperature by `snoozeTemperatureDeltaF` in one device-status write. Default `false` —
+   * it changes a sleeping person's bed temperature, so it ships opt-in.
+   */
+  snoozeSwitch: z.boolean().default(false),
+
+  /**
+   * Whole °F added to the side's current target on each Snooze press, clamped to the Pod's
+   * 55-110°F range. Negative values cool instead. Default `10`. Ignored when `snoozeSwitch`
+   * is `false`.
+   */
+  snoozeTemperatureDeltaF: z
+    .number()
+    .int()
+    .min(-55, { message: 'snoozeTemperatureDeltaF must be at least -55' })
+    .max(55, { message: 'snoozeTemperatureDeltaF cannot exceed 55' })
+    .refine((value) => value !== 0, { message: 'snoozeTemperatureDeltaF must not be 0' })
+    .default(10),
 }).superRefine((data, ctx) => {
   if (data.keepAliveThresholdMs >= data.keepAliveMs) {
     ctx.addIssue({
@@ -320,6 +389,7 @@ export const FreeSleepConfigSchema = z.object({
 
 export type FreeSleepConfig = z.infer<typeof FreeSleepConfigSchema>;
 export type PollIntervalsConfig = z.infer<typeof PollIntervalsSchema>;
+export type WakeAlarmConfig = z.infer<typeof WakeAlarmSchema>;
 
 /**
  * Top-level keys Homebridge itself injects into every platform's config block — never

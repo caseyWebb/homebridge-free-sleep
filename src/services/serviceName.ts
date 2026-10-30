@@ -28,6 +28,8 @@ export const CONFIGURED_NAME = {
   occupancy: 'Occupancy',
   awayMode: 'Away Mode',
   skipNextAlarm: 'Skip Next Alarm',
+  wakeAlarm: 'Wake Alarm',
+  snooze: 'Snooze',
   podConnection: 'Pod Connection',
   led: 'LED',
   prime: 'Prime',

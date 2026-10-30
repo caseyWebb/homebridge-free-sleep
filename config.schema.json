@@ -2,7 +2,7 @@
   "pluginAlias": "FreeSleep",
   "pluginType": "platform",
   "singular": true,
-  "headerDisplay": "Exposes an Eight Sleep Pod running the free-sleep firmware to Apple HomeKit. `host` is the only field most installs need. Every other field below — `sides`, the poll/write timing overrides, the No Response delay, keep-alive, the occupancy source, the water-low sensor type, alarm events, the per-side Away Mode and Skip Next Alarm switches, and the four hub-service toggles (prime, LED, test alarm, server fault) — is live and optional.",
+  "headerDisplay": "Exposes an Eight Sleep Pod running the free-sleep firmware to Apple HomeKit. `host` is the only field most installs need. Every other field below — `sides`, the poll/write timing overrides, the No Response delay, keep-alive, the occupancy source, the water-low sensor type, alarm events, the per-side Away Mode, Skip Next Alarm, Wake Alarm and Snooze switches, and the four hub-service toggles (prime, LED, test alarm, server fault) — is live and optional.",
   "schema": {
     "type": "object",
     "properties": {
@@ -188,6 +188,56 @@
         "type": "boolean",
         "default": false,
         "description": "When enabled, turning a side's Away Mode switch on first turns that side off, then enables away mode, as two sequenced writes. Turning Away Mode off never touches power, regardless of this setting. Off by default. Has no effect when the Away Mode switch itself is disabled."
+      },
+      "wakeAlarmSwitch": {
+        "title": "Wake Alarm switch",
+        "type": "boolean",
+        "default": false,
+        "description": "Publishes a per-side momentary Wake Alarm switch. Turning it on fires the alarm configured under Wake Alarm on that side only, overriding away mode and power state. The tile self-resets to off after about a second; the side's Dismiss Alarm switch reflects the vibration itself. Off by default."
+      },
+      "wakeAlarm": {
+        "title": "Wake Alarm",
+        "type": "object",
+        "description": "The alarm the Wake Alarm switch fires. Ignored unless the Wake Alarm switch is enabled.",
+        "properties": {
+          "duration": {
+            "title": "Duration (seconds)",
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 180,
+            "default": 180
+          },
+          "vibrationIntensity": {
+            "title": "Vibration intensity (1–100)",
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 100,
+            "default": 100
+          },
+          "vibrationPattern": {
+            "title": "Vibration pattern",
+            "type": "string",
+            "default": "double",
+            "oneOf": [
+              { "title": "Double (works on every Pod)", "enum": ["double"] },
+              { "title": "Rise (silently does nothing on a Pod 3)", "enum": ["rise"] }
+            ]
+          }
+        }
+      },
+      "snoozeSwitch": {
+        "title": "Snooze switch",
+        "type": "boolean",
+        "default": false,
+        "description": "Publishes a per-side momentary Snooze switch. Turning it on stops that side's ringing alarm and raises its target temperature by the snooze delta, turning the side on if it had timed out, in one write. The tile self-resets to off after about a second. Off by default."
+      },
+      "snoozeTemperatureDeltaF": {
+        "title": "Snooze temperature delta (°F)",
+        "type": "integer",
+        "minimum": -55,
+        "maximum": 55,
+        "default": 10,
+        "description": "Whole degrees Fahrenheit added to the side's current target on each Snooze press, clamped to 55–110°F. Negative values cool instead. Must not be 0. Ignored unless the Snooze switch is enabled."
       }
     },
     "required": ["host"]

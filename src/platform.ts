@@ -59,7 +59,9 @@ import { isOccupancyChange, OCCUPANCY_SUBTYPE, OccupancySensorService } from './
 import { PRIME_SUBTYPE, PrimeService } from './services/prime.ts';
 import { SERVER_FAULT_SUBTYPE, ServerFaultService } from './services/serverFault.ts';
 import { isSkipAlarmChange, SKIP_ALARM_SUBTYPE, SkipAlarmService } from './services/skipAlarm.ts';
+import { SNOOZE_SUBTYPE, SnoozeService } from './services/snooze.ts';
 import { TEST_ALARM_LEFT_SUBTYPE, TEST_ALARM_RIGHT_SUBTYPE, TestAlarmService } from './services/testAlarm.ts';
+import { WAKE_ALARM_SUBTYPE, WakeAlarmService } from './services/wakeAlarm.ts';
 import { isThermostatChange, THERMOSTAT_SUBTYPE, ThermostatService } from './services/thermostat.ts';
 import type { ServiceContext } from './services/types.ts';
 import { WATER_LOW_SUBTYPE, WaterLowService } from './services/waterLow.ts';
@@ -216,6 +218,10 @@ function enabledServiceKeysFor(hap: HAP, role: Role, config: FreeSleepConfig): R
   // settings-switches (#17/#18, tech-lead resolution 3): each gated by its own boolean, default true.
   if (config.awayModeSwitch) keys.push(`${hap.Service.Switch.UUID}:${AWAY_MODE_SUBTYPE}`);
   if (config.skipAlarmSwitch) keys.push(`${hap.Service.Switch.UUID}:${SKIP_ALARM_SUBTYPE}`);
+  // wake-alarm-controls: each gated by its own boolean, default false (both can vibrate or
+  // re-heat a sleeping person's bed, so they ship opt-in like the hub's test-alarm switch).
+  if (config.wakeAlarmSwitch) keys.push(`${hap.Service.Switch.UUID}:${WAKE_ALARM_SUBTYPE}`);
+  if (config.snoozeSwitch) keys.push(`${hap.Service.Switch.UUID}:${SNOOZE_SUBTYPE}`);
   return new Set(keys);
 }
 
@@ -267,6 +273,10 @@ export class FreeSleepPlatform implements DynamicPlatformPlugin {
   private readonly awayModeServices = new Map<Side, AwayModeService>();
   /** settings-switches (#17). Populated only when `config.skipAlarmSwitch` is `true` (the default). */
   private readonly skipAlarmServices = new Map<Side, SkipAlarmService>();
+  /** wake-alarm-controls. Populated only when `config.wakeAlarmSwitch` is `true` (default false). */
+  private readonly wakeAlarmServices = new Map<Side, WakeAlarmService>();
+  /** wake-alarm-controls. Populated only when `config.snoozeSwitch` is `true` (default false). */
+  private readonly snoozeServices = new Map<Side, SnoozeService>();
   private connectionService: ConnectionService | undefined;
   private waterLowService: WaterLowService | undefined;
   private primeService: PrimeService | undefined;
@@ -438,6 +448,12 @@ export class FreeSleepPlatform implements DynamicPlatformPlugin {
       for (const skipAlarmService of this.skipAlarmServices.values()) {
         skipAlarmService.stop();
       }
+      for (const wakeAlarmService of this.wakeAlarmServices.values()) {
+        wakeAlarmService.stop();
+      }
+      for (const snoozeService of this.snoozeServices.values()) {
+        snoozeService.stop();
+      }
       this.unsubscribeSnapshot?.();
       this.unsubscribeSnapshot = undefined;
     });
@@ -574,6 +590,13 @@ export class FreeSleepPlatform implements DynamicPlatformPlugin {
       }
       if (ctx.config.skipAlarmSwitch) {
         this.skipAlarmServices.set(role, new SkipAlarmService(ctx, role, this.platformStartedAt));
+      }
+      // wake-alarm-controls: each gated by its own boolean, default false.
+      if (ctx.config.wakeAlarmSwitch) {
+        this.wakeAlarmServices.set(role, new WakeAlarmService(ctx, role));
+      }
+      if (ctx.config.snoozeSwitch) {
+        this.snoozeServices.set(role, new SnoozeService(ctx, role));
       }
     }
   }
