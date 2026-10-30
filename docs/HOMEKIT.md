@@ -248,6 +248,11 @@ routinely miss the entire alarm.**
   never consults `controlBothSides` for this field either (`server/src/routes/deviceStatus/
   updateDeviceStatus.ts`), so this is parity, not a carve-out. Without it, a user could not stop
   a ringing alarm from HomeKit while either side was away under the `'block'` policy.
+- **`alarmPressEvent` hides the button** (`hide-alarm-press` change, default `true`): the
+  programmable switch is gated separately from the dismiss switch and the fast-poll scheduler,
+  so a household that triggers nothing from "When … is pressed" can drop the un-tappable tile.
+  `AlarmService` simply constructs no press service and fires no event; the prune table omits
+  the subtype so a cached button is removed on restore.
 - **`alarmSwitchStartsAlarm` makes the switch two-way** (`alarm-switch-start` change, opt-in,
   default `false`). With it on, an ON write is no longer accepted-and-reverted: it posts
   `POST /api/alarm` for this side with `alarmSwitchAlarm` and `force: true` (`executeAlarm`

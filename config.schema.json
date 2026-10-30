@@ -189,6 +189,12 @@
         "default": false,
         "description": "When enabled, turning a side's Away Mode switch on first turns that side off, then enables away mode, as two sequenced writes. Turning Away Mode off never touches power, regardless of this setting. Off by default. Has no effect when the Away Mode switch itself is disabled."
       },
+      "alarmPressEvent": {
+        "title": "Alarm event button",
+        "type": "boolean",
+        "default": true,
+        "description": "Publishes the per-side Alarm button (a stateless programmable switch that fires Single Press when the Pod starts vibrating, for use in automations). Turn off to hide it; the Dismiss Alarm switch and alarm fast-polling are unaffected. On by default. No effect when alarm events are disabled."
+      },
       "alarmSwitchStartsAlarm": {
         "title": "Alarm switch starts an alarm",
         "type": "boolean",

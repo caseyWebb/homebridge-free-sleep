@@ -26,7 +26,7 @@ import {
   type Schedules,
   type Side,
 } from '../src/pod/types.js';
-import { ALARM_DISMISS_SUBTYPE } from '../src/services/alarm.js';
+import { ALARM_DISMISS_SUBTYPE, ALARM_PRESS_SUBTYPE } from '../src/services/alarm.js';
 import { AWAY_MODE_SUBTYPE } from '../src/services/awayMode.js';
 import { SKIP_ALARM_SUBTYPE } from '../src/services/skipAlarm.js';
 import type { AlarmRequest } from '../src/pod/types.js';
@@ -1577,5 +1577,29 @@ describe('alarm-switch-start: platform wiring', () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+});
+
+describe('hide-alarm-press: alarmPressEvent gates the button independently of the dismiss switch', () => {
+  it('default publishes the button; alarmPressEvent: false on restore prunes it and keeps the dismiss switch', async () => {
+    const first = await simulateRestart(factory(resolvedFakeClient()), baseConfig(), []);
+    const previous = first.api.registeredAccessories;
+    const hap = first.api.hap;
+    const left = previous.find((a) => a.displayName === 'Left')!;
+    expect(left.getServiceById(hap.Service.StatelessProgrammableSwitch, ALARM_PRESS_SUBTYPE)).toBeDefined();
+
+    const second = await simulateRestart(factory(resolvedFakeClient()), baseConfig({ alarmPressEvent: false }), previous);
+    expect(left.getServiceById(hap.Service.StatelessProgrammableSwitch, ALARM_PRESS_SUBTYPE)).toBeUndefined();
+    expect(left.getServiceById(hap.Service.Switch, ALARM_DISMISS_SUBTYPE)).toBeDefined();
+    expect(internals(second.platform).alarmServices.size).toBe(2);
+  });
+
+  it('alarmPressEvent: false -> true restores the button without duplicating it', async () => {
+    const first = await simulateRestart(factory(resolvedFakeClient()), baseConfig({ alarmPressEvent: false }), []);
+    const previous = first.api.registeredAccessories;
+    const hap = first.api.hap;
+    await simulateRestart(factory(resolvedFakeClient()), baseConfig(), previous);
+    const left = previous.find((a) => a.displayName === 'Left')!;
+    expect(left.services.filter((sv) => sv.UUID === hap.Service.StatelessProgrammableSwitch.UUID)).toHaveLength(1);
   });
 });

@@ -208,10 +208,9 @@ function enabledServiceKeysFor(hap: HAP, role: Role, config: FreeSleepConfig): R
   }
   // alarm-events (#16, tech-lead resolution 2): gated by `alarmEvents` (default true).
   if (config.alarmEvents) {
-    keys.push(
-      `${hap.Service.StatelessProgrammableSwitch.UUID}:${ALARM_PRESS_SUBTYPE}`,
-      `${hap.Service.Switch.UUID}:${ALARM_DISMISS_SUBTYPE}`,
-    );
+    keys.push(`${hap.Service.Switch.UUID}:${ALARM_DISMISS_SUBTYPE}`);
+    // hide-alarm-press: the button is separately gated (default on).
+    if (config.alarmPressEvent) keys.push(`${hap.Service.StatelessProgrammableSwitch.UUID}:${ALARM_PRESS_SUBTYPE}`);
   }
   // settings-switches (#17/#18, tech-lead resolution 3): each gated by its own boolean, default true.
   if (config.awayModeSwitch) keys.push(`${hap.Service.Switch.UUID}:${AWAY_MODE_SUBTYPE}`);

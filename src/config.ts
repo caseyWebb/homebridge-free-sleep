@@ -345,6 +345,16 @@ export const FreeSleepConfigSchema = z.object({
   awayModeTurnsSideOff: z.boolean().default(false),
 
   /**
+   * Consumed by `hide-alarm-press`: gates the per-side alarm-press
+   * `StatelessProgrammableSwitch` (the "Alarm" button that fires "Single Press" when the Pod
+   * starts vibrating) independently of the "Dismiss Alarm" switch and the fast-poll scheduler,
+   * which stay governed by `alarmEvents`. Default `true` (unchanged behaviour); set `false` to
+   * hide the button for a household that triggers nothing from it. No effect when `alarmEvents`
+   * is `false` (nothing alarm-related is published then).
+   */
+  alarmPressEvent: z.boolean().default(true),
+
+  /**
    * Consumed by `alarm-switch-start`: when `true`, writing ON to a side's "Dismiss Alarm"
    * `Switch` (`src/services/alarm.ts`) starts the alarm described by `alarmSwitchAlarm` on that
    * side (`POST /api/alarm`, `force: true`) instead of being accepted-and-reverted, turning the

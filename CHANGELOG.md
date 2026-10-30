@@ -8,6 +8,8 @@ All notable user-facing changes to this project are documented here. Format loos
 
 ### Added
 
+- `alarmPressEvent` (default on): set to `false` to hide each side's "Alarm" event button while
+  keeping the Dismiss Alarm switch and alarm fast-polling. (`hide-alarm-press`)
 - Opt-in two-way Alarm switch (`alarmSwitchStartsAlarm`, default off): with it on, turning a
   side's "Dismiss Alarm" switch on starts the alarm configured under `alarmSwitchAlarm` (default
   180 s, intensity 100, double) on that side with `force: true`; the tile stays on while the Pod

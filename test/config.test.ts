@@ -777,6 +777,31 @@ describe('FreeSleepConfigSchema — alarm-switch-start keys', () => {
   });
 });
 
+describe('FreeSleepConfigSchema — alarmPressEvent (hide-alarm-press)', () => {
+  it('defaults to true', () => {
+    const result = FreeSleepConfigSchema.safeParse({ host: 'pod.local' });
+    expect(result.success).toBe(true);
+    if (result.success) expect(result.data.alarmPressEvent).toBe(true);
+  });
+
+  it('parses an explicit false independently of alarmEvents', () => {
+    const result = FreeSleepConfigSchema.safeParse({ host: 'pod.local', alarmPressEvent: false });
+    expect(result.success).toBe(true);
+    if (result.success) {
+      expect(result.data.alarmPressEvent).toBe(false);
+      expect(result.data.alarmEvents).toBe(true);
+    }
+  });
+
+  it('rejects a non-boolean value, naming the key', () => {
+    const result = FreeSleepConfigSchema.safeParse({ host: 'pod.local', alarmPressEvent: 'no' });
+    expect(result.success).toBe(false);
+    if (!result.success) {
+      expect(result.error.issues.some((issue) => issue.path.join('.') === 'alarmPressEvent')).toBe(true);
+    }
+  });
+});
+
 describe('unrecognizedConfigKeys', () => {
   it('ignores Homebridge-injected keys and schema-defined keys', () => {
     expect(

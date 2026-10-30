@@ -71,7 +71,9 @@ export class AlarmService {
   private readonly ctx: ServiceContext;
   private readonly side: Side;
   private readonly platformStartedAt: number;
-  private readonly pressService: Service;
+  /** `undefined` when `config.alarmPressEvent` is `false` (`hide-alarm-press`): no button is
+   * published and `handleChange` fires nothing; the dismiss switch is unaffected. */
+  private readonly pressService: Service | undefined;
   private readonly dismissService: Service;
 
   /** The dismiss switch's own last-pushed `On` value — mirrors `ThermostatService`'s shadow
@@ -111,20 +113,26 @@ export class AlarmService {
     const hap = ctx.api.hap;
     const accessory = ctx.accessory;
 
-    const existingPress = accessory.getServiceById(hap.Service.StatelessProgrammableSwitch, ALARM_PRESS_SUBTYPE);
-    this.pressService =
-      existingPress ??
-      accessory.addService(new hap.Service.StatelessProgrammableSwitch(`${accessory.displayName} Alarm`, ALARM_PRESS_SUBTYPE));
-    seedConfiguredName(this.pressService, hap, CONFIGURED_NAME.alarm);
-    // Every setProps call happens before any value is set and before the accessory is
-    // registered (mirrors ThermostatService's own construction-ordering discipline). HAP
-    // explicitly exempts ProgrammableSwitchEvent from the setProps revalidation path (docs/
-    // HOMEKIT.md), so this is safe the same way it is for every other button-shaped accessory.
-    this.pressService.getCharacteristic(hap.Characteristic.ProgrammableSwitchEvent).setProps({
-      validValues: [hap.Characteristic.ProgrammableSwitchEvent.SINGLE_PRESS],
-    });
-    // No onGet at all — this characteristic has no meaningful "current value" to serve; every
-    // existing StatelessProgrammableSwitch implementation is push-only via updateValue.
+    if (ctx.config.alarmPressEvent) {
+      const existingPress = accessory.getServiceById(hap.Service.StatelessProgrammableSwitch, ALARM_PRESS_SUBTYPE);
+      this.pressService =
+        existingPress ??
+        accessory.addService(new hap.Service.StatelessProgrammableSwitch(`${accessory.displayName} Alarm`, ALARM_PRESS_SUBTYPE));
+      seedConfiguredName(this.pressService, hap, CONFIGURED_NAME.alarm);
+      // Every setProps call happens before any value is set and before the accessory is
+      // registered (mirrors ThermostatService's own construction-ordering discipline). HAP
+      // explicitly exempts ProgrammableSwitchEvent from the setProps revalidation path (docs/
+      // HOMEKIT.md), so this is safe the same way it is for every other button-shaped accessory.
+      this.pressService.getCharacteristic(hap.Characteristic.ProgrammableSwitchEvent).setProps({
+        validValues: [hap.Characteristic.ProgrammableSwitchEvent.SINGLE_PRESS],
+      });
+      // No onGet at all — this characteristic has no meaningful "current value" to serve; every
+      // existing StatelessProgrammableSwitch implementation is push-only via updateValue.
+    } else {
+      // hide-alarm-press: the platform's prune table already omits the subtype, so a cached
+      // button from an earlier config is removed on restore before this constructor runs.
+      this.pressService = undefined;
+    }
 
     const existingDismiss = accessory.getServiceById(hap.Service.Switch, ALARM_DISMISS_SUBTYPE);
     this.dismissService =
@@ -333,7 +341,7 @@ export class AlarmService {
   handleChange(change: AlarmVibratingChange): void {
     this.publishDismissState(change.current);
     if (change.previous === false && change.current === true) {
-      if (this.dismissOverlayGuardActive) return;
+      if (this.dismissOverlayGuardActive || !this.pressService) return;
       const hap = this.ctx.api.hap;
       this.pressService
         .getCharacteristic(hap.Characteristic.ProgrammableSwitchEvent)

@@ -310,3 +310,29 @@ describe('the dismiss switch keeps its subtype and identity either way', () => {
     expect(switches[0]?.subtype).toBe(ALARM_DISMISS_SUBTYPE);
   });
 });
+
+describe('alarmPressEvent: false hides the button (hide-alarm-press)', () => {
+  it('constructs no StatelessProgrammableSwitch, fires no press on a start, and the dismiss switch still works', async () => {
+    const s = setup({ config: { alarmPressEvent: false } });
+    // `build` looks the press service up to count presses; it does not exist here, so wire by hand.
+    const service = new AlarmService(s.ctx, 'right', s.timers.now());
+    route(s.snapshot, service);
+    const presses = s.accessory.services.filter((sv) => sv.UUID === s.api.hap.Service.StatelessProgrammableSwitch.UUID);
+    expect(presses).toHaveLength(0);
+    const dismiss = s.accessory.getServiceById(s.api.hap.Service.Switch, ALARM_DISMISS_SUBTYPE)!;
+    expect(dismiss).toBeDefined();
+    const on = dismiss.getCharacteristic(s.api.hap.Characteristic.On);
+
+    const pending = on.handleSetRequest(true);
+    await vi.advanceTimersByTimeAsync(0);
+    await pending;
+    expect(s.fake.postAlarmCalls).toHaveLength(1);
+    expect(await on.handleGetRequest()).toBe(true);
+
+    // A genuine observed rising edge later also fires nothing — there is no service to fire on.
+    const ringing = structuredClone(deviceStatusFixture);
+    ringing.right.isAlarmVibrating = true;
+    expect(() => s.snapshot.observeDeviceStatus(ringing)).not.toThrow();
+    service.stop();
+  });
+});
