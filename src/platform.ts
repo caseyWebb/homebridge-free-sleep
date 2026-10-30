@@ -520,6 +520,8 @@ export class FreeSleepPlatform implements DynamicPlatformPlugin {
 
   private serviceContextFor(accessory: PlatformAccessory): ServiceContext | undefined {
     if (!this.config || !this.snapshot || !this.writeQueue || !this.awayModeGuard || !this.podClient) return undefined;
+    const poller = this.poller;
+    const alarmPollIntervalMs = this.config.pollIntervals.alarmPollIntervalMs ?? DEFAULT_ALARM_POLL_INTERVAL_MS;
     return {
       api: this.api,
       log: this.log,
@@ -530,6 +532,14 @@ export class FreeSleepPlatform implements DynamicPlatformPlugin {
       timers: this.timers,
       config: this.config,
       podClient: this.podClient,
+      // alarm-switch-start: the same fast-poll request the AlarmWindowScheduler makes around a
+      // scheduled alarm, for an alarm the Alarm switch starts on demand.
+      ...(poller
+        ? {
+            requestAlarmPoll: (untilMs: number) =>
+              poller.requestMode('deviceStatus', { intervalMs: alarmPollIntervalMs, untilMs, reason: 'alarm-switch' }),
+          }
+        : {}),
     };
   }
 

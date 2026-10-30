@@ -4,7 +4,7 @@ import { fileURLToPath } from 'node:url';
 
 import { describe, expect, it } from 'vitest';
 
-import { FreeSleepConfigSchema, PollIntervalsFieldsSchema, unrecognizedConfigKeys } from '../src/config.js';
+import { FreeSleepConfigSchema, PollIntervalsFieldsSchema, unrecognizedConfigKeys, AlarmSwitchAlarmFieldsSchema } from '../src/config.js';
 import { PLATFORM_NAME } from '../src/settings.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -722,6 +722,58 @@ describe('FreeSleepConfigSchema — awayModeTurnsSideOff (settings-switches)', (
     if (!result.success) {
       expect(result.error.issues.some((issue) => issue.path.join('.') === 'awayModeTurnsSideOff')).toBe(true);
     }
+  });
+});
+
+// ---------------------------------------------------------------------------------------
+// alarm-switch-start: alarmSwitchStartsAlarm, alarmSwitchAlarm
+// ---------------------------------------------------------------------------------------
+
+describe('FreeSleepConfigSchema — alarm-switch-start keys', () => {
+  it('alarmSwitchStartsAlarm defaults to false and alarmSwitchAlarm to the fully-populated default', () => {
+    const result = FreeSleepConfigSchema.safeParse({ host: 'pod.local' });
+    expect(result.success).toBe(true);
+    if (!result.success) return;
+    expect(result.data.alarmSwitchStartsAlarm).toBe(false);
+    expect(result.data.alarmSwitchAlarm).toEqual({ duration: 180, vibrationIntensity: 100, vibrationPattern: 'double' });
+  });
+
+  it('a partial alarmSwitchAlarm object fills the remaining fields from their defaults', () => {
+    const result = FreeSleepConfigSchema.safeParse({ host: 'pod.local', alarmSwitchAlarm: { duration: 30 } });
+    expect(result.success).toBe(true);
+    if (result.success) {
+      expect(result.data.alarmSwitchAlarm).toEqual({ duration: 30, vibrationIntensity: 100, vibrationPattern: 'double' });
+    }
+  });
+
+  it.each([
+    ['duration', 0],
+    ['duration', 181],
+    ['duration', 1.5],
+    ['vibrationIntensity', 0],
+    ['vibrationIntensity', 101],
+    ['vibrationPattern', 'triple'],
+  ])('rejects alarmSwitchAlarm.%s = %s, naming the path', (field, value) => {
+    const result = FreeSleepConfigSchema.safeParse({ host: 'pod.local', alarmSwitchAlarm: { [field]: value } });
+    expect(result.success).toBe(false);
+    if (!result.success) {
+      expect(result.error.issues.some((issue) => issue.path.join('.') === `alarmSwitchAlarm.${field}`)).toBe(true);
+    }
+  });
+
+  it('rejects a non-boolean alarmSwitchStartsAlarm, naming the key', () => {
+    const result = FreeSleepConfigSchema.safeParse({ host: 'pod.local', alarmSwitchStartsAlarm: 'yes' });
+    expect(result.success).toBe(false);
+    if (!result.success) {
+      expect(result.error.issues.some((issue) => issue.path.join('.') === 'alarmSwitchStartsAlarm')).toBe(true);
+    }
+  });
+
+  it("config.schema.json's alarmSwitchAlarm.properties match AlarmSwitchAlarmFieldsSchema's shape", () => {
+    const uiProps = (readConfigSchemaJson().schema.properties.alarmSwitchAlarm as { properties?: Record<string, unknown> })
+      .properties;
+    expect(uiProps).toBeDefined();
+    expect(new Set(Object.keys(uiProps ?? {}))).toEqual(new Set(Object.keys(AlarmSwitchAlarmFieldsSchema.shape)));
   });
 });
 

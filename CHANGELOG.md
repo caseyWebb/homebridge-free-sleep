@@ -8,6 +8,13 @@ All notable user-facing changes to this project are documented here. Format loos
 
 ### Added
 
+- Opt-in two-way Alarm switch (`alarmSwitchStartsAlarm`, default off): with it on, turning a
+  side's "Dismiss Alarm" switch on starts the alarm configured under `alarmSwitchAlarm` (default
+  180 s, intensity 100, double) on that side with `force: true`; the tile stays on while the Pod
+  vibrates (fast-polled for the duration) and turns itself off when the alarm ends. Turning it
+  off dismisses as before. Built so the iPhone's own Sleep-alarm Shortcuts triggers can drive the
+  bed through Home actions alone. Stopping a ringing alarm on a Pod 3 additionally needs a
+  free-sleep build that fixes upstream #54 — see `docs/POD-API.md`. (`alarm-switch-start`)
 - Every HAP service on every accessory now carries a distinct `ConfiguredName`, seeded once at
   construction and never overwritten afterward — controller (Home app) renames persist exactly
   like accessory-level renames already do. Fixes tiles that previously all showed the same

@@ -11,12 +11,28 @@
  * initial-publish call from the constructor, an accept-then-revert timer for the dismiss switch's
  * on-write (reusing `ThermostatService`'s named delay/pattern), and a `platformStartedAt`-based
  * No-Response escalation predicate on the dismiss switch's `onGet`.
+ *
+ * **`alarmSwitchStartsAlarm` (`alarm-switch-start` change):** with the flag on, the dismiss
+ * switch becomes a two-way Alarm switch. An ON write posts `POST /api/alarm` for this side with
+ * `config.alarmSwitchAlarm` and `force: true` (`executeAlarm` silently no-ops an off or away
+ * side without it, free-sleep `server/src/jobs/alarmScheduler.ts`), then installs an
+ * `isAlarmVibrating: true` overlay on the snapshot for the alarm's real duration
+ * (`max(10, duration)` s — upstream's own clamp) and requests a fast-poll window for the same
+ * span plus a tail. The overlay makes the tile read on (and fires the alarm-press event) at
+ * once; it retires silently when a poll confirms the Pod is vibrating, and otherwise expires at
+ * the duration's end — so if nothing is ever observed the tile still turns itself off when the
+ * alarm would have ended. The fast poll is what lets the *end* of the vibration (upstream's own
+ * timer flipping the flag back) be seen within seconds rather than on the base ~30s poll. An OFF
+ * write is unchanged: the same dismiss write as before, whose own overlay simply supersedes the
+ * start overlay (same snapshot key). A rejected `postAlarm` surfaces as
+ * `SERVICE_COMMUNICATION_FAILURE` and the tile reverts to the observed value; there is no retry
+ * (a second attempt landing while the first is in progress would re-fire the alarm).
  */
 
 import type { Service } from 'homebridge';
 
 import { AwayModeBlockedError } from '../pod/awayModeGuard.ts';
-import type { Change, TimerHandle } from '../pod/snapshot.ts';
+import type { Change, OverlayHandle, TimerHandle } from '../pod/snapshot.ts';
 import type { Side } from '../pod/types.ts';
 import { CONFIGURED_NAME, seedConfiguredName } from './serviceName.ts';
 import type { ServiceContext } from './types.ts';
@@ -28,6 +44,13 @@ export const ALARM_DISMISS_SUBTYPE = 'alarm-dismiss';
  * accept-then-revert for the dismiss switch's on-write, and the same delay a `block`-refused
  * write reverts after. */
 const DISMISS_REVERT_DELAY_MS = 500;
+
+/** Upstream's own floor on a real vibration: `Math.max(10, duration) * 1000` ms
+ * (`server/src/jobs/alarmScheduler.ts`'s `executeAlarm`). */
+const MIN_VIBRATION_S = 10;
+/** How long past the alarm's nominal end the start-triggered fast-poll window keeps running, so
+ * the final `isAlarmVibrating: false` observation is not left to the base poll. */
+const ALARM_POLL_TAIL_MS = 30_000;
 
 /** The single `Change` variant this service watches — `SideChange<'isAlarmVibrating', boolean>`
  * (`src/pod/snapshot.ts`). */
@@ -72,6 +95,13 @@ export class AlarmService {
   /** The pending guard-clear timer for the success path above, if any — retained so `stop()` can
    * clear it, mirroring `revertTimer`. */
   private dismissOverlayGuardTimer: TimerHandle | null = null;
+  /** `alarm-switch-start`: the `isAlarmVibrating: true` overlay the last successful ON write
+   * installed, if any — retained so `stop()` can clear it. A later dismiss write's own overlay
+   * replaces it on the same snapshot key, leaving this handle harmlessly stale. */
+  private startOverlay: OverlayHandle | null = null;
+  /** `alarm-switch-start`: release function for the fast-poll window the last ON write
+   * requested, if any — released on `stop()`; otherwise it lapses at its own `untilMs`. */
+  private releaseAlarmPoll: (() => void) | null = null;
 
   constructor(ctx: ServiceContext, side: Side, platformStartedAt: number) {
     this.ctx = ctx;
@@ -156,6 +186,10 @@ export class AlarmService {
       this.publishedOn = value;
 
       if (value) {
+        if (this.ctx.config.alarmSwitchStartsAlarm) {
+          await this.startAlarm();
+          return;
+        }
         // isAlarmVibrating: true is unsupported server-side (docs/POD-API.md: "`true` is
         // unsupported and logged as such") — never sent to the Pod. Accepted, then quietly
         // reverted to the actually-observed value (alarm-events spec's "Turning the dismiss
@@ -198,6 +232,35 @@ export class AlarmService {
         throw new hap.HapStatusError(hap.HAPStatus.SERVICE_COMMUNICATION_FAILURE);
       }
     });
+  }
+
+  /**
+   * `alarm-switch-start`: the ON write with `alarmSwitchStartsAlarm` on — see the module doc.
+   * Order matters: the request is awaited first so a failure reverts the tile without ever
+   * having claimed "ringing"; only a confirmed `200` installs the overlay and the fast poll.
+   */
+  private async startAlarm(): Promise<void> {
+    const hap = this.ctx.api.hap;
+    const { duration, vibrationIntensity, vibrationPattern } = this.ctx.config.alarmSwitchAlarm;
+    try {
+      await this.ctx.podClient.postAlarm({ side: this.side, duration, vibrationIntensity, vibrationPattern, force: true });
+    } catch (error) {
+      this.ctx.log.warn(`FreeSleep: ${this.side} alarm start failed: ${describeError(error)}`);
+      this.scheduleRevert();
+      throw new hap.HapStatusError(hap.HAPStatus.SERVICE_COMMUNICATION_FAILURE);
+    }
+    const vibrationMs = Math.max(MIN_VIBRATION_S, duration) * 1000;
+    this.clearStartOverlay();
+    this.startOverlay = this.ctx.snapshot.setOverlay(this.side, 'isAlarmVibrating', true, vibrationMs);
+    this.releaseAlarmPoll?.();
+    this.releaseAlarmPoll = this.ctx.requestAlarmPoll?.(this.ctx.timers.now() + vibrationMs + ALARM_POLL_TAIL_MS) ?? null;
+  }
+
+  private clearStartOverlay(): void {
+    if (this.startOverlay !== null) {
+      this.ctx.snapshot.clearOverlay(this.startOverlay);
+      this.startOverlay = null;
+    }
   }
 
   private armDismissOverlayGuard(): void {
@@ -286,5 +349,10 @@ export class AlarmService {
       this.revertTimer = null;
     }
     this.clearDismissOverlayGuard();
+    this.clearStartOverlay();
+    if (this.releaseAlarmPoll !== null) {
+      this.releaseAlarmPoll();
+      this.releaseAlarmPoll = null;
+    }
   }
 }

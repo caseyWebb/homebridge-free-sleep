@@ -188,6 +188,42 @@
         "type": "boolean",
         "default": false,
         "description": "When enabled, turning a side's Away Mode switch on first turns that side off, then enables away mode, as two sequenced writes. Turning Away Mode off never touches power, regardless of this setting. Off by default. Has no effect when the Away Mode switch itself is disabled."
+      },
+      "alarmSwitchStartsAlarm": {
+        "title": "Alarm switch starts an alarm",
+        "type": "boolean",
+        "default": false,
+        "description": "When enabled, turning a side's Dismiss Alarm switch on starts the alarm configured below on that side (overriding away mode and power state), so the tile works both ways: on = start / ringing, off = dismiss. The tile stays on while the Pod vibrates and turns itself off when the alarm ends. Off by default. Has no effect when alarm events are disabled."
+      },
+      "alarmSwitchAlarm": {
+        "title": "Alarm fired by the Alarm switch",
+        "type": "object",
+        "description": "The alarm an on-write fires when the setting above is enabled. Otherwise ignored.",
+        "properties": {
+          "duration": {
+            "title": "Duration (seconds)",
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 180,
+            "default": 180
+          },
+          "vibrationIntensity": {
+            "title": "Vibration intensity (1–100)",
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 100,
+            "default": 100
+          },
+          "vibrationPattern": {
+            "title": "Vibration pattern",
+            "type": "string",
+            "default": "double",
+            "oneOf": [
+              { "title": "Double (works on every Pod)", "enum": ["double"] },
+              { "title": "Rise (silently does nothing on a Pod 3)", "enum": ["rise"] }
+            ]
+          }
+        }
       }
     },
     "required": ["host"]

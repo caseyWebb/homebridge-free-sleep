@@ -248,6 +248,27 @@ routinely miss the entire alarm.**
   never consults `controlBothSides` for this field either (`server/src/routes/deviceStatus/
   updateDeviceStatus.ts`), so this is parity, not a carve-out. Without it, a user could not stop
   a ringing alarm from HomeKit while either side was away under the `'block'` policy.
+- **`alarmSwitchStartsAlarm` makes the switch two-way** (`alarm-switch-start` change, opt-in,
+  default `false`). With it on, an ON write is no longer accepted-and-reverted: it posts
+  `POST /api/alarm` for this side with `alarmSwitchAlarm` and `force: true` (`executeAlarm`
+  silently no-ops an off or away side without it, `server/src/jobs/alarmScheduler.ts`). On a
+  `200`, the service installs an `isAlarmVibrating: true` snapshot overlay for the alarm's real
+  duration (`max(10, duration)` s, upstream's own clamp) — the tile reads on at once and the
+  alarm-press event fires, since this *is* a rising edge — and requests a `deviceStatus`
+  fast-poll window (`pollIntervals.alarmPollIntervalMs`) for that span plus 30 s through a new
+  optional `ServiceContext.requestAlarmPoll`, the same `PodPoller.requestMode` the window
+  scheduler uses around a scheduled alarm. The overlay retires silently once a poll confirms the
+  Pod is vibrating (raw then governs, so the tile tracks the real end), and otherwise expires at
+  the duration's end, so the tile turns itself off even if nothing was ever observed. An OFF
+  write is unchanged — its own dismiss overlay supersedes the start overlay on the same key. A
+  rejected post maps to `SERVICE_COMMUNICATION_FAILURE` and reverts the tile; no retry. The
+  intended use is three iOS Sleep-alarm Shortcuts automations built from Home actions only:
+  "goes off" → Alarm on; "is snoozed" → Alarm off + Thermostat to a warmer absolute target; "is
+  dismissed" → Alarm off + Thermostat Off. The seeded `ConfiguredName` stays "Dismiss Alarm"
+  (never overwritten for existing installs); rename the tile to "Alarm" in the Home app.
+  **Needs confirming on a paired device:** that a Shortcuts "Control Home" action turning the
+  switch on from outside the LAN (via the home hub) is acknowledged within HomeKit's write
+  timeout while `postAlarm` round-trips to the Pod.
 
 ## Away Mode and Skip Next Alarm: two per-side `Switch`es over `POST /api/settings` (`settings-switches`, #17/#18)
 

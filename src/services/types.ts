@@ -50,5 +50,14 @@ export interface ServiceContext {
   readonly awayModeGuard: AwayModeGuard;
   /** The same `TimerApi` instance shared with the poller and the write queue. */
   readonly timers: TimerApi;
+  /**
+   * `alarm-switch-start`: asks the poller for a `deviceStatus` fast-poll window (at the
+   * `alarmPollIntervalMs` cadence) until `untilMs`, returning its release function — the same
+   * `PodPoller.requestMode` the `AlarmWindowScheduler` uses around a *scheduled* alarm, exposed
+   * so an alarm the Alarm switch itself starts is watched just as closely (its start, and above
+   * all its end, would otherwise be seen only on the base ~30s poll). Optional: absent in
+   * hand-built test contexts, in which case the service simply does not accelerate polling.
+   */
+  readonly requestAlarmPoll?: (untilMs: number) => () => void;
   readonly config: FreeSleepConfig;
 }

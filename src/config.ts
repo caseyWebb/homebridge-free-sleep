@@ -128,6 +128,44 @@ export const PollIntervalsFieldsSchema = z
 
 export const PollIntervalsSchema = PollIntervalsFieldsSchema.default({});
 
+/**
+ * The alarm a side's Alarm switch fires when `alarmSwitchStartsAlarm` is on
+ * (`alarm-switch-start`). Exported un-defaulted, like `PollIntervalsFieldsSchema`, so a test
+ * can inspect its `.shape`. Bounds mirror upstream's own `AlarmSchema`
+ * (`server/src/db/schedulesSchema.ts`: intensity 1-100, duration a positive integer up to 180)
+ * and `AlarmRequestSchema` in `src/pod/types.ts`.
+ */
+export const AlarmSwitchAlarmFieldsSchema = z.object({
+  /** Seconds. Upstream clamps the real vibration to at least 10s regardless. Default 180. */
+  duration: z
+    .number()
+    .int()
+    .min(1, { message: 'alarmSwitchAlarm.duration must be at least 1' })
+    .max(180, { message: 'alarmSwitchAlarm.duration cannot exceed 180' })
+    .default(180),
+  /** 1-100. Upstream treats this as a ramp ceiling, not a fixed level. Default 100. */
+  vibrationIntensity: z
+    .number()
+    .int()
+    .min(1, { message: 'alarmSwitchAlarm.vibrationIntensity must be at least 1' })
+    .max(100, { message: 'alarmSwitchAlarm.vibrationIntensity cannot exceed 100' })
+    .default(100),
+  /**
+   * Default `'double'` — the only pattern a Pod 3's firmware actually implements; `'rise'` is
+   * accepted by free-sleep but silently never vibrates there
+   * (https://github.com/throwaway31265/free-sleep/issues/55).
+   */
+  vibrationPattern: z.enum(['double', 'rise']).default('double'),
+});
+
+/** A fully-specified default (not `{}`): zod v4's `.default()` returns its value without
+ * re-parsing it, so an empty object would skip the per-field defaults above. */
+export const AlarmSwitchAlarmSchema = AlarmSwitchAlarmFieldsSchema.default({
+  duration: 180,
+  vibrationIntensity: 100,
+  vibrationPattern: 'double',
+});
+
 export const FreeSleepConfigSchema = z.object({
   /**
    * The Pod's LAN hostname or IP address. Required, non-empty, un-defaulted (config spec,
@@ -305,6 +343,19 @@ export const FreeSleepConfigSchema = z.object({
    * `awayModeSwitch` is `false` (there is then no switch to toggle).
    */
   awayModeTurnsSideOff: z.boolean().default(false),
+
+  /**
+   * Consumed by `alarm-switch-start`: when `true`, writing ON to a side's "Dismiss Alarm"
+   * `Switch` (`src/services/alarm.ts`) starts the alarm described by `alarmSwitchAlarm` on that
+   * side (`POST /api/alarm`, `force: true`) instead of being accepted-and-reverted, turning the
+   * tile into a two-way Alarm switch: on = start/ringing, off = dismiss. Default `false` — a
+   * mis-tap would otherwise vibrate a bed at any hour, and `alarm-events`' original contract was
+   * "ON is never sent to the Pod". Has no effect when `alarmEvents` is `false`.
+   */
+  alarmSwitchStartsAlarm: z.boolean().default(false),
+
+  /** The alarm an ON write fires when `alarmSwitchStartsAlarm` is on. Otherwise ignored. */
+  alarmSwitchAlarm: AlarmSwitchAlarmSchema,
 }).superRefine((data, ctx) => {
   if (data.keepAliveThresholdMs >= data.keepAliveMs) {
     ctx.addIssue({
@@ -320,6 +371,7 @@ export const FreeSleepConfigSchema = z.object({
 
 export type FreeSleepConfig = z.infer<typeof FreeSleepConfigSchema>;
 export type PollIntervalsConfig = z.infer<typeof PollIntervalsSchema>;
+export type AlarmSwitchAlarmConfig = z.infer<typeof AlarmSwitchAlarmSchema>;
 
 /**
  * Top-level keys Homebridge itself injects into every platform's config block — never

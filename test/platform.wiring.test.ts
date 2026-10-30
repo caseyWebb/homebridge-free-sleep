@@ -29,6 +29,7 @@ import {
 import { ALARM_DISMISS_SUBTYPE } from '../src/services/alarm.js';
 import { AWAY_MODE_SUBTYPE } from '../src/services/awayMode.js';
 import { SKIP_ALARM_SUBTYPE } from '../src/services/skipAlarm.js';
+import type { AlarmRequest } from '../src/pod/types.js';
 import { THERMOSTAT_SUBTYPE, type ThermostatService } from '../src/services/thermostat.js';
 import { CONNECTION_SUBTYPE } from '../src/services/connection.js';
 import { WATER_LOW_SUBTYPE } from '../src/services/waterLow.js';
@@ -1515,6 +1516,66 @@ describe('shutdown stops each side\'s AwayModeService and SkipAlarmService (sett
     await api.fireShutdown();
     for (const spy of stopSpies) {
       expect(spy).toHaveBeenCalledTimes(1);
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------------------
+// alarm-switch-start: through the real platform, an ON write to a side's Dismiss Alarm switch
+// posts the configured alarm and leaves the tile on; by default it posts nothing.
+// ---------------------------------------------------------------------------------------
+
+describe('alarm-switch-start: platform wiring', () => {
+  it('with alarmSwitchStartsAlarm, an ON write posts /api/alarm for that side with force and the tile stays on', async () => {
+    vi.useFakeTimers();
+    try {
+      const posted: AlarmRequest[] = [];
+      const client = resolvedFakeClient({
+        postAlarm: (request) => {
+          posted.push(request);
+          return Promise.resolve();
+        },
+      });
+      const { api } = await simulateRestart(
+        factory(client),
+        baseConfig({ alarmSwitchStartsAlarm: true, alarmSwitchAlarm: { duration: 20 } }),
+        [],
+      );
+      const hap = api.hap;
+      const right = api.registeredAccessories.find((a) => a.displayName === 'Right')!;
+      const on = right.getServiceById(hap.Service.Switch, ALARM_DISMISS_SUBTYPE)!.getCharacteristic(hap.Characteristic.On);
+      const pending = on.handleSetRequest(true);
+      await vi.advanceTimersByTimeAsync(0);
+      await pending;
+      expect(posted).toEqual([{ side: 'right', duration: 20, vibrationIntensity: 100, vibrationPattern: 'double', force: true }]);
+      expect(await on.handleGetRequest()).toBe(true);
+      await api.fireShutdown();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('by default an ON write posts no alarm', async () => {
+    vi.useFakeTimers();
+    try {
+      const posted: AlarmRequest[] = [];
+      const client = resolvedFakeClient({
+        postAlarm: (request) => {
+          posted.push(request);
+          return Promise.resolve();
+        },
+      });
+      const { api } = await simulateRestart(factory(client), baseConfig(), []);
+      const hap = api.hap;
+      const right = api.registeredAccessories.find((a) => a.displayName === 'Right')!;
+      const on = right.getServiceById(hap.Service.Switch, ALARM_DISMISS_SUBTYPE)!.getCharacteristic(hap.Characteristic.On);
+      const pending = on.handleSetRequest(true);
+      await vi.advanceTimersByTimeAsync(600);
+      await pending;
+      expect(posted).toHaveLength(0);
+      await api.fireShutdown();
+    } finally {
+      vi.useRealTimers();
     }
   });
 });
