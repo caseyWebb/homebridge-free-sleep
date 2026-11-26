@@ -5,7 +5,8 @@
  * Exactly five characteristics, `setProps` applied at construction before any value is
  * reported and before the accessory is registered (design.md, "Characteristic table"):
  * `CurrentHeatingCoolingState` (no `setProps` — its default valid values are already right),
- * `TargetHeatingCoolingState` (`validValues: [OFF, AUTO]`, OFF first), `CurrentTemperature`
+ * `TargetHeatingCoolingState` (`validValues: [OFF, HEAT, COOL, AUTO]`, OFF first; HEAT and COOL
+ * are accepted as aliases of AUTO and never reported back), `CurrentTemperature`
  * (`{ minValue: -270, maxValue: 100 }`), `TargetTemperature` (`TARGET_TEMP_PROPS`), and
  * `TemperatureDisplayUnits` (no `setProps`, served from `accessory.context`).
  *
@@ -27,6 +28,11 @@ import type { ServiceContext } from './types.ts';
  * optimistically ahead of the throw (design.md, "The tile-revert mechanism" — the same pattern
  * the alarm-dismiss `Switch`'s "accept then quietly revert" already uses). */
 const AWAY_MODE_BLOCKED_REVERT_DELAY_MS = 500;
+
+/** How long after an accepted HEAT/COOL write to normalize the published mode to AUTO. HAP
+ * assigns the written value only after `onSet` resolves, so an in-handler update would be
+ * overwritten; the delay mirrors `AWAY_MODE_BLOCKED_REVERT_DELAY_MS` for the same reason. */
+const MODE_ALIAS_NORMALIZE_DELAY_MS = 500;
 
 export const THERMOSTAT_SUBTYPE = 'thermostat';
 
@@ -79,6 +85,9 @@ export class ThermostatService {
    * clear it on platform shutdown instead of leaving it to fire (or sit pending forever) after
    * teardown. `null` whenever no revert is currently scheduled. */
   private awayModeRevertTimer: TimerHandle | null = null;
+  /** The pending `scheduleModeAliasNormalize` timer, if any — cleared by `stop()` like
+   * `awayModeRevertTimer`. */
+  private modeAliasNormalizeTimer: TimerHandle | null = null;
 
   constructor(ctx: ServiceContext, side: Side, platformStartedAt: number) {
     this.ctx = ctx;
@@ -97,7 +106,16 @@ export class ThermostatService {
     // does not bump the HAP configuration number, and re-validates (and can silently rewrite)
     // the current value if called late (docs/HOMEKIT.md).
     this.service.getCharacteristic(hap.Characteristic.TargetHeatingCoolingState).setProps({
-      validValues: [hap.Characteristic.TargetHeatingCoolingState.OFF, hap.Characteristic.TargetHeatingCoolingState.AUTO],
+      // HEAT and COOL are accepted (and treated as AUTO) rather than refused: the Home app's tile
+      // tap re-sends whatever mode it last remembered for this thermostat, and a remembered HEAT
+      // rejected with INVALID_VALUE_IN_REQUEST bricks the whole side as "No Response" with no
+      // way to recover from the tile (docs/HOMEKIT.md, "TargetHeatingCoolingState").
+      validValues: [
+        hap.Characteristic.TargetHeatingCoolingState.OFF,
+        hap.Characteristic.TargetHeatingCoolingState.HEAT,
+        hap.Characteristic.TargetHeatingCoolingState.COOL,
+        hap.Characteristic.TargetHeatingCoolingState.AUTO,
+      ],
     });
     this.service.getCharacteristic(hap.Characteristic.TargetTemperature).setProps(TARGET_TEMP_PROPS);
     this.service.getCharacteristic(hap.Characteristic.CurrentTemperature).setProps({ minValue: -270, maxValue: 100 });
@@ -239,7 +257,9 @@ export class ThermostatService {
     const displayUnitsChar = this.service.getCharacteristic(hap.Characteristic.TemperatureDisplayUnits);
 
     targetStateChar.onSet(async (value) => {
-      const isOn = value === hap.Characteristic.TargetHeatingCoolingState.AUTO;
+      // Any non-OFF mode means "on": the Pod has one setpoint and heats or cools toward it on its
+      // own, so HEAT and COOL are aliases of AUTO. Reads keep reporting AUTO for a running side.
+      const isOn = value !== hap.Characteristic.TargetHeatingCoolingState.OFF;
       // Claim the mode into the shadow before submitting — mirrors the temperature path (design.md,
       // "The °F shadow") so `submitSide`'s synchronous overlay-install echo, which fires before
       // HAP has assigned `.value`, is suppressed rather than pushed back at the writer (S2).
@@ -255,6 +275,9 @@ export class ThermostatService {
         }
         this.ctx.log.debug(`FreeSleep: ${this.side} power write failed: ${describeError(error)}`);
         throw new hap.HapStatusError(hap.HAPStatus.SERVICE_COMMUNICATION_FAILURE);
+      }
+      if (isOn && value !== hap.Characteristic.TargetHeatingCoolingState.AUTO) {
+        this.scheduleModeAliasNormalize();
       }
     });
 
@@ -323,10 +346,35 @@ export class ThermostatService {
    * write's ~500ms corrective `refresh()` never fires (and never shows up as a leaked pending
    * timer) after the platform has already torn down.
    */
+  /**
+   * After an accepted HEAT/COOL write, replaces the HEAT/COOL that HAP stored with AUTO, so the
+   * value controllers see (and the Home app remembers for its next tile tap) is the one mode this
+   * service ever reports for a running side. Skipped if the side is no longer on by then.
+   */
+  private scheduleModeAliasNormalize(): void {
+    if (this.modeAliasNormalizeTimer !== null) {
+      this.ctx.timers.clearTimeout(this.modeAliasNormalizeTimer);
+    }
+    this.modeAliasNormalizeTimer = this.ctx.timers.setTimeout(() => {
+      this.modeAliasNormalizeTimer = null;
+      const hap = this.ctx.api.hap;
+      const TargetState = hap.Characteristic.TargetHeatingCoolingState;
+      const characteristic = this.service.getCharacteristic(TargetState);
+      if (contextOf(this.ctx).publishedIsOn !== true) return;
+      if (characteristic.value === TargetState.HEAT || characteristic.value === TargetState.COOL) {
+        characteristic.updateValue(TargetState.AUTO);
+      }
+    }, MODE_ALIAS_NORMALIZE_DELAY_MS);
+  }
+
   stop(): void {
     if (this.awayModeRevertTimer !== null) {
       this.ctx.timers.clearTimeout(this.awayModeRevertTimer);
       this.awayModeRevertTimer = null;
+    }
+    if (this.modeAliasNormalizeTimer !== null) {
+      this.ctx.timers.clearTimeout(this.modeAliasNormalizeTimer);
+      this.modeAliasNormalizeTimer = null;
     }
   }
 

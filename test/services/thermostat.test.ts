@@ -172,7 +172,7 @@ describe('construction (2.1)', () => {
 });
 
 describe('properties declared at construction (2.2)', () => {
-  it('TargetHeatingCoolingState validValues are exactly [OFF, AUTO], OFF first', () => {
+  it('TargetHeatingCoolingState validValues are exactly [OFF, HEAT, COOL, AUTO], OFF first', () => {
     const { ctx, api } = setup();
     new ThermostatService(ctx, 'left', 0);
     const accessory = ctx.accessory;
@@ -180,8 +180,23 @@ describe('properties declared at construction (2.2)', () => {
     const char = service.getCharacteristic(api.hap.Characteristic.TargetHeatingCoolingState);
     expect(Array.from(char.validValuesIterator())).toEqual([
       api.hap.Characteristic.TargetHeatingCoolingState.OFF,
+      api.hap.Characteristic.TargetHeatingCoolingState.HEAT,
+      api.hap.Characteristic.TargetHeatingCoolingState.COOL,
       api.hap.Characteristic.TargetHeatingCoolingState.AUTO,
     ]);
+  });
+
+  it('a client HEAT or COOL write is accepted by HAP rather than refused as an invalid value', async () => {
+    const { ctx, api } = setup();
+    new ThermostatService(ctx, 'left', 0);
+    const service = ctx.accessory.getServiceById(api.hap.Service.Thermostat, THERMOSTAT_SUBTYPE)!;
+    const char = service.getCharacteristic(api.hap.Characteristic.TargetHeatingCoolingState);
+    const TargetState = api.hap.Characteristic.TargetHeatingCoolingState;
+    for (const mode of [TargetState.HEAT, TargetState.COOL]) {
+      const pending = char.handleSetRequest(mode);
+      await vi.advanceTimersByTimeAsync(400);
+      await expect(pending).resolves.not.toThrow();
+    }
   });
 
   it('TargetTemperature validValues has 56 whole degrees, 110°F reachable', () => {
@@ -396,6 +411,18 @@ describe('writes map to minimal patches (4.1)', () => {
     const hap = ctx.api.hap;
     const { setHandlers } = build(ctx, 'left');
     const pending = setHandlers.get(UUID.targetState)!(hap.Characteristic.TargetHeatingCoolingState.AUTO, {} as never, undefined);
+    await vi.advanceTimersByTimeAsync(400);
+    await pending;
+    expect(fake.postDeviceStatusCalls).toEqual([{ left: { isOn: true } }]);
+  });
+
+  it.each([
+    ['HEAT', Characteristic.TargetHeatingCoolingState.HEAT],
+    ['COOL', Characteristic.TargetHeatingCoolingState.COOL],
+  ])('%s is an alias of AUTO: a body carrying only isOn: true', async (_name, mode) => {
+    const { ctx, fake } = setup();
+    const { setHandlers } = build(ctx, 'left');
+    const pending = setHandlers.get(UUID.targetState)!(mode, {} as never, undefined);
     await vi.advanceTimersByTimeAsync(400);
     await pending;
     expect(fake.postDeviceStatusCalls).toEqual([{ left: { isOn: true } }]);
@@ -880,5 +907,73 @@ describe('ConfiguredName seeding (2.1)', () => {
     const warnings = captureCharacteristicWarnings(accessory);
     new ThermostatService(ctx, 'left', 0);
     expect(warnings).toHaveLength(0);
+  });
+});
+
+describe('HEAT/COOL aliases are normalized to AUTO after an accepted write', () => {
+  function targetStateChar(ctx: ServiceContext) {
+    const hap = ctx.api.hap;
+    return ctx.accessory.getServiceById(hap.Service.Thermostat, THERMOSTAT_SUBTYPE)!.getCharacteristic(hap.Characteristic.TargetHeatingCoolingState);
+  }
+
+  it('the stored HEAT is replaced with AUTO once the write settles, and reads report AUTO', async () => {
+    const { ctx } = setup();
+    const hap = ctx.api.hap;
+    const { getHandlers, setHandlers } = build(ctx, 'left');
+    const char = targetStateChar(ctx);
+    const pending = setHandlers.get(UUID.targetState)!(hap.Characteristic.TargetHeatingCoolingState.HEAT, {} as never, undefined);
+    await vi.advanceTimersByTimeAsync(400);
+    await pending;
+    // What HAP itself does once onSet resolves: store the client-supplied value.
+    char.value = hap.Characteristic.TargetHeatingCoolingState.HEAT;
+    expect(getHandlers.get(UUID.targetState)!({} as never, undefined)).toBe(hap.Characteristic.TargetHeatingCoolingState.AUTO);
+
+    await vi.advanceTimersByTimeAsync(500);
+    expect(char.value).toBe(hap.Characteristic.TargetHeatingCoolingState.AUTO);
+  });
+
+  it('an AUTO write schedules no normalization', async () => {
+    const { ctx } = setup();
+    const hap = ctx.api.hap;
+    const { setHandlers } = build(ctx, 'left');
+    const char = targetStateChar(ctx);
+    const updateSpy = vi.spyOn(char, 'updateValue');
+    const pending = setHandlers.get(UUID.targetState)!(hap.Characteristic.TargetHeatingCoolingState.AUTO, {} as never, undefined);
+    await vi.advanceTimersByTimeAsync(400);
+    await pending;
+    char.value = hap.Characteristic.TargetHeatingCoolingState.AUTO;
+    updateSpy.mockClear();
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(updateSpy).not.toHaveBeenCalledWith(hap.Characteristic.TargetHeatingCoolingState.AUTO);
+  });
+
+  it('a HEAT write followed by OFF before the delay does not flip the side back to AUTO', async () => {
+    const { ctx } = setup();
+    const hap = ctx.api.hap;
+    const { setHandlers } = build(ctx, 'left');
+    const char = targetStateChar(ctx);
+    const heat = setHandlers.get(UUID.targetState)!(hap.Characteristic.TargetHeatingCoolingState.HEAT, {} as never, undefined);
+    await vi.advanceTimersByTimeAsync(400);
+    await heat;
+    char.value = hap.Characteristic.TargetHeatingCoolingState.HEAT;
+    const off = setHandlers.get(UUID.targetState)!(hap.Characteristic.TargetHeatingCoolingState.OFF, {} as never, undefined);
+    char.value = hap.Characteristic.TargetHeatingCoolingState.OFF;
+    await vi.advanceTimersByTimeAsync(600);
+    await off;
+    expect(char.value).toBe(hap.Characteristic.TargetHeatingCoolingState.OFF);
+  });
+
+  it('stop() clears a pending normalization', async () => {
+    const { ctx } = setup();
+    const hap = ctx.api.hap;
+    const { service, setHandlers } = build(ctx, 'left');
+    const char = targetStateChar(ctx);
+    const pending = setHandlers.get(UUID.targetState)!(hap.Characteristic.TargetHeatingCoolingState.COOL, {} as never, undefined);
+    await vi.advanceTimersByTimeAsync(400);
+    await pending;
+    char.value = hap.Characteristic.TargetHeatingCoolingState.COOL;
+    service.stop();
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(char.value).toBe(hap.Characteristic.TargetHeatingCoolingState.COOL);
   });
 });
