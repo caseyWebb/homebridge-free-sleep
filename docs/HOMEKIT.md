@@ -17,7 +17,7 @@ app's mode picker underneath the user.
 genuinely optional. **Omit them** — the Home app only renders a range control in AUTO if they
 are present. `dillonp23/homebridge-eight8sleep` reached the same conclusion for this device.
 
-### `TargetHeatingCoolingState` restricted to `[OFF, AUTO]`
+### `TargetHeatingCoolingState`: `[OFF, HEAT, COOL, AUTO]`, reported as `[OFF, AUTO]`
 
 `setProps({ validValues })` is enforced by HAP, not merely advisory:
 
@@ -29,10 +29,21 @@ are present. `dillonp23/homebridge-eight8sleep` reached the same conclusion for 
 - `setProps` re-validates the current value and rewrites it if now illegal, so always call
   `setProps` during construction, before any value is set.
 
-Siri caveat: "set the bed to heat" will fail with `INVALID_VALUE_IN_REQUEST`. `AUTO` is what
-Siri uses for "turn on", so the common path is fine. If it becomes a real complaint, an
-opt-in that widens `validValues` and aliases HEAT/COOL to AUTO is possible, but it makes the
-reported value fight the user's selection. Default stays `[OFF, AUTO]`.
+The list originally was `[OFF, AUTO]`, on the theory that refusing HEAT/COOL only cost a Siri
+phrasing ("set the bed to heat"). Confirmed on a paired device (2026-11-26) that it costs far
+more: tapping a thermostat **tile** makes the Home app re-send the mode it last remembered for
+that accessory, and an accessory whose remembered mode was HEAT (from an older accessory
+database) sent `1` on every tap. Each was refused with `INVALID_VALUE_IN_REQUEST`, which the Home
+app surfaces as "This accessory is not responding" for the whole side, before showing any
+controls — while temperatures kept updating, since events still flowed. Picking Auto in the
+detail view recovered it by hand.
+
+So HEAT and COOL are accepted and treated as aliases of AUTO (the Pod has one setpoint and
+heats or cools toward it itself — any non-OFF mode is `isOn: true`). Reads still report only
+OFF or AUTO, and ~500 ms after an accepted HEAT/COOL write the stored value is replaced with
+AUTO (HAP stores the written value only after `onSet` resolves), so the mode the Home app
+remembers converges on AUTO. The mode picker does show Heat and Cool; choosing one turns the
+side on and snaps back to Auto — a cosmetic fight accepted over a bricked tile.
 
 ### `CurrentHeatingCoolingState` has no "idle" value
 
